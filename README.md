@@ -1,19 +1,35 @@
 # My Agent
 
-一个最小的只读诊断型 coding agent 原型。目标是先跑通 agent loop：
+一个从只读诊断 loop 逐步生长出来的最小 coding agent。当前主循环是：
 
 ```text
 user task -> model -> tool call -> tool result -> model -> final answer
 ```
 
-首版只暴露这些工具：
+当前暴露这些工具：
 
 - `list_files`
 - `read_file`
 - `search`
+- `apply_patch`
 - `run_tests`
 
 `run_tests` 只允许常见测试命令，例如 `python3 -m unittest`、`pytest`、`npm test`、`go test`。
+`apply_patch` 每次只允许修改一个 workspace-relative 文件，支持 `Add File`、`Update File`
+和 `Delete File`。例如：
+
+```text
+*** Begin Patch
+*** Update File: app.py
+@@
+-return 1
++return 2
+*** End Patch
+```
+
+更新使用精确上下文匹配；匹配失败或上下文不唯一时不会写入。绝对路径、`..`、symlink、
+`.git` 和 `.my-agent` 都会被拒绝。Add/Update 使用同目录临时文件和 `os.replace()`
+完成单文件原子替换。单次 patch 最多 100,000 字符，Update 目标最多 1 MB。
 
 ## Run
 
@@ -83,7 +99,8 @@ REPL 支持这些本地命令：
 - `provider.py`：定义统一 provider 协议和统一模型返回值
 - `providers/deepseek.py`：在统一消息与 DeepSeek Chat Completions 格式之间转换
 - `tools.py`：定义 tool schema、registry、执行入口和统一 `ToolResult`
-- `workspace.py` / `permissions.py`：限制路径范围和测试命令
+- `patches.py`：解析并提交单文件 patch，不依赖 shell 命令
+- `workspace.py` / `permissions.py`：限制路径范围、受保护目录和测试命令
 - `trace.py` / `trajectory.py`：分别保存 raw event log 和规范化 trajectory
 
 一次 turn 的调用顺序是：
@@ -112,7 +129,7 @@ PYTHONPATH=. python3 -m unittest discover -s tests
 ## Development Log
 
 项目从最小只读 loop、DeepSeek adapter、thinking/tool use、canonical trajectory，
-逐步演进到 session-aware runtime。完整里程碑和设计决策见
+逐步演进到 session-aware runtime 和受控文件编辑。完整里程碑和设计决策见
 [docs/development-log.md](docs/development-log.md)。
 
 ## Export Trajectory

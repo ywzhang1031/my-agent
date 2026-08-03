@@ -69,16 +69,36 @@
 这一步只改变身份和契约，不增加能力。当前 agent 仍然只暴露诊断工具，避免在权限模型、
 审计字段和失败语义尚未设计完成时提前获得写权限。
 
+## Milestone 7: Single-file Apply Patch
+
+第一个写能力采用单文件 patch，而不是先开放通用 shell。
+
+- `ApplyPatchTool` 暴露一个严格 JSON Schema 参数：`patch`。
+- `patches.py` 解析 `Add File`、`Update File` 和 `Delete File`。
+- 每次调用只允许一个文件操作，使 action、observation 和失败边界保持清晰。
+- Update 使用精确上下文；不匹配或存在多个匹配位置时拒绝修改。
+- `Workspace` 拒绝绝对路径、`..` 和 symlink traversal。
+- `PermissionPolicy` 拒绝 `.git` 和 `.my-agent` 中的写操作。
+- parser 在执行层限制 100,000 字符 patch 和 1 MB Update 目标，不只依赖 tool schema。
+- Add/Update 先写同目录临时文件，再通过 `os.replace()` 原子替换目标文件。
+- `ToolResult.metadata` 记录 `applied`、`operation` 和 `changed_files`，现有 trajectory
+  可以直接把它保存为 observation，因此不需要升级 schema。
+
+当前没有多文件事务、模糊上下文匹配、二进制/CRLF 编辑、交互 approval 或 OS sandbox。
+这些限制是显式契约，不由模型提示词代替执行层检查。
+
 ## Current Boundaries
 
-- Agent tools 不提供文件写入能力。
+- `apply_patch` 可以自动修改 workspace 内的单个普通 UTF-8/LF 文件。
+- 文件写入没有交互 approval，也没有操作系统级 sandbox。
 - `run_tests` 使用命令 allowlist，但不是操作系统级 sandbox；测试代码仍可能产生副作用。
 - 本地 `.my-agent/`、`trace.jsonl` 和 `trajectory.json` 默认不提交到 Git。
 - 当前只有 DeepSeek adapter，provider abstraction 已为其他模型保留边界。
 
 ## Next Candidates
 
-- 增加第二个 provider adapter，验证统一协议是否足够稳定。
-- 增加 context budget 和 conversation compaction。
+- 增加只读 `git_diff`，让模型验证实际修改结果。
+- 将 `run_tests` 扩展为受控 shell policy，并明确命令、环境变量和工作目录边界。
 - 将测试命令放入更强的 sandbox。
+- 增加 context budget 和 conversation compaction。
 - 为真实任务建立 eval cases，并使用 trajectory 分析失败类型。

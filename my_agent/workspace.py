@@ -29,6 +29,24 @@ class Workspace:
             raise WorkspaceError(f"path is outside workspace: {path}")
         return resolved
 
+    def resolve_patch_path(self, path: str) -> tuple[Path, str]:
+        relative = Path(path)
+        if not path or relative.is_absolute() or relative == Path("."):
+            raise WorkspaceError("patch path must be workspace-relative")
+        if any(part == ".." for part in relative.parts):
+            raise WorkspaceError("patch path must not contain '..'")
+
+        current = self.root
+        for part in relative.parts:
+            current = current / part
+            if current.is_symlink():
+                raise WorkspaceError(f"patch path must not traverse a symlink: {path}")
+
+        resolved = (self.root / relative).resolve(strict=False)
+        if os.path.commonpath([str(self.root), str(resolved)]) != str(self.root):
+            raise WorkspaceError(f"patch path is outside workspace: {path}")
+        return resolved, relative.as_posix()
+
     def list_files(self, path: str = ".", max_files: int = 200) -> tuple[list[str], bool]:
         start = self.resolve(path)
         if not start.exists():

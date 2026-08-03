@@ -12,10 +12,11 @@ from .trace import TraceRecorder
 from .workspace import Workspace
 
 
-DEFAULT_INSTRUCTIONS = """You are a read-only diagnostic coding agent.
-You may inspect files, search the repository, and run test commands.
-You must not edit, create, delete, move, or rename files.
-When you have enough evidence, return a concise diagnosis and next steps.
+DEFAULT_INSTRUCTIONS = """You are a coding agent operating inside one workspace.
+You may inspect files, search the repository, edit files with apply_patch, and run test commands.
+Each apply_patch call must change exactly one workspace-relative file.
+Do not modify .git, .my-agent, or paths outside the workspace.
+After editing, run the narrowest relevant tests before returning a concise result.
 """
 
 

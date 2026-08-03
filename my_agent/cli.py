@@ -8,14 +8,21 @@ from .agent_loop import AgentLoop
 from .permissions import PermissionPolicy
 from .providers.deepseek import DeepSeekProvider
 from .session import SessionState, SessionStore
-from .tools import ListFilesTool, ReadFileTool, RunTestsTool, SearchTool, ToolRegistry
+from .tools import (
+    ApplyPatchTool,
+    ListFilesTool,
+    ReadFileTool,
+    RunTestsTool,
+    SearchTool,
+    ToolRegistry,
+)
 from .trace import TraceRecorder
 from .trajectory import make_trajectory, read_jsonl_trace, write_trajectory_json
 from .workspace import Workspace
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run a read-only diagnostic coding agent.")
+    parser = argparse.ArgumentParser(description="Run a minimal coding agent.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     ask = subparsers.add_parser("ask", help="Run one persisted conversation turn.")
@@ -165,7 +172,7 @@ def _build_runtime(
     workspace: Workspace,
     trace_path: str | Path,
 ) -> tuple[AgentLoop, ToolRegistry]:
-    registry = ToolRegistry([ListFilesTool(), ReadFileTool(), SearchTool(), RunTestsTool()])
+    registry = build_tool_registry()
     provider = DeepSeekProvider(model=args.model, base_url=args.base_url, thinking=args.thinking)
     loop = AgentLoop(
         workspace=workspace,
@@ -176,6 +183,18 @@ def _build_runtime(
         max_steps=args.max_steps,
     )
     return loop, registry
+
+
+def build_tool_registry() -> ToolRegistry:
+    return ToolRegistry(
+        [
+            ApplyPatchTool(),
+            ListFilesTool(),
+            ReadFileTool(),
+            SearchTool(),
+            RunTestsTool(),
+        ]
+    )
 
 
 def _session_store(args: argparse.Namespace, workspace: Workspace) -> SessionStore:

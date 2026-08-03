@@ -6,13 +6,14 @@ from contextlib import redirect_stderr
 from pathlib import Path
 
 from my_agent.agent_loop import AgentLoop
-from my_agent.cli import build_parser
+from my_agent.cli import build_parser, build_tool_registry
 from my_agent.messages import AssistantMessage, ToolCall, ToolResultMessage, UserMessage
 from my_agent.permissions import PermissionPolicy
 from my_agent.provider import ProviderResponse, ScriptedProvider
 from my_agent.providers.deepseek import DeepSeekProvider
 from my_agent.session import SessionStore
 from my_agent.tools import (
+    ApplyPatchTool,
     ListFilesTool,
     ReadFileTool,
     RunTestsTool,
@@ -141,6 +142,12 @@ class MyAgentTests(unittest.TestCase):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             parser.parse_args(["--workspace", "/tmp/repo", "inspect", "this", "repo"])
 
+    def test_default_tool_registry_exposes_apply_patch(self):
+        self.assertEqual(
+            build_tool_registry().names(),
+            ["apply_patch", "list_files", "read_file", "run_tests", "search"],
+        )
+
     def test_agent_loop_exposes_only_session_turn_entrypoint(self):
         self.assertFalse(hasattr(AgentLoop, "run"))
 
@@ -180,6 +187,205 @@ class MyAgentTests(unittest.TestCase):
             self.assertEqual(passing.exit_code, 0)
             self.assertFalse(denied.ok)
             self.assertIn("not allowed", denied.stderr)
+
+    def test_apply_patch_updates_adds_and_deletes_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Workspace(tmpdir)
+            ctx = ToolContext(workspace=workspace, permissions=PermissionPolicy())
+            tool = ApplyPatchTool()
+            Path(tmpdir, "app.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+            Path(tmpdir, "obsolete.txt").write_text("remove me\n", encoding="utf-8")
+
+            updated = tool.run(
+                {
+                    "patch": """*** Begin Patch
+*** Update File: app.py
+@@
+ def value():
+-    return 1
++    return 2
+*** End Patch"""
+                },
+                ctx,
+            )
+            added = tool.run(
+                {
+                    "patch": """*** Begin Patch
+*** Add File: nested/new.py
++print('new')
+*** End Patch"""
+                },
+                ctx,
+            )
+            deleted = tool.run(
+                {
+                    "patch": """*** Begin Patch
+*** Delete File: obsolete.txt
+*** End Patch"""
+                },
+                ctx,
+            )
+
+            self.assertTrue(updated.ok, updated.stderr)
+            self.assertTrue(added.ok, added.stderr)
+            self.assertTrue(deleted.ok, deleted.stderr)
+            self.assertEqual(
+                Path(tmpdir, "app.py").read_text(encoding="utf-8"),
+                "def value():\n    return 2\n",
+            )
+            self.assertEqual(
+                Path(tmpdir, "nested", "new.py").read_text(encoding="utf-8"),
+                "print('new')\n",
+            )
+            self.assertFalse(Path(tmpdir, "obsolete.txt").exists())
+            self.assertEqual(updated.metadata["operation"], "update")
+            self.assertEqual(updated.metadata["changed_files"], ["app.py"])
+
+    def test_apply_patch_context_mismatch_does_not_write(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir, "app.py")
+            target.write_text("value = 1\n", encoding="utf-8")
+            tool = ApplyPatchTool()
+            ctx = ToolContext(workspace=Workspace(tmpdir), permissions=PermissionPolicy())
+
+            result = tool.run(
+                {
+                    "patch": """*** Begin Patch
+*** Update File: app.py
+@@
+-value = 2
++value = 3
+*** End Patch"""
+                },
+                ctx,
+            )
+
+            self.assertFalse(result.ok)
+            self.assertIn("context did not match", result.stderr)
+            self.assertEqual(target.read_text(encoding="utf-8"), "value = 1\n")
+            self.assertFalse(result.metadata["applied"])
+
+    def test_apply_patch_rejects_ambiguous_context(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir, "app.py")
+            target.write_text("value = 1\nvalue = 1\n", encoding="utf-8")
+            tool = ApplyPatchTool()
+            ctx = ToolContext(workspace=Workspace(tmpdir), permissions=PermissionPolicy())
+
+            result = tool.run(
+                {
+                    "patch": """*** Begin Patch
+*** Update File: app.py
+@@
+-value = 1
++value = 2
+*** End Patch"""
+                },
+                ctx,
+            )
+
+            self.assertFalse(result.ok)
+            self.assertIn("ambiguous", result.stderr)
+            self.assertEqual(target.read_text(encoding="utf-8"), "value = 1\nvalue = 1\n")
+
+    def test_apply_patch_rejects_multiple_file_operations_before_writing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir, "app.py")
+            target.write_text("value = 1\n", encoding="utf-8")
+            tool = ApplyPatchTool()
+            ctx = ToolContext(workspace=Workspace(tmpdir), permissions=PermissionPolicy())
+
+            result = tool.run(
+                {
+                    "patch": """*** Begin Patch
+*** Update File: app.py
+@@
+-value = 1
++value = 2
+*** Add File: extra.py
++value = 3
+*** End Patch"""
+                },
+                ctx,
+            )
+
+            self.assertFalse(result.ok)
+            self.assertIn("exactly one file operation", result.stderr)
+            self.assertEqual(target.read_text(encoding="utf-8"), "value = 1\n")
+            self.assertFalse(Path(tmpdir, "extra.py").exists())
+
+    def test_apply_patch_rejects_oversized_input(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tool = ApplyPatchTool()
+            ctx = ToolContext(workspace=Workspace(tmpdir), permissions=PermissionPolicy())
+            oversized_patch = (
+                "*** Begin Patch\n*** Add File: large.txt\n+"
+                + "x" * 100_001
+                + "\n*** End Patch"
+            )
+
+            result = tool.run({"patch": oversized_patch}, ctx)
+
+            self.assertFalse(result.ok)
+            self.assertIn("exceeds", result.stderr)
+            self.assertFalse(Path(tmpdir, "large.txt").exists())
+
+    def test_apply_patch_rejects_protected_and_symlink_paths(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir, "workspace")
+            root.mkdir()
+            git_dir = root / ".git"
+            git_dir.mkdir()
+            git_config = git_dir / "config"
+            git_config.write_text("protected\n", encoding="utf-8")
+            outside = Path(tmpdir, "outside.txt")
+            outside.write_text("outside\n", encoding="utf-8")
+            (root / "link.txt").symlink_to(outside)
+            tool = ApplyPatchTool()
+            ctx = ToolContext(workspace=Workspace(root), permissions=PermissionPolicy())
+
+            protected = tool.run(
+                {
+                    "patch": """*** Begin Patch
+*** Update File: .GIT/config
+@@
+-protected
++changed
+*** End Patch"""
+                },
+                ctx,
+            )
+            escaped = tool.run(
+                {
+                    "patch": """*** Begin Patch
+*** Update File: link.txt
+@@
+-outside
++changed
+*** End Patch"""
+                },
+                ctx,
+            )
+            parent_escape = tool.run(
+                {
+                    "patch": """*** Begin Patch
+*** Update File: ../outside.txt
+@@
+-outside
++changed
+*** End Patch"""
+                },
+                ctx,
+            )
+
+            self.assertFalse(protected.ok)
+            self.assertIn("protected path", protected.stderr)
+            self.assertFalse(escaped.ok)
+            self.assertIn("symlink", escaped.stderr)
+            self.assertFalse(parent_escape.ok)
+            self.assertIn("must not contain '..'", parent_escape.stderr)
+            self.assertEqual(git_config.read_text(encoding="utf-8"), "protected\n")
+            self.assertEqual(outside.read_text(encoding="utf-8"), "outside\n")
 
     def test_agent_loop_executes_tool_call_and_writes_trace(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -242,6 +448,57 @@ class MyAgentTests(unittest.TestCase):
             self.assertIn("tool_call", event_names)
             self.assertIn("tool_result", event_names)
             self.assertIn("final_answer", event_names)
+
+    def test_agent_loop_records_apply_patch_observation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace_path = Path(tmpdir, "workspace")
+            workspace_path.mkdir()
+            target = workspace_path / "app.py"
+            target.write_text("value = 1\n", encoding="utf-8")
+            store = SessionStore(Path(tmpdir, "sessions"))
+            state = store.create(workspace_path)
+            patch = """*** Begin Patch
+*** Update File: app.py
+@@
+-value = 1
++value = 2
+*** End Patch"""
+            provider = ScriptedProvider(
+                [
+                    ProviderResponse(
+                        tool_calls=[
+                            ToolCall(
+                                call_id="call_patch",
+                                name="apply_patch",
+                                arguments={"patch": patch},
+                            )
+                        ],
+                        finish_reason="tool_calls",
+                    ),
+                    ProviderResponse(content="Updated app.py.", finish_reason="stop"),
+                ]
+            )
+            loop = AgentLoop(
+                workspace=Workspace(workspace_path),
+                provider=provider,
+                tools=ToolRegistry([ApplyPatchTool()]),
+                permissions=PermissionPolicy(),
+                trace=TraceRecorder(state.trace_path),
+                max_steps=4,
+            )
+
+            result = loop.run_turn(state, "Set value to 2.")
+            events = read_jsonl_trace(state.trace_path)
+            trajectory = make_trajectory(events, source_path=state.trace_path)
+            observation = trajectory["turns"][0]["steps"][0]["observations"][0]
+
+            self.assertEqual(result.answer, "Updated app.py.")
+            self.assertEqual(target.read_text(encoding="utf-8"), "value = 2\n")
+            self.assertTrue(observation["output"]["metadata"]["applied"])
+            self.assertEqual(
+                observation["output"]["metadata"]["changed_files"],
+                ["app.py"],
+            )
 
     def test_deepseek_provider_translates_canonical_messages_and_tools(self):
         provider = DeepSeekProvider(api_key="test-key", model="deepseek-v4-flash")

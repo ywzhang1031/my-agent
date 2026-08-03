@@ -1,10 +1,19 @@
 from __future__ import annotations
 
 import shlex
+from pathlib import PurePosixPath
 
 
 class PermissionPolicy:
     blocked_shell_tokens = {";", "&&", "||", "|", ">", ">>", "<", "`", "$("}
+    protected_path_parts = {".git", ".my-agent"}
+
+    def allow_file_change(self, operation: str, path: str) -> tuple[bool, str]:
+        if operation not in {"add", "update", "delete"}:
+            return False, f"unsupported file operation: {operation}"
+        if any(part.casefold() in self.protected_path_parts for part in PurePosixPath(path).parts):
+            return False, f"file operation targets a protected path: {path}"
+        return True, ""
 
     def allow_test_command(self, command: str) -> tuple[bool, str, list[str]]:
         try:
@@ -17,7 +26,7 @@ class PermissionPolicy:
             return False, "shell chaining or redirection is not allowed", argv
         if self._is_allowed_test_command(argv):
             return True, "", argv
-        return False, f"command is not allowed in read-only diagnostic mode: {command}", argv
+        return False, f"command is not allowed by the test-command policy: {command}", argv
 
     def _is_allowed_test_command(self, argv: list[str]) -> bool:
         if argv[0] in {"pytest", "py.test"}:

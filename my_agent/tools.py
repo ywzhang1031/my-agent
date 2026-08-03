@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from .messages import ToolCall
+from .patches import MAX_PATCH_CHARS, apply_patch
 from .permissions import PermissionPolicy
 from .workspace import Workspace, WorkspaceError
 
@@ -229,6 +230,55 @@ class RunTestsTool(ToolBase):
             exit_code=completed.returncode,
             truncated=stdout_truncated or stderr_truncated,
             metadata={"command": argv},
+        )
+
+
+class ApplyPatchTool(ToolBase):
+    name = "apply_patch"
+    description = "Apply one exact, workspace-relative Add, Update, or Delete File patch."
+    parameters = {
+        "type": "object",
+        "properties": {
+            "patch": {
+                "type": "string",
+                "description": (
+                    "One-file patch delimited by *** Begin Patch and *** End Patch. "
+                    "Update targets must be UTF-8 text with LF line endings."
+                ),
+                "maxLength": MAX_PATCH_CHARS,
+            }
+        },
+        "required": ["patch"],
+        "additionalProperties": False,
+    }
+    required = ["patch"]
+    strict = True
+
+    def run(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        patch = arguments.get("patch")
+        if not isinstance(patch, str):
+            return ToolResult(
+                ok=False,
+                stderr="patch must be a string",
+                metadata={"applied": False},
+            )
+        try:
+            applied = apply_patch(patch, ctx.workspace, ctx.permissions)
+        except (WorkspaceError, OSError, ValueError) as exc:
+            return ToolResult(
+                ok=False,
+                stderr=str(exc),
+                metadata={"applied": False},
+            )
+        return ToolResult(
+            ok=True,
+            stdout=f"{applied.operation} {applied.path}",
+            path=str(applied.absolute_path),
+            metadata={
+                "applied": True,
+                "operation": applied.operation,
+                "changed_files": [applied.path],
+            },
         )
 
 
