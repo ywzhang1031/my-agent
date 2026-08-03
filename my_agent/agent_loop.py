@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass
 
 from .messages import AssistantMessage, Message, ToolResultMessage, UserMessage
-from .permissions import ReadOnlyPermissionPolicy
+from .permissions import PermissionPolicy
 from .provider import Provider, ProviderResponse
 from .session import SessionState
 from .tools import ToolContext, ToolRegistry
@@ -33,7 +33,7 @@ class AgentLoop:
         workspace: Workspace,
         provider: Provider,
         tools: ToolRegistry,
-        permissions: ReadOnlyPermissionPolicy,
+        permissions: PermissionPolicy,
         trace: TraceRecorder,
         max_steps: int = 12,
         instructions: str = DEFAULT_INSTRUCTIONS,

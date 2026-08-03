@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 from .agent_loop import AgentLoop
-from .permissions import ReadOnlyPermissionPolicy
+from .permissions import PermissionPolicy
 from .providers.deepseek import DeepSeekProvider
 from .session import SessionState, SessionStore
 from .tools import ListFilesTool, ReadFileTool, RunTestsTool, SearchTool, ToolRegistry
@@ -52,7 +52,7 @@ def _add_runtime_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--sessions-dir",
         default=None,
-        help="Session storage root. Defaults to <workspace>/.readonly-agent/sessions.",
+        help="Session storage root. Defaults to <workspace>/.my-agent/sessions.",
     )
     parser.add_argument("--max-steps", type=int, default=12, help="Maximum model/tool loop steps per turn.")
 
@@ -171,7 +171,7 @@ def _build_runtime(
         workspace=workspace,
         provider=provider,
         tools=registry,
-        permissions=ReadOnlyPermissionPolicy(),
+        permissions=PermissionPolicy(),
         trace=TraceRecorder(trace_path),
         max_steps=args.max_steps,
     )
@@ -179,7 +179,7 @@ def _build_runtime(
 
 
 def _session_store(args: argparse.Namespace, workspace: Workspace) -> SessionStore:
-    root = Path(args.sessions_dir) if args.sessions_dir else workspace.root / ".readonly-agent" / "sessions"
+    root = Path(args.sessions_dir) if args.sessions_dir else workspace.root / ".my-agent" / "sessions"
     return SessionStore(root)
 
 

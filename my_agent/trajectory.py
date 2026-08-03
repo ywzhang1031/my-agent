@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = "readonly-cli-agent.session-trajectory.v1"
+SCHEMA_VERSION = "my-agent.trajectory.v2"
 
 
 def read_jsonl_trace(path: str | Path) -> list[dict[str, Any]]:

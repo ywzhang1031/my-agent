@@ -53,7 +53,7 @@ REPL 支持这些本地命令：
 默认 session 目录是：
 
 ```text
-<workspace>/.readonly-agent/sessions/<session_id>/
+<workspace>/.my-agent/sessions/<session_id>/
   session.json
   messages.jsonl
   trace.jsonl
@@ -61,7 +61,7 @@ REPL 支持这些本地命令：
 ```
 
 可以用 `--sessions-dir` 把 session 放到 workspace 之外。`list_files` 默认会忽略
-`.readonly-agent`，避免 agent 把自己的运行记录当成待诊断源码。
+`.my-agent`，避免 agent 把自己的运行记录当成待诊断源码。
 
 如果没有设置 `DEEPSEEK_API_KEY`，CLI 会直接报错，不会假装完成诊断。
 `trace.jsonl` 会记录 `model_request`、`model_response`、`tool_call`、`tool_result`
@@ -121,11 +121,11 @@ PYTHONPATH=. python3 -m unittest discover -s tests
 WORKSPACE=/path/to/repo
 SESSION_ID=20260803-120000-abcdef
 PYTHONPATH=. python3 scripts/export_trajectory.py \
-  --trace "$WORKSPACE/.readonly-agent/sessions/$SESSION_ID/trace.jsonl" \
-  --output "$WORKSPACE/.readonly-agent/sessions/$SESSION_ID/trajectory.json"
+  --trace "$WORKSPACE/.my-agent/sessions/$SESSION_ID/trace.jsonl" \
+  --output "$WORKSPACE/.my-agent/sessions/$SESSION_ID/trajectory.json"
 ```
 
 `trace.jsonl` 是原始事件流；导出的 `trajectory.json` 使用
-`readonly-cli-agent.session-trajectory.v1`，先按 turn 分组，再按 step 分组，避免不同
+`my-agent.trajectory.v2`，先按 turn 分组，再按 step 分组，避免不同
 turn 中相同 step 编号发生碰撞。每轮结束后会自动刷新 `trajectory.json`，手动导出主要
 用于重新生成或校验现有 session trajectory。

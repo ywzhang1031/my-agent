@@ -11,7 +11,7 @@
 - 定义统一的 `UserMessage`、`AssistantMessage`、`ToolCall` 和 `ToolResultMessage`。
 - 实现 `list_files`、`read_file`、`search` 和 `run_tests` 四个只读诊断工具。
 - 使用 `Workspace` 限制文件访问范围。
-- 使用 `ReadOnlyPermissionPolicy` 限制可执行的测试命令。
+- 使用 `PermissionPolicy` 限制可执行的测试命令。
 - 跑通 `user -> model -> tool call -> tool result -> model -> final answer`。
 
 ## Milestone 2: Provider Adapter and DeepSeek Thinking
@@ -55,11 +55,25 @@
 - trajectory 只接受 session trace。
 - 后续修改直接升级当前接口和 schema，不为未发布旧版维护兼容分支。
 
+## Milestone 6: Capability-neutral Runtime Contracts
+
+在增加写工具之前，先解除核心运行时与“只读模式”的命名耦合。
+
+- Python package 现在使用能力中立的 `my_agent` 名称。
+- 权限类现在使用 `PermissionPolicy`，为后续统一表达
+  read、write 和 execute 决策保留稳定边界。
+- session state 目录统一为 `.my-agent/`。
+- trajectory schema 升级为 `my-agent.trajectory.v2`。
+- 不提供旧 import、旧类名、旧目录或旧 schema 的兼容层。
+
+这一步只改变身份和契约，不增加能力。当前 agent 仍然只暴露诊断工具，避免在权限模型、
+审计字段和失败语义尚未设计完成时提前获得写权限。
+
 ## Current Boundaries
 
 - Agent tools 不提供文件写入能力。
 - `run_tests` 使用命令 allowlist，但不是操作系统级 sandbox；测试代码仍可能产生副作用。
-- 本地 `.readonly-agent/`、`trace.jsonl` 和 `trajectory.json` 默认不提交到 Git。
+- 本地 `.my-agent/`、`trace.jsonl` 和 `trajectory.json` 默认不提交到 Git。
 - 当前只有 DeepSeek adapter，provider abstraction 已为其他模型保留边界。
 
 ## Next Candidates

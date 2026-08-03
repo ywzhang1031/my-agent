@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from .messages import ToolCall
-from .permissions import ReadOnlyPermissionPolicy
+from .permissions import PermissionPolicy
 from .workspace import Workspace, WorkspaceError
 
 
@@ -47,7 +47,7 @@ class ToolResult:
 @dataclass
 class ToolContext:
     workspace: Workspace
-    permissions: ReadOnlyPermissionPolicy
+    permissions: PermissionPolicy
     timeout_seconds: int = 60
 
 

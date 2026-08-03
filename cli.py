@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-from readonly_cli_agent.cli import main
+from my_agent.cli import main
 
 
 if __name__ == "__main__":

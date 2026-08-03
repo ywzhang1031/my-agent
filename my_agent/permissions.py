@@ -3,7 +3,7 @@ from __future__ import annotations
 import shlex
 
 
-class ReadOnlyPermissionPolicy:
+class PermissionPolicy:
     blocked_shell_tokens = {";", "&&", "||", "|", ">", ">>", "<", "`", "$("}
 
     def allow_test_command(self, command: str) -> tuple[bool, str, list[str]]:

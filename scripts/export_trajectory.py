@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from readonly_cli_agent.trajectory import make_trajectory, read_jsonl_trace, write_trajectory_json
+from my_agent.trajectory import make_trajectory, read_jsonl_trace, write_trajectory_json
 
 
 def build_parser() -> argparse.ArgumentParser:

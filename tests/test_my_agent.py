@@ -5,14 +5,14 @@ import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
 
-from readonly_cli_agent.agent_loop import AgentLoop
-from readonly_cli_agent.cli import build_parser
-from readonly_cli_agent.messages import AssistantMessage, ToolCall, ToolResultMessage, UserMessage
-from readonly_cli_agent.permissions import ReadOnlyPermissionPolicy
-from readonly_cli_agent.provider import ProviderResponse, ScriptedProvider
-from readonly_cli_agent.providers.deepseek import DeepSeekProvider
-from readonly_cli_agent.session import SessionStore
-from readonly_cli_agent.tools import (
+from my_agent.agent_loop import AgentLoop
+from my_agent.cli import build_parser
+from my_agent.messages import AssistantMessage, ToolCall, ToolResultMessage, UserMessage
+from my_agent.permissions import PermissionPolicy
+from my_agent.provider import ProviderResponse, ScriptedProvider
+from my_agent.providers.deepseek import DeepSeekProvider
+from my_agent.session import SessionStore
+from my_agent.tools import (
     ListFilesTool,
     ReadFileTool,
     RunTestsTool,
@@ -20,16 +20,16 @@ from readonly_cli_agent.tools import (
     ToolContext,
     ToolRegistry,
 )
-from readonly_cli_agent.trace import TraceRecorder
-from readonly_cli_agent.trajectory import make_trajectory, read_jsonl_trace
-from readonly_cli_agent.workspace import Workspace
+from my_agent.trace import TraceRecorder
+from my_agent.trajectory import make_trajectory, read_jsonl_trace
+from my_agent.workspace import Workspace
 
 
-class ReadOnlyAgentTests(unittest.TestCase):
+class MyAgentTests(unittest.TestCase):
     def test_list_files_ignores_session_state_directory(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             Path(tmpdir, "app.py").write_text("print('hello')\n", encoding="utf-8")
-            session_dir = Path(tmpdir, ".readonly-agent", "sessions", "session-1")
+            session_dir = Path(tmpdir, ".my-agent", "sessions", "session-1")
             session_dir.mkdir(parents=True)
             Path(session_dir, "messages.jsonl").write_text("{}\n", encoding="utf-8")
 
@@ -94,7 +94,7 @@ class ReadOnlyAgentTests(unittest.TestCase):
                 workspace=Workspace(workspace_path),
                 provider=provider,
                 tools=ToolRegistry([ListFilesTool()]),
-                permissions=ReadOnlyPermissionPolicy(),
+                permissions=PermissionPolicy(),
                 trace=TraceRecorder(state.trace_path),
                 max_steps=4,
             )
@@ -149,7 +149,7 @@ class ReadOnlyAgentTests(unittest.TestCase):
             workspace = Workspace(tmpdir)
             outside = Path(tmpdir).parent / "outside-secret.txt"
             outside.write_text("secret", encoding="utf-8")
-            ctx = ToolContext(workspace=workspace, permissions=ReadOnlyPermissionPolicy())
+            ctx = ToolContext(workspace=workspace, permissions=PermissionPolicy())
 
             result = ReadFileTool().run({"path": str(outside)}, ctx)
 
@@ -167,7 +167,7 @@ class ReadOnlyAgentTests(unittest.TestCase):
             )
             ctx = ToolContext(
                 workspace=Workspace(tmpdir),
-                permissions=ReadOnlyPermissionPolicy(),
+                permissions=PermissionPolicy(),
                 timeout_seconds=10,
             )
 
@@ -218,7 +218,7 @@ class ReadOnlyAgentTests(unittest.TestCase):
                 workspace=Workspace(workspace_path),
                 provider=provider,
                 tools=registry,
-                permissions=ReadOnlyPermissionPolicy(),
+                permissions=PermissionPolicy(),
                 trace=TraceRecorder(state.trace_path),
                 max_steps=4,
             )
@@ -421,7 +421,7 @@ class ReadOnlyAgentTests(unittest.TestCase):
 
         self.assertEqual(
             trajectory["schema_version"],
-            "readonly-cli-agent.session-trajectory.v1",
+            "my-agent.trajectory.v2",
         )
         self.assertEqual(trajectory["workspace"], "/tmp/repo")
         turn = trajectory["turns"][0]
@@ -527,7 +527,7 @@ class ReadOnlyAgentTests(unittest.TestCase):
 
         self.assertEqual(
             trajectory["schema_version"],
-            "readonly-cli-agent.session-trajectory.v1",
+            "my-agent.trajectory.v2",
         )
         self.assertEqual(trajectory["session_id"], "session-1")
         self.assertEqual(len(trajectory["turns"]), 2)

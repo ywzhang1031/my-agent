@@ -40,7 +40,7 @@ class Workspace:
             dirnames[:] = [
                 name
                 for name in dirnames
-                if name not in {".git", ".readonly-agent", "__pycache__", "node_modules"}
+                if name not in {".git", ".my-agent", "__pycache__", "node_modules"}
             ]
             for filename in filenames:
                 full_path = Path(current_root) / filename
