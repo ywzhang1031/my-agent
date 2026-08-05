@@ -16,7 +16,9 @@ DEFAULT_INSTRUCTIONS = """You are a coding agent operating inside one workspace.
 You may inspect files, search the repository, edit files with apply_patch, and run test commands.
 Each apply_patch call must change exactly one workspace-relative file.
 Do not modify .git, .my-agent, or paths outside the workspace.
-After editing, run the narrowest relevant tests before returning a concise result.
+After editing, inspect the actual changes with git_diff and run the narrowest relevant tests.
+Use read_file when you need the contents of an untracked file reported by git_diff.
+Return a concise result only after checking the changes and test evidence.
 """
 
 

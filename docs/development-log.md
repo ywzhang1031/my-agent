@@ -87,9 +87,26 @@
 当前没有多文件事务、模糊上下文匹配、二进制/CRLF 编辑、交互 approval 或 OS sandbox。
 这些限制是显式契约，不由模型提示词代替执行层检查。
 
+## Milestone 8: Read-only Git Diff
+
+文件编辑之后增加独立的只读验证工具，而不是要求模型通过通用 shell 拼接 Git 命令。
+
+- `GitDiffTool` 只接受可选的 workspace-relative `path`，不接受任意 Git 参数。
+- tracked 变化使用固定的 `git diff HEAD -- <path>`，同时覆盖 staged 和 unstaged 修改。
+- untracked 文件使用 `git ls-files --others --exclude-standard` 单独发现，只返回文件名。
+- 禁用 pager、颜色、external diff 和 textconv，并设置 `GIT_OPTIONAL_LOCKS=0`。
+- workspace 是大仓库子目录时，pathspec 仍限制在 workspace 内，不暴露兄弟目录变化。
+- `.my-agent` session state 无论目标仓库是否忽略它，都不会进入 untracked observation。
+- stdout 最多 12,000 字符，untracked metadata 最多 200 项。
+- 非 Git workspace 或没有 `HEAD` commit 时返回明确失败 observation。
+
+`git_diff` 不写文件、不修改 index，也不运行 shell。它的结果继续使用通用
+`ToolResult -> ToolResultMessage -> observation` 路径，所以 trajectory schema 保持 v2。
+
 ## Current Boundaries
 
 - `apply_patch` 可以自动修改 workspace 内的单个普通 UTF-8/LF 文件。
+- `git_diff` 只比较 `HEAD` 和当前工作树；untracked 文件只展示名称，不展示内容。
 - 文件写入没有交互 approval，也没有操作系统级 sandbox。
 - `run_tests` 使用命令 allowlist，但不是操作系统级 sandbox；测试代码仍可能产生副作用。
 - 本地 `.my-agent/`、`trace.jsonl` 和 `trajectory.json` 默认不提交到 Git。
@@ -97,7 +114,6 @@
 
 ## Next Candidates
 
-- 增加只读 `git_diff`，让模型验证实际修改结果。
 - 将 `run_tests` 扩展为受控 shell policy，并明确命令、环境变量和工作目录边界。
 - 将测试命令放入更强的 sandbox。
 - 增加 context budget 和 conversation compaction。

@@ -10,6 +10,7 @@ from .providers.deepseek import DeepSeekProvider
 from .session import SessionState, SessionStore
 from .tools import (
     ApplyPatchTool,
+    GitDiffTool,
     ListFilesTool,
     ReadFileTool,
     RunTestsTool,
@@ -189,6 +190,7 @@ def build_tool_registry() -> ToolRegistry:
     return ToolRegistry(
         [
             ApplyPatchTool(),
+            GitDiffTool(),
             ListFilesTool(),
             ReadFileTool(),
             SearchTool(),

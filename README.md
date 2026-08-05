@@ -12,6 +12,7 @@ user task -> model -> tool call -> tool result -> model -> final answer
 - `read_file`
 - `search`
 - `apply_patch`
+- `git_diff`
 - `run_tests`
 
 `run_tests` 只允许常见测试命令，例如 `python3 -m unittest`、`pytest`、`npm test`、`go test`。
@@ -30,6 +31,12 @@ user task -> model -> tool call -> tool result -> model -> final answer
 更新使用精确上下文匹配；匹配失败或上下文不唯一时不会写入。绝对路径、`..`、symlink、
 `.git` 和 `.my-agent` 都会被拒绝。Add/Update 使用同目录临时文件和 `os.replace()`
 完成单文件原子替换。单次 patch 最多 100,000 字符，Update 目标最多 1 MB。
+
+`git_diff` 使用固定参数直接调用 Git，不启动 shell。它返回 `HEAD` 到当前工作树的 tracked
+diff，因此同时覆盖 staged 和 unstaged 修改，并附带 untracked 文件名。可以用可选的
+workspace-relative `path` 限定范围；untracked 内容需要继续调用 `read_file`。输出最多
+12,000 字符、untracked 最多 200 个，并且要求 workspace 位于已有 `HEAD` commit 的
+Git 仓库中。
 
 ## Run
 
@@ -114,6 +121,7 @@ CLI loads SessionState
      or asks ToolRegistry to execute every tool call
   -> ToolResult becomes ToolResultMessage
   -> next model request sees the new observation
+  -> after edits, git_diff exposes the actual working-tree delta
   -> CLI saves messages, trace, and trajectory
 ```
 

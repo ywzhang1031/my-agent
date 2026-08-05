@@ -1,5 +1,6 @@
 import io
 import json
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr
@@ -14,6 +15,7 @@ from my_agent.providers.deepseek import DeepSeekProvider
 from my_agent.session import SessionStore
 from my_agent.tools import (
     ApplyPatchTool,
+    GitDiffTool,
     ListFilesTool,
     ReadFileTool,
     RunTestsTool,
@@ -24,6 +26,31 @@ from my_agent.tools import (
 from my_agent.trace import TraceRecorder
 from my_agent.trajectory import make_trajectory, read_jsonl_trace
 from my_agent.workspace import Workspace
+
+
+def _git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=root,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+
+def _commit_workspace(root: Path) -> None:
+    _git(root, "init", "-q")
+    _git(root, "add", ".")
+    _git(
+        root,
+        "-c",
+        "user.name=My Agent Tests",
+        "-c",
+        "user.email=my-agent@example.invalid",
+        "commit",
+        "-qm",
+        "initial",
+    )
 
 
 class MyAgentTests(unittest.TestCase):
@@ -142,10 +169,10 @@ class MyAgentTests(unittest.TestCase):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             parser.parse_args(["--workspace", "/tmp/repo", "inspect", "this", "repo"])
 
-    def test_default_tool_registry_exposes_apply_patch(self):
+    def test_default_tool_registry_exposes_current_tools(self):
         self.assertEqual(
             build_tool_registry().names(),
-            ["apply_patch", "list_files", "read_file", "run_tests", "search"],
+            ["apply_patch", "git_diff", "list_files", "read_file", "run_tests", "search"],
         )
 
     def test_agent_loop_exposes_only_session_turn_entrypoint(self):
@@ -187,6 +214,122 @@ class MyAgentTests(unittest.TestCase):
             self.assertEqual(passing.exit_code, 0)
             self.assertFalse(denied.ok)
             self.assertIn("not allowed", denied.stderr)
+
+    def test_git_diff_reports_tracked_and_untracked_changes_without_mutating_status(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            tracked = root / "app.py"
+            unstaged = root / "other.py"
+            tracked.write_text("value = 1\n", encoding="utf-8")
+            unstaged.write_text("other = 1\n", encoding="utf-8")
+            _commit_workspace(root)
+            tool = GitDiffTool()
+            ctx = ToolContext(workspace=Workspace(root), permissions=PermissionPolicy())
+            clean = tool.run({"path": "."}, ctx)
+            tracked.write_text("value = 2\n", encoding="utf-8")
+            _git(root, "add", "app.py")
+            unstaged.write_text("other = 2\n", encoding="utf-8")
+            (root / "new.py").write_text("new = True\n", encoding="utf-8")
+            state_dir = root / ".my-agent" / "sessions" / "session-1"
+            state_dir.mkdir(parents=True)
+            (state_dir / "trace.jsonl").write_text("{}\n", encoding="utf-8")
+            before = _git(root, "status", "--porcelain=v1", "--untracked-files=all").stdout
+
+            result = tool.run({"path": "."}, ctx)
+
+            after = _git(root, "status", "--porcelain=v1", "--untracked-files=all").stdout
+            self.assertTrue(clean.ok, clean.stderr)
+            self.assertEqual(clean.stdout, "No changes.")
+            self.assertTrue(result.ok, result.stderr)
+            self.assertIn("diff --git a/app.py b/app.py", result.stdout)
+            self.assertIn("-value = 1", result.stdout)
+            self.assertIn("+value = 2", result.stdout)
+            self.assertIn("diff --git a/other.py b/other.py", result.stdout)
+            self.assertIn("[untracked files]\nnew.py", result.stdout)
+            self.assertEqual(result.metadata["untracked_files"], ["new.py"])
+            self.assertEqual(result.exit_code, 0)
+            self.assertNotIn(".my-agent", result.stdout)
+            self.assertEqual(before, after)
+
+    def test_git_diff_scopes_nested_workspace_to_its_subdirectory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repository = Path(tmpdir)
+            workspace = repository / "workspace"
+            workspace.mkdir()
+            inside = workspace / "inside.py"
+            outside = repository / "outside.py"
+            inside.write_text("inside = 1\n", encoding="utf-8")
+            outside.write_text("outside = 1\n", encoding="utf-8")
+            _commit_workspace(repository)
+            inside.write_text("inside = 2\n", encoding="utf-8")
+            outside.write_text("outside = 2\n", encoding="utf-8")
+            (workspace / "inside-new.py").write_text("inside_new = True\n", encoding="utf-8")
+            (repository / "outside-new.py").write_text("outside_new = True\n", encoding="utf-8")
+            tool = GitDiffTool()
+            ctx = ToolContext(workspace=Workspace(workspace), permissions=PermissionPolicy())
+
+            result = tool.run({"path": "."}, ctx)
+
+            self.assertTrue(result.ok, result.stderr)
+            self.assertIn("inside.py", result.stdout)
+            self.assertIn("inside-new.py", result.stdout)
+            self.assertNotIn("outside.py", result.stdout)
+            self.assertNotIn("outside-new.py", result.stdout)
+
+    def test_git_diff_filters_paths_and_rejects_workspace_escape(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir, "workspace")
+            root.mkdir()
+            (root / "a.py").write_text("a = 1\n", encoding="utf-8")
+            (root / "b.py").write_text("b = 1\n", encoding="utf-8")
+            _commit_workspace(root)
+            (root / "a.py").write_text("a = 2\n", encoding="utf-8")
+            (root / "b.py").write_text("b = 2\n", encoding="utf-8")
+            tool = GitDiffTool()
+            ctx = ToolContext(workspace=Workspace(root), permissions=PermissionPolicy())
+
+            filtered = tool.run({"path": "a.py"}, ctx)
+            parent_escape = tool.run({"path": "../outside.py"}, ctx)
+            absolute = tool.run({"path": str(root / "a.py")}, ctx)
+
+            self.assertTrue(filtered.ok, filtered.stderr)
+            self.assertIn("a.py", filtered.stdout)
+            self.assertNotIn("b.py", filtered.stdout)
+            self.assertFalse(parent_escape.ok)
+            self.assertIn("workspace-relative", parent_escape.stderr)
+            self.assertFalse(absolute.ok)
+            self.assertIn("workspace-relative", absolute.stderr)
+
+    def test_git_diff_truncates_large_output(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            target = root / "large.txt"
+            target.write_text("old\n", encoding="utf-8")
+            _commit_workspace(root)
+            target.write_text("new line\n" * 2_000, encoding="utf-8")
+            tool = GitDiffTool()
+            ctx = ToolContext(workspace=Workspace(root), permissions=PermissionPolicy())
+
+            result = tool.run({"path": "."}, ctx)
+
+            self.assertTrue(result.ok, result.stderr)
+            self.assertTrue(result.truncated)
+            self.assertTrue(result.stdout.endswith("...[truncated]"))
+
+    def test_git_diff_requires_repository_with_head(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            tool = GitDiffTool()
+            ctx = ToolContext(workspace=Workspace(root), permissions=PermissionPolicy())
+
+            not_repository = tool.run({"path": "."}, ctx)
+            _git(root, "init", "-q")
+            without_head = tool.run({"path": "."}, ctx)
+
+            self.assertFalse(not_repository.ok)
+            self.assertIn("not a Git repository", not_repository.stderr)
+            self.assertFalse(without_head.ok)
+            self.assertIn("HEAD commit", without_head.stderr)
 
     def test_apply_patch_updates_adds_and_deletes_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:

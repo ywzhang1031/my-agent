@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
 from .messages import ToolCall
@@ -12,6 +14,7 @@ from .workspace import Workspace, WorkspaceError
 
 
 MAX_OUTPUT_CHARS = 12000
+MAX_UNTRACKED_FILES = 200
 
 
 @dataclass(frozen=True)
@@ -280,6 +283,142 @@ class ApplyPatchTool(ToolBase):
                 "changed_files": [applied.path],
             },
         )
+
+
+class GitDiffTool(ToolBase):
+    name = "git_diff"
+    description = "Show tracked changes from HEAD plus workspace-relative untracked file names."
+    parameters = {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Optional workspace-relative file or directory path.",
+            }
+        },
+        "additionalProperties": False,
+    }
+    strict = True
+
+    def run(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        try:
+            resolved, pathspec = _git_pathspec(arguments.get("path", "."), ctx.workspace)
+            repository = _run_git(ctx, ["rev-parse", "--is-inside-work-tree"])
+            if repository.returncode != 0 or repository.stdout.strip() != "true":
+                return ToolResult(
+                    ok=False,
+                    stderr="workspace is not a Git repository",
+                    exit_code=repository.returncode,
+                )
+            head = _run_git(ctx, ["rev-parse", "--verify", "HEAD"])
+            if head.returncode != 0:
+                return ToolResult(
+                    ok=False,
+                    stderr="Git repository has no HEAD commit",
+                    exit_code=head.returncode,
+                )
+
+            diff = _run_git(
+                ctx,
+                [
+                    "diff",
+                    "--no-color",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "HEAD",
+                    "--",
+                    pathspec,
+                ],
+            )
+            if diff.returncode != 0:
+                return ToolResult(
+                    ok=False,
+                    stderr=diff.stderr.strip() or "git diff failed",
+                    exit_code=diff.returncode,
+                )
+            untracked_result = _run_git(
+                ctx,
+                ["ls-files", "--others", "--exclude-standard", "-z", "--", pathspec],
+            )
+            if untracked_result.returncode != 0:
+                return ToolResult(
+                    ok=False,
+                    stderr=untracked_result.stderr.strip() or "git ls-files failed",
+                    exit_code=untracked_result.returncode,
+                )
+        except subprocess.TimeoutExpired:
+            return ToolResult(
+                ok=False,
+                stderr=f"git command timed out after {ctx.timeout_seconds}s",
+            )
+        except (OSError, ValueError, WorkspaceError) as exc:
+            return ToolResult(ok=False, stderr=str(exc))
+
+        all_untracked = sorted(
+            path
+            for path in untracked_result.stdout.split("\0")
+            if path and ".my-agent" not in {part.casefold() for part in PurePosixPath(path).parts}
+        )
+        untracked = all_untracked[:MAX_UNTRACKED_FILES]
+        untracked_truncated = len(all_untracked) > len(untracked)
+        sections: list[str] = []
+        if diff.stdout.strip():
+            sections.append(diff.stdout.rstrip())
+        if untracked:
+            listing = "[untracked files]\n" + "\n".join(untracked)
+            if untracked_truncated:
+                listing += "\n...[untracked files truncated]"
+            sections.append(listing)
+        output, output_truncated = _truncate("\n\n".join(sections) or "No changes.")
+        return ToolResult(
+            ok=True,
+            stdout=output,
+            exit_code=0,
+            truncated=output_truncated or untracked_truncated,
+            path=str(resolved),
+            metadata={
+                "base": "HEAD",
+                "path": pathspec,
+                "untracked_files": untracked,
+                "untracked_truncated": untracked_truncated,
+            },
+        )
+
+
+def _git_pathspec(path: Any, workspace: Workspace) -> tuple[Path, str]:
+    if not isinstance(path, str) or not path:
+        raise ValueError("git diff path must be a non-empty workspace-relative string")
+    candidate = Path(path)
+    if candidate.is_absolute() or any(part == ".." for part in candidate.parts):
+        raise ValueError("git diff path must be workspace-relative")
+    resolved = workspace.resolve(path)
+    relative = resolved.relative_to(workspace.root)
+    return resolved, "." if relative == Path(".") else relative.as_posix()
+
+
+def _run_git(
+    ctx: ToolContext,
+    arguments: list[str],
+) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_PAGER": "cat",
+            "GIT_TERMINAL_PROMPT": "0",
+            "LC_ALL": "C",
+        }
+    )
+    return subprocess.run(
+        ["git", "-c", "core.pager=cat", "-c", "color.ui=false", *arguments],
+        cwd=ctx.workspace.root,
+        env=environment,
+        text=True,
+        errors="replace",
+        capture_output=True,
+        timeout=ctx.timeout_seconds,
+        check=False,
+    )
 
 
 def _truncate(value: bytes | str, max_chars: int = MAX_OUTPUT_CHARS) -> tuple[str, bool]:
