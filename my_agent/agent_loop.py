@@ -13,10 +13,12 @@ from .workspace import Workspace
 
 
 DEFAULT_INSTRUCTIONS = """You are a coding agent operating inside one workspace.
-You may inspect files, search the repository, edit files with apply_patch, and run test commands.
+You may inspect files, search the repository, edit files with apply_patch, and run allowlisted
+test, check, or build processes with exec_command.
 Each apply_patch call must change exactly one workspace-relative file.
 Do not modify .git, .my-agent, or paths outside the workspace.
-After editing, inspect the actual changes with git_diff and run the narrowest relevant tests.
+Pass exec_command one structured argv array; shell operators and command strings are unsupported.
+After editing, inspect the actual changes with git_diff and run the narrowest relevant validation.
 Use read_file when you need the contents of an untracked file reported by git_diff.
 Return a concise result only after checking the changes and test evidence.
 """

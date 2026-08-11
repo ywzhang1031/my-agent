@@ -13,9 +13,25 @@ user task -> model -> tool call -> tool result -> model -> final answer
 - `search`
 - `apply_patch`
 - `git_diff`
-- `run_tests`
+- `exec_command`
 
-`run_tests` 只允许常见测试命令，例如 `python3 -m unittest`、`pytest`、`npm test`、`go test`。
+`exec_command` 接受结构化 `argv`、workspace-relative `cwd` 和受 harness 上限约束的
+`timeout_seconds`，不接受 shell command string。例如：
+
+```json
+{
+  "argv": ["python3", "-m", "unittest", "discover", "-s", "tests"],
+  "cwd": ".",
+  "timeout_seconds": 60
+}
+```
+
+当前 policy 只允许常见 test/check/build 形态，例如 `pytest`、`python -m unittest`、
+`ruff check`、`black --check`、`mypy`、`npm run lint`、`cargo check` 和 `go build`。
+它拒绝 shell operator、可执行文件路径、任意 Python 脚本、`python -c`、shell、安装命令
+和文件操作命令。子进程不接收 stdin/TTY，只继承筛选后的基础环境变量；provider API key
+不会传入。超时会终止整个 process group，stdout/stderr observation 各自最多保留
+12,000 bytes。
 `apply_patch` 每次只允许修改一个 workspace-relative 文件，支持 `Add File`、`Update File`
 和 `Delete File`。例如：
 
@@ -106,8 +122,9 @@ REPL 支持这些本地命令：
 - `provider.py`：定义统一 provider 协议和统一模型返回值
 - `providers/deepseek.py`：在统一消息与 DeepSeek Chat Completions 格式之间转换
 - `tools.py`：定义 tool schema、registry、执行入口和统一 `ToolResult`
+- `execution.py`：在清理后的环境中管理子进程、输出捕获、timeout 和 process group
 - `patches.py`：解析并提交单文件 patch，不依赖 shell 命令
-- `workspace.py` / `permissions.py`：限制路径范围、受保护目录和测试命令
+- `workspace.py` / `permissions.py`：限制路径范围、受保护目录和命令形态
 - `trace.py` / `trajectory.py`：分别保存 raw event log 和规范化 trajectory
 
 一次 turn 的调用顺序是：
@@ -122,8 +139,12 @@ CLI loads SessionState
   -> ToolResult becomes ToolResultMessage
   -> next model request sees the new observation
   -> after edits, git_diff exposes the actual working-tree delta
+  -> exec_command runs the narrowest allowlisted validation
   -> CLI saves messages, trace, and trajectory
 ```
+
+`exec_command` 的 allowlist 是 harness policy，不是安全 sandbox。被允许的 test/build
+命令仍会执行仓库中的代码，因此仍可能写文件、访问用户可读路径或尝试网络访问。
 
 `final_answer` 仍然是 harness 的判断：当规范化后的 `ProviderResponse.tool_calls`
 为空时，这次 turn 完成。它不代表整个 session 结束；是否继续下一轮由 CLI REPL 决定。

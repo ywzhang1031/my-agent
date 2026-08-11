@@ -1,10 +1,13 @@
 import io
 import json
+import os
 import subprocess
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
+from unittest.mock import patch
 
 from my_agent.agent_loop import AgentLoop
 from my_agent.cli import build_parser, build_tool_registry
@@ -15,10 +18,10 @@ from my_agent.providers.deepseek import DeepSeekProvider
 from my_agent.session import SessionStore
 from my_agent.tools import (
     ApplyPatchTool,
+    ExecCommandTool,
     GitDiffTool,
     ListFilesTool,
     ReadFileTool,
-    RunTestsTool,
     SearchTool,
     ToolContext,
     ToolRegistry,
@@ -172,7 +175,7 @@ class MyAgentTests(unittest.TestCase):
     def test_default_tool_registry_exposes_current_tools(self):
         self.assertEqual(
             build_tool_registry().names(),
-            ["apply_patch", "git_diff", "list_files", "read_file", "run_tests", "search"],
+            ["apply_patch", "exec_command", "git_diff", "list_files", "read_file", "search"],
         )
 
     def test_agent_loop_exposes_only_session_turn_entrypoint(self):
@@ -190,7 +193,7 @@ class MyAgentTests(unittest.TestCase):
             self.assertFalse(result.ok)
             self.assertIn("outside workspace", result.stderr)
 
-    def test_run_tests_allows_test_commands_and_rejects_mutating_commands(self):
+    def test_exec_command_allows_validation_commands_and_rejects_arbitrary_code(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             Path(tmpdir, "test_sample.py").write_text(
                 "import unittest\n\n"
@@ -205,15 +208,172 @@ class MyAgentTests(unittest.TestCase):
                 timeout_seconds=10,
             )
 
-            passing = RunTestsTool().run(
-                {"command": "python3 -m unittest discover -s ."}, ctx
+            passing = ExecCommandTool().run(
+                {"argv": ["python3", "-m", "unittest", "discover", "-s", "."]}, ctx
             )
-            denied = RunTestsTool().run({"command": "rm -rf ."}, ctx)
+            denied = ExecCommandTool().run(
+                {"argv": ["python3", "-c", "print('unsafe')"]}, ctx
+            )
 
             self.assertTrue(passing.ok, passing.stderr)
             self.assertEqual(passing.exit_code, 0)
+            self.assertEqual(passing.metadata["status"], "success")
+            self.assertEqual(passing.metadata["category"], "test")
             self.assertFalse(denied.ok)
             self.assertIn("not allowed", denied.stderr)
+            self.assertEqual(denied.metadata["status"], "denied")
+
+    def test_exec_command_policy_categorizes_supported_checks_and_builds(self):
+        policy = PermissionPolicy()
+
+        cases = [
+            (["ruff", "check", "."], "check"),
+            (["python3", "-m", "black", "--check", "."], "check"),
+            (["npm", "run", "lint"], "check"),
+            (["cargo", "check"], "check"),
+            (["go", "build", "./..."], "build"),
+        ]
+
+        for argv, category in cases:
+            with self.subTest(argv=argv):
+                decision = policy.decide_command(argv)
+                self.assertTrue(decision.allowed, decision.reason)
+                self.assertEqual(decision.category, category)
+
+        for argv in (["rm", "-rf", "."], ["bash", "-lc", "pytest"], ["./check.sh"]):
+            with self.subTest(argv=argv):
+                self.assertFalse(policy.decide_command(argv).allowed)
+
+    def test_exec_command_validates_argv_and_workspace_relative_cwd(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir, "workspace")
+            nested = root / "nested"
+            nested.mkdir(parents=True)
+            (nested / "test_nested.py").write_text(
+                "import unittest\n\n"
+                "class NestedTest(unittest.TestCase):\n"
+                "    def test_ok(self):\n"
+                "        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            outside = Path(tmpdir, "outside")
+            outside.mkdir()
+            (root / "outside-link").symlink_to(outside, target_is_directory=True)
+            ctx = ToolContext(workspace=Workspace(root), permissions=PermissionPolicy())
+            tool = ExecCommandTool()
+
+            nested_result = tool.run(
+                {
+                    "argv": ["python3", "-m", "unittest", "discover", "-s", "."],
+                    "cwd": "nested",
+                },
+                ctx,
+            )
+            invalid_argv = tool.run({"argv": "python3 -m unittest"}, ctx)
+            parent_escape = tool.run(
+                {"argv": ["python3", "-m", "unittest"], "cwd": "../outside"}, ctx
+            )
+            symlink_escape = tool.run(
+                {"argv": ["python3", "-m", "unittest"], "cwd": "outside-link"}, ctx
+            )
+
+            self.assertTrue(nested_result.ok, nested_result.stderr)
+            self.assertEqual(nested_result.metadata["cwd"], "nested")
+            self.assertFalse(invalid_argv.ok)
+            self.assertEqual(invalid_argv.metadata["status"], "invalid_request")
+            self.assertFalse(parent_escape.ok)
+            self.assertIn("workspace-relative", parent_escape.stderr)
+            self.assertFalse(symlink_escape.ok)
+            self.assertIn("outside workspace", symlink_escape.stderr)
+
+    def test_exec_command_strips_provider_secrets_from_child_environment(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "test_environment.py").write_text(
+                "import os\n"
+                "import unittest\n\n"
+                "class EnvironmentTest(unittest.TestCase):\n"
+                "    def test_provider_key_is_absent(self):\n"
+                "        self.assertNotIn('DEEPSEEK_API_KEY', os.environ)\n",
+                encoding="utf-8",
+            )
+            ctx = ToolContext(workspace=Workspace(tmpdir), permissions=PermissionPolicy())
+
+            with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "should-not-leak"}):
+                result = ExecCommandTool().run(
+                    {"argv": ["python3", "-m", "unittest", "discover", "-s", "."]},
+                    ctx,
+                )
+
+            self.assertTrue(result.ok, result.stderr)
+            self.assertNotIn("DEEPSEEK_API_KEY", result.metadata["environment_keys"])
+
+    def test_exec_command_reports_nonzero_exit_and_truncates_output(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "test_failure.py").write_text(
+                "import unittest\n\n"
+                "class FailureTest(unittest.TestCase):\n"
+                "    def test_failure(self):\n"
+                "        print('x' * 13000)\n"
+                "        self.fail('expected failure')\n",
+                encoding="utf-8",
+            )
+            ctx = ToolContext(workspace=Workspace(tmpdir), permissions=PermissionPolicy())
+
+            result = ExecCommandTool().run(
+                {"argv": ["python3", "-m", "unittest", "discover", "-s", "."]}, ctx
+            )
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.metadata["status"], "nonzero_exit")
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertTrue(result.truncated)
+            self.assertIn("...[truncated]", result.stdout)
+
+    def test_exec_command_reports_spawn_error(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ctx = ToolContext(workspace=Workspace(tmpdir), permissions=PermissionPolicy())
+
+            with patch.dict(os.environ, {"PATH": "/definitely-missing"}):
+                result = ExecCommandTool().run({"argv": ["ruff", "check", "."]}, ctx)
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.metadata["status"], "spawn_error")
+            self.assertIsNone(result.exit_code)
+
+    def test_exec_command_timeout_kills_the_process_group(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            marker = Path(tmpdir, "child-survived.txt")
+            Path(tmpdir, "test_timeout.py").write_text(
+                "import subprocess\n"
+                "import sys\n"
+                "import time\n"
+                "import unittest\n\n"
+                "class TimeoutTest(unittest.TestCase):\n"
+                "    def test_timeout(self):\n"
+                f"        code = \"import time; time.sleep(2); open({str(marker)!r}, 'w').write('alive')\"\n"
+                "        subprocess.Popen([sys.executable, '-c', code])\n"
+                "        time.sleep(30)\n",
+                encoding="utf-8",
+            )
+            ctx = ToolContext(
+                workspace=Workspace(tmpdir),
+                permissions=PermissionPolicy(),
+                timeout_seconds=5,
+            )
+
+            result = ExecCommandTool().run(
+                {
+                    "argv": ["python3", "-m", "unittest", "discover", "-s", "."],
+                    "timeout_seconds": 1,
+                },
+                ctx,
+            )
+            time.sleep(2.5)
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.metadata["status"], "timed_out")
+            self.assertTrue(result.metadata["timed_out"])
+            self.assertFalse(marker.exists())
 
     def test_git_diff_reports_tracked_and_untracked_changes_without_mutating_status(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -542,7 +702,7 @@ class MyAgentTests(unittest.TestCase):
                     ListFilesTool(),
                     ReadFileTool(),
                     SearchTool(),
-                    RunTestsTool(),
+                    ExecCommandTool(),
                 ]
             )
             provider = ScriptedProvider(
@@ -642,6 +802,61 @@ class MyAgentTests(unittest.TestCase):
                 observation["output"]["metadata"]["changed_files"],
                 ["app.py"],
             )
+
+    def test_agent_loop_records_exec_command_observation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace_path = Path(tmpdir, "workspace")
+            workspace_path.mkdir()
+            (workspace_path / "test_sample.py").write_text(
+                "import unittest\n\n"
+                "class SampleTest(unittest.TestCase):\n"
+                "    def test_ok(self):\n"
+                "        self.assertEqual(2 + 2, 4)\n",
+                encoding="utf-8",
+            )
+            store = SessionStore(Path(tmpdir, "sessions"))
+            state = store.create(workspace_path)
+            argv = ["python3", "-m", "unittest", "discover", "-s", "."]
+            provider = ScriptedProvider(
+                [
+                    ProviderResponse(
+                        tool_calls=[
+                            ToolCall(
+                                call_id="call_exec",
+                                name="exec_command",
+                                arguments={"argv": argv, "cwd": "."},
+                            )
+                        ],
+                        finish_reason="tool_calls",
+                    ),
+                    ProviderResponse(content="Validation passed.", finish_reason="stop"),
+                ]
+            )
+            loop = AgentLoop(
+                workspace=Workspace(workspace_path),
+                provider=provider,
+                tools=ToolRegistry([ExecCommandTool()]),
+                permissions=PermissionPolicy(),
+                trace=TraceRecorder(state.trace_path),
+                max_steps=4,
+            )
+
+            result = loop.run_turn(state, "Run the tests.")
+            trajectory = make_trajectory(
+                read_jsonl_trace(state.trace_path),
+                source_path=state.trace_path,
+            )
+            step = trajectory["turns"][0]["steps"][0]
+            action = step["actions"][0]
+            observation = step["observations"][0]
+
+            self.assertEqual(result.answer, "Validation passed.")
+            self.assertEqual(action["tool_name"], "exec_command")
+            self.assertEqual(action["arguments"]["argv"], argv)
+            self.assertTrue(observation["output"]["ok"])
+            self.assertEqual(observation["output"]["metadata"]["status"], "success")
+            self.assertEqual(observation["output"]["metadata"]["category"], "test")
+            self.assertEqual(observation["output"]["metadata"]["cwd"], ".")
 
     def test_deepseek_provider_translates_canonical_messages_and_tools(self):
         provider = DeepSeekProvider(api_key="test-key", model="deepseek-v4-flash")

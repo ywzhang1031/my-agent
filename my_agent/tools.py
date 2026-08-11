@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
+from .execution import ProcessRunner
 from .messages import ToolCall
 from .patches import MAX_PATCH_CHARS, apply_patch
 from .permissions import PermissionPolicy
@@ -15,6 +16,7 @@ from .workspace import Workspace, WorkspaceError
 
 MAX_OUTPUT_CHARS = 12000
 MAX_UNTRACKED_FILES = 200
+MAX_COMMAND_TIMEOUT_SECONDS = 300
 
 
 @dataclass(frozen=True)
@@ -188,51 +190,90 @@ class SearchTool(ToolBase):
             return ToolResult(ok=False, stderr=str(exc))
 
 
-class RunTestsTool(ToolBase):
-    name = "run_tests"
-    description = "Run an allowlisted test command without shell expansion."
+class ExecCommandTool(ToolBase):
+    name = "exec_command"
+    description = (
+        "Run one allowlisted test, check, or build process from a structured argv array. "
+        "Shell operators, scripts, arbitrary interpreters, stdin, and interactive commands "
+        "are not supported."
+    )
     parameters = {
         "type": "object",
         "properties": {
-            "command": {"type": "string", "description": "Test command to run."},
-            "timeout_seconds": {"type": "integer", "description": "Timeout in seconds."},
+            "argv": {
+                "type": "array",
+                "description": "Executable name and arguments as separate strings.",
+                "items": {"type": "string", "minLength": 1, "maxLength": 4096},
+                "minItems": 1,
+                "maxItems": 128,
+            },
+            "cwd": {
+                "type": "string",
+                "description": "Workspace-relative working directory. Defaults to '.'.",
+            },
+            "timeout_seconds": {
+                "type": "integer",
+                "description": "Timeout in seconds, capped by the harness limit.",
+                "minimum": 1,
+                "maximum": MAX_COMMAND_TIMEOUT_SECONDS,
+            },
         },
-        "required": ["command"],
+        "required": ["argv"],
         "additionalProperties": False,
     }
-    required = ["command"]
+    required = ["argv"]
+    strict = True
 
     def run(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        command = arguments.get("command", "")
-        allowed, reason, argv = ctx.permissions.allow_test_command(command)
-        if not allowed:
-            return ToolResult(ok=False, stderr=reason)
-        timeout = int(arguments.get("timeout_seconds", ctx.timeout_seconds))
-        try:
-            completed = subprocess.run(
-                argv,
-                cwd=ctx.workspace.root,
-                text=True,
-                capture_output=True,
-                timeout=timeout,
-                check=False,
+        decision = ctx.permissions.decide_command(arguments.get("argv"))
+        if not decision.allowed:
+            return ToolResult(
+                ok=False,
+                stderr=decision.reason,
+                metadata={
+                    "status": (
+                        "invalid_request" if decision.outcome == "invalid" else "denied"
+                    ),
+                    "category": decision.category,
+                    "normalized_argv": list(decision.argv),
+                },
             )
-        except subprocess.TimeoutExpired as exc:
-            stdout = _truncate(exc.stdout or "")
-            stderr = _truncate(exc.stderr or f"command timed out after {timeout}s")
-            return ToolResult(ok=False, stdout=stdout[0], stderr=stderr[0], truncated=stdout[1] or stderr[1])
-        except OSError as exc:
-            return ToolResult(ok=False, stderr=str(exc))
 
-        stdout, stdout_truncated = _truncate(completed.stdout)
-        stderr, stderr_truncated = _truncate(completed.stderr)
+        try:
+            cwd, relative_cwd = _command_cwd(arguments.get("cwd", "."), ctx.workspace)
+            timeout = _command_timeout(arguments.get("timeout_seconds"), ctx.timeout_seconds)
+        except (ValueError, WorkspaceError) as exc:
+            return ToolResult(
+                ok=False,
+                stderr=str(exc),
+                metadata={
+                    "status": "invalid_request",
+                    "category": decision.category,
+                    "normalized_argv": list(decision.argv),
+                },
+            )
+
+        execution = ProcessRunner(max_output_bytes=MAX_OUTPUT_CHARS).run(
+            argv=list(decision.argv),
+            cwd=cwd,
+            timeout_seconds=timeout,
+        )
         return ToolResult(
-            ok=completed.returncode == 0,
-            stdout=stdout,
-            stderr=stderr,
-            exit_code=completed.returncode,
-            truncated=stdout_truncated or stderr_truncated,
-            metadata={"command": argv},
+            ok=execution.status == "success",
+            stdout=execution.stdout,
+            stderr=execution.stderr,
+            exit_code=execution.exit_code,
+            truncated=execution.truncated,
+            metadata={
+                "status": execution.status,
+                "category": decision.category,
+                "normalized_argv": list(decision.argv),
+                "cwd": relative_cwd,
+                "timeout_seconds": timeout,
+                "timed_out": execution.timed_out,
+                "duration_ms": execution.duration_ms,
+                "environment_keys": list(execution.environment_keys),
+            },
         )
 
 
@@ -394,6 +435,32 @@ def _git_pathspec(path: Any, workspace: Workspace) -> tuple[Path, str]:
     resolved = workspace.resolve(path)
     relative = resolved.relative_to(workspace.root)
     return resolved, "." if relative == Path(".") else relative.as_posix()
+
+
+def _command_cwd(value: Any, workspace: Workspace) -> tuple[Path, str]:
+    if not isinstance(value, str) or not value:
+        raise ValueError("cwd must be a non-empty workspace-relative string")
+    candidate = Path(value)
+    if candidate.is_absolute() or any(part == ".." for part in candidate.parts):
+        raise ValueError("cwd must be workspace-relative and must not contain '..'")
+    resolved = workspace.resolve(value)
+    if not resolved.exists():
+        raise ValueError(f"cwd does not exist: {value}")
+    if not resolved.is_dir():
+        raise ValueError(f"cwd is not a directory: {value}")
+    relative = resolved.relative_to(workspace.root)
+    return resolved, "." if relative == Path(".") else relative.as_posix()
+
+
+def _command_timeout(value: Any, harness_limit: int) -> int:
+    requested = harness_limit if value is None else value
+    if isinstance(requested, bool) or not isinstance(requested, int):
+        raise ValueError("timeout_seconds must be an integer")
+    if requested < 1 or requested > MAX_COMMAND_TIMEOUT_SECONDS:
+        raise ValueError(
+            f"timeout_seconds must be between 1 and {MAX_COMMAND_TIMEOUT_SECONDS}"
+        )
+    return min(requested, harness_limit, MAX_COMMAND_TIMEOUT_SECONDS)
 
 
 def _run_git(

@@ -103,18 +103,41 @@
 `git_diff` 不写文件、不修改 index，也不运行 shell。它的结果继续使用通用
 `ToolResult -> ToolResultMessage -> observation` 路径，所以 trajectory schema 保持 v2。
 
+## Milestone 9: Structured Controlled Execution
+
+专用 `run_tests` 被直接替换为能力更通用、边界更明确的 `exec_command`，不保留旧接口。
+
+- tool input 从 command string 改为结构化 `argv`，因此不会启动 shell，也不解析管道、
+  重定向、command substitution 或 chaining。
+- `PermissionPolicy.decide_command()` 分别返回 `invalid`、`deny` 或 `allow`，并为允许的
+  命令标记 `test`、`check` 或 `build` category。
+- policy 按 executable、subcommand 和关键 flag 判断命令形态；拒绝 executable path、
+  Python `-c`/脚本、shell、package install 和直接文件操作。
+- `cwd` 必须是存在的 workspace-relative directory；`..`、绝对路径和解析到 workspace
+  外部的 symlink 都会被拒绝。
+- `ProcessRunner` 使用筛选后的环境变量，不把 DeepSeek 或其他 provider secret 传给子进程。
+- 子进程没有 stdin/TTY；输出通过临时文件捕获并截断；timeout 会终止整个 process group，
+  避免测试启动的子进程继续存活。
+- observation metadata 区分 `success`、`nonzero_exit`、`timed_out`、`spawn_error`、
+  `denied` 和 `invalid_request`，同时记录 category、normalized argv、cwd 和 duration。
+- agent loop、provider adapter、统一 message 和 trajectory schema 都不需要改变；它们只看到
+  新的 tool schema 和通用 `ToolResult`。
+
 ## Current Boundaries
 
 - `apply_patch` 可以自动修改 workspace 内的单个普通 UTF-8/LF 文件。
 - `git_diff` 只比较 `HEAD` 和当前工作树；untracked 文件只展示名称，不展示内容。
 - 文件写入没有交互 approval，也没有操作系统级 sandbox。
-- `run_tests` 使用命令 allowlist，但不是操作系统级 sandbox；测试代码仍可能产生副作用。
+- `exec_command` 只执行 allowlisted test/check/build argv，但不是操作系统级 sandbox；
+  被允许的项目代码仍可能写文件、读取用户文件或访问网络。
+- `exec_command` 不支持 shell command string、pipe/redirection、stdin、TTY、后台 session、
+  package install 或交互 approval。
 - 本地 `.my-agent/`、`trace.jsonl` 和 `trajectory.json` 默认不提交到 Git。
 - 当前只有 DeepSeek adapter，provider abstraction 已为其他模型保留边界。
 
 ## Next Candidates
 
-- 将 `run_tests` 扩展为受控 shell policy，并明确命令、环境变量和工作目录边界。
-- 将测试命令放入更强的 sandbox。
+- 使用 macOS Seatbelt、Linux bubblewrap 或 container 将允许的进程放入 OS sandbox。
+- 增加 allow/ask/deny approval flow，并把用户决策写入 trace。
 - 增加 context budget 和 conversation compaction。
 - 为真实任务建立 eval cases，并使用 trajectory 分析失败类型。
