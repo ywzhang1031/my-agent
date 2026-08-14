@@ -149,8 +149,11 @@
 request breakdown，而不是只展示一个总数。
 
 - 直接用 `prompt_toolkit` 替换 `readline/libedit` 输入后端，不保留两套终端实现。
-- 输入 `/` 自动展示 slash commands 和说明；`Tab`/`Shift-Tab` 选择，底部 toolbar 显示
-  context 百分比、估算用量、context limit 和 pending turn 状态。
+- 输入 `/` 自动展示 slash commands 和说明；`Shift-Tab` 反向选择，`Tab` 接受候选；完整
+  slash command 再按 `Tab` 会直接提交，与 Codex CLI 的两阶段行为一致。
+- 底部 toolbar 显示 context 百分比、估算用量、context limit 和 pending turn 状态。
+- `enable_history_search` 会关闭 `complete_while_typing`，因此保持普通上下键历史但禁用该选项；
+  对 stdin/stdout 都是 TTY 的进程显式提供 output，避免 `TERM=dumb` 触发无菜单的 dumb prompt。
 - prompt 出现前只计算一次 context snapshot，输入每个字符时复用缓存，避免长会话反复扫描。
 - `ContextBreakdown` 把实际 request 拆为 system prompt、tool definitions、conversation summary、
   active conversation 和 protocol overhead；所有类别之和必须等于 `estimated_tokens`。

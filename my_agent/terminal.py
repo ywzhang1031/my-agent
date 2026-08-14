@@ -13,6 +13,8 @@ from prompt_toolkit.document import Document
 from prompt_toolkit.formatted_text import AnyFormattedText
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.output import Output
+from prompt_toolkit.output.defaults import create_output
 from prompt_toolkit.shortcuts import CompleteStyle
 from prompt_toolkit.styles import Style
 
@@ -40,7 +42,8 @@ class SlashCommandCompleter(Completer):
             return
         lowered = prefix.lower()
         for command in self.commands:
-            if command.name.lower().startswith(lowered):
+            command_name = command.name.lower()
+            if command_name.startswith(lowered) and command_name != lowered:
                 yield Completion(
                     command.name,
                     start_position=-len(prefix),
@@ -72,6 +75,7 @@ class LineEditor:
         status_provider: Callable[[], AnyFormattedText] | None = None,
         prompt_session: Any | None = None,
     ) -> None:
+        command_list = tuple(commands)
         self.history_path = Path(history_path)
         self.status_provider = status_provider
         self.history_path.parent.mkdir(parents=True, exist_ok=True)
@@ -79,13 +83,14 @@ class LineEditor:
         self._secure_history()
         self.session = prompt_session or PromptSession(
             history=FileHistory(str(self.history_path)),
-            completer=SlashCommandCompleter(commands),
+            completer=SlashCommandCompleter(command_list),
             complete_while_typing=True,
             complete_style=CompleteStyle.COLUMN,
-            reserve_space_for_menu=10,
-            enable_history_search=True,
-            key_bindings=_completion_key_bindings(),
+            reserve_space_for_menu=max(10, len(command_list) + 2),
+            enable_history_search=False,
+            key_bindings=_completion_key_bindings(command_list),
             style=TERMINAL_STYLE,
+            output=_interactive_output(),
         )
 
     def __enter__(self) -> LineEditor:
@@ -138,7 +143,7 @@ def format_context_status(
         fragments.append(("class:bottom-toolbar.pending", "  pending turn"))
     fragments.extend(
         [
-            ("class:bottom-toolbar.hint", "  |  / commands  |  Tab select "),
+            ("class:bottom-toolbar.hint", "  |  / commands  |  Tab accept/run "),
         ]
     )
     return fragments
@@ -278,16 +283,27 @@ class StreamRenderer:
         self.status_output.flush()
 
 
-def _completion_key_bindings() -> KeyBindings:
+def _completion_key_bindings(commands: Iterable[SlashCommand]) -> KeyBindings:
     bindings = KeyBindings()
+    command_names = {command.name for command in commands}
 
     @bindings.add("tab")
-    def select_next_completion(event: Any) -> None:
+    def accept_completion_or_command(event: Any) -> None:
         buffer = event.app.current_buffer
-        if buffer.complete_state:
-            buffer.complete_next()
-        else:
-            buffer.start_completion(select_first=True)
+        completion_state = buffer.complete_state
+        if completion_state and completion_state.completions:
+            completion = completion_state.current_completion
+            buffer.apply_completion(completion or completion_state.completions[0])
+            return
+        document = buffer.document
+        if (
+            document.cursor_position == len(document.text)
+            and document.text in command_names
+        ):
+            buffer.validate_and_handle()
+            return
+        if document.text_before_cursor.startswith("/"):
+            buffer.start_completion(select_first=False)
 
     @bindings.add("s-tab")
     def select_previous_completion(event: Any) -> None:
@@ -298,6 +314,12 @@ def _completion_key_bindings() -> KeyBindings:
             buffer.start_completion(select_first=True)
 
     return bindings
+
+
+def _interactive_output() -> Output | None:
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        return create_output(stdout=sys.stdout)
+    return None
 
 
 def _context_bar(

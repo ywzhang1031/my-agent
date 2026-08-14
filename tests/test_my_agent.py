@@ -8,10 +8,14 @@ import time
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+from prompt_toolkit.buffer import Buffer, CompletionState
 from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.document import Document
+from prompt_toolkit.keys import Keys
+from prompt_toolkit.output import DummyOutput
 
 from my_agent.agent_loop import AgentEvent, AgentLoop
 from my_agent.cli import build_parser, build_tool_registry
@@ -26,6 +30,7 @@ from my_agent.terminal import (
     SlashCommand,
     SlashCommandCompleter,
     StreamRenderer,
+    _completion_key_bindings,
     format_context_status,
     render_context_usage,
 )
@@ -439,6 +444,12 @@ class MyAgentTests(unittest.TestCase):
                 CompleteEvent(completion_requested=True),
             )
         )
+        exact_matches = list(
+            completer.get_completions(
+                Document(text="/context", cursor_position=8),
+                CompleteEvent(completion_requested=True),
+            )
+        )
 
         self.assertEqual([match.text for match in matches], ["/context"])
         self.assertEqual(matches[0].display_meta_text, "Show context usage")
@@ -447,6 +458,68 @@ class MyAgentTests(unittest.TestCase):
             ["/context", "/retry"],
         )
         self.assertEqual(prose_matches, [])
+        self.assertEqual(exact_matches, [])
+
+    def test_tab_accepts_completion_then_submits_complete_slash_command(self):
+        bindings = _completion_key_bindings(
+            [SlashCommand("/context", "Show context usage")]
+        )
+        tab_handler = next(
+            binding.handler
+            for binding in bindings.bindings
+            if binding.keys == (Keys.ControlI,)
+        )
+        accepted = []
+        buffer = Buffer(
+            document=Document(text="/co", cursor_position=3),
+            accept_handler=lambda current: accepted.append(current.text),
+            multiline=False,
+        )
+        buffer.complete_state = CompletionState(
+            buffer.document,
+            list(
+                SlashCommandCompleter(
+                    [SlashCommand("/context", "Show context usage")]
+                ).get_completions(
+                    buffer.document,
+                    CompleteEvent(completion_requested=True),
+                )
+            ),
+        )
+        event = SimpleNamespace(app=SimpleNamespace(current_buffer=buffer))
+
+        tab_handler(event)
+
+        self.assertEqual(buffer.text, "/context")
+        self.assertIsNone(buffer.complete_state)
+        self.assertEqual(accepted, [])
+
+        tab_handler(event)
+
+        self.assertEqual(accepted, ["/context"])
+        self.assertEqual(buffer.text, "")
+
+    def test_tab_does_not_submit_regular_text(self):
+        bindings = _completion_key_bindings(
+            [SlashCommand("/context", "Show context usage")]
+        )
+        tab_handler = next(
+            binding.handler
+            for binding in bindings.bindings
+            if binding.keys == (Keys.ControlI,)
+        )
+        accepted = []
+        buffer = Buffer(
+            document=Document(text="inspect this repo", cursor_position=17),
+            accept_handler=lambda current: accepted.append(current.text),
+            multiline=False,
+        )
+        event = SimpleNamespace(app=SimpleNamespace(current_buffer=buffer))
+
+        tab_handler(event)
+
+        self.assertEqual(buffer.text, "inspect this repo")
+        self.assertEqual(accepted, [])
 
     def test_line_editor_passes_status_toolbar_and_secures_history(self):
         class FakePromptSession:
@@ -478,6 +551,23 @@ class MyAgentTests(unittest.TestCase):
             self.assertEqual(fake_session.calls[0][0], "you> ")
             self.assertIs(fake_session.calls[0][1]["bottom_toolbar"], status_provider)
             self.assertEqual(history_path.stat().st_mode & 0o777, 0o600)
+
+    def test_line_editor_enables_live_menu_with_explicit_terminal_output(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = DummyOutput()
+            with redirect_stderr(io.StringIO()), patch.dict(
+                os.environ, {"TERM": "dumb"}
+            ), patch(
+                "my_agent.terminal._interactive_output",
+                return_value=output,
+            ):
+                editor = LineEditor(
+                    history_path=Path(tmpdir, "history"),
+                    commands=[SlashCommand("/context", "Show context usage")],
+                )
+
+            self.assertIs(editor.session._output, output)
+            self.assertTrue(editor.session.default_buffer.complete_while_typing())
 
     def test_context_usage_panel_and_toolbar_show_real_breakdown(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -512,7 +602,7 @@ class MyAgentTests(unittest.TestCase):
             self.assertIn("Last provider input", panel)
             self.assertIn("context", toolbar)
             self.assertIn("/ commands", toolbar)
-            self.assertIn("Tab select", toolbar)
+            self.assertIn("Tab accept/run", toolbar)
 
     def test_chat_help_lists_itself(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -102,9 +102,12 @@ REPL 支持这些本地命令：
 - `/help`：显示命令帮助
 
 REPL 使用 `prompt_toolkit`，支持左右移动光标、行内插入和上下方向键历史。输入 `/` 会显示
-全部 slash commands 及说明；`Tab`/`Shift-Tab` 选择候选，`Enter` 执行。底部状态栏持续显示
-context 百分比、估算用量和 pending 状态。历史保存在 `.my-agent/history`，权限设为 `0600`。
+全部 slash commands 及说明；`Shift-Tab` 反向选择候选，`Tab` 接受当前候选，再按一次 `Tab`
+可执行完整命令，`Enter` 也可执行。底部状态栏持续显示 context 百分比、估算用量和 pending
+状态。历史保存在 `.my-agent/history`，权限设为 `0600`。
 输入过程中按 `Ctrl-C` 只清空当前行；模型调用失败后可以执行 `/retry` 或 `/abort`。
+交互 stdin/stdout 是 TTY 时，CLI 会显式启用完整 terminal layout；即使宿主错误地报告
+`TERM=dumb`，slash menu 也不会退化为纯文本 `input()`。
 
 `/context` 会展开当前 request 的分类账单：`System prompt`、`Tool definitions`、
 `Conversation summary`、`Conversation` 和 `Protocol overhead`。它还会显示完整 context limit、
