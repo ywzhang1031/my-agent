@@ -2,6 +2,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -9,15 +10,25 @@ from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
+from prompt_toolkit.completion import CompleteEvent
+from prompt_toolkit.document import Document
+
 from my_agent.agent_loop import AgentEvent, AgentLoop
 from my_agent.cli import build_parser, build_tool_registry
-from my_agent.context import ContextManager
+from my_agent.context import ContextManager, estimate_text_tokens
 from my_agent.messages import AssistantMessage, ToolCall, ToolResultMessage, UserMessage
 from my_agent.permissions import PermissionPolicy
 from my_agent.provider import ProviderError, ProviderResponse, ScriptedProvider
 from my_agent.providers.deepseek import DeepSeekProvider
 from my_agent.session import PendingTurn, SessionStore
-from my_agent.terminal import LineEditor, StreamRenderer
+from my_agent.terminal import (
+    LineEditor,
+    SlashCommand,
+    SlashCommandCompleter,
+    StreamRenderer,
+    format_context_status,
+    render_context_usage,
+)
 from my_agent.tools import (
     ApplyPatchTool,
     ExecCommandTool,
@@ -351,6 +362,25 @@ class MyAgentTests(unittest.TestCase):
             self.assertIn("<conversation_summary>", snapshot.system_prompt)
             self.assertLessEqual(snapshot.estimated_tokens, snapshot.input_budget)
             self.assertGreater(snapshot.compacted_messages, 0)
+            self.assertEqual(snapshot.breakdown.total_tokens, snapshot.estimated_tokens)
+            self.assertGreater(snapshot.breakdown.system_prompt_tokens, 0)
+            self.assertGreater(snapshot.breakdown.tool_definition_tokens, 0)
+            self.assertGreater(snapshot.breakdown.summary_tokens, 0)
+            self.assertGreater(snapshot.breakdown.conversation_tokens, 0)
+            self.assertEqual(
+                snapshot.breakdown.system_prompt_tokens
+                + snapshot.breakdown.summary_tokens,
+                estimate_text_tokens(snapshot.system_prompt),
+            )
+            self.assertEqual(snapshot.context_window_tokens, 900)
+            self.assertEqual(snapshot.reserve_output_tokens, 200)
+
+            without_tools = manager.inspect(
+                state=state,
+                tools=[],
+                system_prompt="You are a coding agent.",
+            )
+            self.assertEqual(without_tools.breakdown.tool_definition_tokens, 0)
 
     def test_cli_only_accepts_current_subcommands(self):
         parser = build_parser()
@@ -383,53 +413,112 @@ class MyAgentTests(unittest.TestCase):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             parser.parse_args(["--workspace", "/tmp/repo", "inspect", "this", "repo"])
 
-    def test_line_editor_enables_navigation_and_persists_history(self):
-        class FakeReadline:
+    def test_slash_command_completer_only_matches_command_prefixes(self):
+        completer = SlashCommandCompleter(
+            [
+                SlashCommand("/context", "Show context usage"),
+                SlashCommand("/retry", "Retry pending turn"),
+            ]
+        )
+
+        matches = list(
+            completer.get_completions(
+                Document(text="/co", cursor_position=3),
+                CompleteEvent(completion_requested=True),
+            )
+        )
+        all_matches = list(
+            completer.get_completions(
+                Document(text="/", cursor_position=1),
+                CompleteEvent(completion_requested=True),
+            )
+        )
+        prose_matches = list(
+            completer.get_completions(
+                Document(text="explain /co", cursor_position=11),
+                CompleteEvent(completion_requested=True),
+            )
+        )
+
+        self.assertEqual([match.text for match in matches], ["/context"])
+        self.assertEqual(matches[0].display_meta_text, "Show context usage")
+        self.assertEqual(
+            [match.text for match in all_matches],
+            ["/context", "/retry"],
+        )
+        self.assertEqual(prose_matches, [])
+
+    def test_line_editor_passes_status_toolbar_and_secures_history(self):
+        class FakePromptSession:
             def __init__(self):
-                self.loaded = None
-                self.written = None
-                self.bindings = []
-                self.history_length = None
+                self.calls = []
 
-            def read_history_file(self, path):
-                self.loaded = path
-
-            def write_history_file(self, path):
-                self.written = path
-                Path(path).write_text("history\n", encoding="utf-8")
-
-            def parse_and_bind(self, binding):
-                self.bindings.append(binding)
-
-            def set_history_length(self, length):
-                self.history_length = length
+            def prompt(self, prompt, **kwargs):
+                self.calls.append((prompt, kwargs))
+                return "edited"
 
         with tempfile.TemporaryDirectory() as tmpdir:
             history_path = Path(tmpdir, "state", "history")
             history_path.parent.mkdir()
             history_path.write_text("old command\n", encoding="utf-8")
-            fake_readline = FakeReadline()
+            os.chmod(history_path, 0o644)
+            fake_session = FakePromptSession()
+            status_provider = lambda: [("class:toolbar", "context 1%")]
             editor = LineEditor(
                 history_path=history_path,
-                readline_module=fake_readline,
-                input_func=lambda prompt: f"{prompt}edited",
+                commands=[SlashCommand("/context", "Show context usage")],
+                status_provider=status_provider,
+                prompt_session=fake_session,
             )
 
             with editor:
                 value = editor.read("you> ")
 
-            self.assertEqual(value, "you> edited")
-            self.assertEqual(fake_readline.loaded, str(history_path))
-            self.assertEqual(fake_readline.written, str(history_path))
-            self.assertIn("set editing-mode emacs", fake_readline.bindings)
-            self.assertEqual(fake_readline.history_length, 500)
+            self.assertEqual(value, "edited")
+            self.assertEqual(fake_session.calls[0][0], "you> ")
+            self.assertIs(fake_session.calls[0][1]["bottom_toolbar"], status_provider)
             self.assertEqual(history_path.stat().st_mode & 0o777, 0o600)
+
+    def test_context_usage_panel_and_toolbar_show_real_breakdown(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace_path = Path(tmpdir, "workspace")
+            workspace_path.mkdir()
+            state = SessionStore(Path(tmpdir, "sessions")).create(workspace_path)
+            state.messages.append(UserMessage(content="Inspect app.py"))
+            manager = ContextManager(
+                context_window_tokens=1_000,
+                reserve_output_tokens=200,
+            )
+            snapshot = manager.inspect(
+                state=state,
+                tools=[ListFilesTool().spec()],
+                system_prompt="You are a coding agent.",
+            )
+
+            panel = render_context_usage(
+                snapshot,
+                last_provider_input=123,
+                width=24,
+                color=False,
+            )
+            toolbar = "".join(text for _, text in format_context_status(snapshot))
+
+            self.assertIn("Context Usage", panel)
+            self.assertIn("System prompt", panel)
+            self.assertIn("Tool definitions", panel)
+            self.assertIn("Conversation summary", panel)
+            self.assertIn("Conversation", panel)
+            self.assertIn("Protocol overhead", panel)
+            self.assertIn("Last provider input", panel)
+            self.assertIn("context", toolbar)
+            self.assertIn("/ commands", toolbar)
+            self.assertIn("Tab select", toolbar)
 
     def test_chat_help_lists_itself(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             completed = subprocess.run(
                 [
-                    "python3",
+                    sys.executable,
                     "cli.py",
                     "chat",
                     "--workspace",
@@ -445,7 +534,8 @@ class MyAgentTests(unittest.TestCase):
             )
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertIn("/trace /tools /help /exit", completed.stdout)
+        self.assertIn("/help       Show slash commands", completed.stdout)
+        self.assertIn("use Tab/Shift-Tab to select", completed.stdout)
 
     def test_stream_renderer_displays_reasoning_content_and_tool_progress(self):
         output = io.StringIO()

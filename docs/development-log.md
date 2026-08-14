@@ -143,6 +143,21 @@
 - trajectory schema 升级为 `my-agent.trajectory.v3`，记录 context snapshot、provider retry、
   turn error/abort 和新 metrics。
 
+## Milestone 11: Discoverable Terminal and Context Accounting
+
+交互层从基础 line editing 升级为可发现的 command palette，同时让 context UI 使用真实的
+request breakdown，而不是只展示一个总数。
+
+- 直接用 `prompt_toolkit` 替换 `readline/libedit` 输入后端，不保留两套终端实现。
+- 输入 `/` 自动展示 slash commands 和说明；`Tab`/`Shift-Tab` 选择，底部 toolbar 显示
+  context 百分比、估算用量、context limit 和 pending turn 状态。
+- prompt 出现前只计算一次 context snapshot，输入每个字符时复用缓存，避免长会话反复扫描。
+- `ContextBreakdown` 把实际 request 拆为 system prompt、tool definitions、conversation summary、
+  active conversation 和 protocol overhead；所有类别之和必须等于 `estimated_tokens`。
+- `/context` 展示分类进度条、input budget、reserved output、最近 provider input usage 和消息数。
+- UI 不显示当前 request 中不存在的 Rules、Skills、MCP 或 subagent 分类。
+- history 继续持久化到 `.my-agent/history`，每次读取后收紧为 `0600`。
+
 ## Current Boundaries
 
 - `apply_patch` 可以自动修改 workspace 内的单个普通 UTF-8/LF 文件。
@@ -154,6 +169,8 @@
   package install 或交互 approval。
 - context token 是字符启发式估算，不是 DeepSeek tokenizer 的精确结果；compaction 使用
   确定性 extractive summary，不是模型生成的语义摘要。
+- context breakdown 同样是估算值；provider usage 只能给出精确总 input，不能反推每类的精确
+  tokenizer 计数。
 - stream 在已经显示部分 delta 后不会自动重放；用户必须使用 `/retry` 或 `/abort`。
 - `/abort` 只清理 conversation state，不回滚已经执行的文件修改或进程副作用。
 - 本地 `.my-agent/`、`trace.jsonl` 和 `trajectory.json` 默认不提交到 Git。

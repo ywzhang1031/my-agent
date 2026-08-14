@@ -57,12 +57,19 @@ Git 仓库中。
 
 ## Run
 
+先安装唯一的终端 UI 依赖：
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+```
+
 CLI 只提供 `ask`、`chat` 和 `resume` 三个 session-aware 入口。
 执行一个可恢复的单轮任务：
 
 ```bash
 export DEEPSEEK_API_KEY=...
-python3 cli.py ask \
+.venv/bin/python cli.py ask \
   --model deepseek-v4-flash \
   --workspace . \
   "Inspect this repo and suggest what to test."
@@ -72,13 +79,13 @@ python3 cli.py ask \
 stdout。之后可以用同一个 ID 继续对话：
 
 ```bash
-python3 cli.py resume <session_id> --workspace .
+.venv/bin/python cli.py resume <session_id> --workspace .
 ```
 
 要直接进入多轮 REPL：
 
 ```bash
-python3 cli.py chat --workspace .
+.venv/bin/python cli.py chat --workspace .
 ```
 
 REPL 支持这些本地命令：
@@ -94,16 +101,22 @@ REPL 支持这些本地命令：
 - `/abort`：丢弃 pending turn 的消息；已经产生的文件或进程副作用不会回滚
 - `/help`：显示命令帮助
 
-REPL 使用系统 `readline`/macOS `libedit`，支持左右移动光标、行内插入、上下方向键历史
-和 Emacs 风格快捷键。历史保存在 `.my-agent/history`，权限设为 `0600`。输入过程中按
-`Ctrl-C` 只清空当前行；模型调用失败后可以执行 `/retry` 或 `/abort`。
+REPL 使用 `prompt_toolkit`，支持左右移动光标、行内插入和上下方向键历史。输入 `/` 会显示
+全部 slash commands 及说明；`Tab`/`Shift-Tab` 选择候选，`Enter` 执行。底部状态栏持续显示
+context 百分比、估算用量和 pending 状态。历史保存在 `.my-agent/history`，权限设为 `0600`。
+输入过程中按 `Ctrl-C` 只清空当前行；模型调用失败后可以执行 `/retry` 或 `/abort`。
+
+`/context` 会展开当前 request 的分类账单：`System prompt`、`Tool definitions`、
+`Conversation summary`、`Conversation` 和 `Protocol overhead`。它还会显示完整 context limit、
+输入预算、输出预留、最近一次 provider input usage，以及 active/summarized message 数量。没有
+注入 request 的 Rules、Skills、MCP 或 subagent 不会为了界面效果显示成虚构分类。
 
 默认启用流式输出；`--no-stream` 可以只在本轮结束时显示完整答案。thinking 默认仍会发给
 DeepSeek，但 CLI 只显示 `thinking...` 状态；使用 `--show-thinking` 才会流式打印
 `reasoning_content`。context 上限和输出预留可以显式覆盖：
 
 ```bash
-python3 cli.py chat \
+.venv/bin/python cli.py chat \
   --context-window-tokens 1000000 \
   --max-output-tokens 64000 \
   --show-thinking
@@ -138,7 +151,7 @@ python3 cli.py chat \
 代码按这几个边界拆分：
 
 - `cli.py`：解析 `ask/chat/resume`，控制 REPL，并在每轮后保存 session
-- `terminal.py`：封装 line editor/history 和流式终端渲染，不参与 agent 决策
+- `terminal.py`：封装 command completion、context UI、history 和流式渲染，不参与 agent 决策
 - `session.py`：序列化统一 `Message`、context 状态和可重试的 `PendingTurn`
 - `context.py`：估算 token、保留 active turn，并摘要压缩较老的 completed turns
 - `agent_loop.py`：维护 model -> tool -> observation -> model 循环，并发出统一 `AgentEvent`
@@ -173,7 +186,8 @@ CLI loads SessionState
 Context token 数量是保守估算，不是 provider tokenizer 的精确计数。达到输入预算的 85% 时，
 `ContextManager` 会按完整 user turn 边界压缩较老历史，目标降到 70%；当前 active turn、最近
 原始消息和完整本地 `messages.jsonl` 会保留。摘要是确定性的 extractive summary，不会递归
-调用模型，因此它便宜且可预测，但不等同于语义无损记忆。
+调用模型，因此它便宜且可预测，但不等同于语义无损记忆。分类 breakdown 与发送前的同一份
+`ContextSnapshot` 一起生成，类别之和必须等于 `estimated_tokens`，终端不会另算一套数字。
 
 DeepSeek adapter 只会在尚未向终端输出任何 `content`/`reasoning_content` delta 时自动重试
 可重试错误。流中途失败时自动重放可能造成重复文本，所以 harness 保留 `PendingTurn`，由用户
@@ -189,7 +203,7 @@ DeepSeek adapter 只会在尚未向终端输出任何 `content`/`reasoning_conte
 ## Test
 
 ```bash
-PYTHONPATH=. python3 -m unittest discover -s tests
+PYTHONPATH=. .venv/bin/python -m unittest discover -s tests
 ```
 
 ## Development Log

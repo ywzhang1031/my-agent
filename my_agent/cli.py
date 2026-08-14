@@ -8,7 +8,13 @@ from .agent_loop import AgentLoop
 from .permissions import PermissionPolicy
 from .providers.deepseek import DeepSeekProvider
 from .session import SessionState, SessionStore
-from .terminal import LineEditor, StreamRenderer
+from .terminal import (
+    LineEditor,
+    SlashCommand,
+    StreamRenderer,
+    format_context_status,
+    render_context_usage,
+)
 from .tools import (
     ApplyPatchTool,
     ExecCommandTool,
@@ -21,6 +27,20 @@ from .tools import (
 from .trace import TraceRecorder
 from .trajectory import make_trajectory, read_jsonl_trace, write_trajectory_json
 from .workspace import Workspace
+
+
+SLASH_COMMANDS = (
+    SlashCommand("/new", "Start a new session"),
+    SlashCommand("/sessions", "List saved sessions"),
+    SlashCommand("/summary", "Show current session state"),
+    SlashCommand("/context", "Show detailed context usage"),
+    SlashCommand("/retry", "Resume the pending model step"),
+    SlashCommand("/abort", "Discard the pending turn"),
+    SlashCommand("/trace", "Show the raw trace path"),
+    SlashCommand("/tools", "List available tools"),
+    SlashCommand("/help", "Show slash commands"),
+    SlashCommand("/exit", "Save and exit"),
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -155,8 +175,22 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
     print(f"session: {state.session_id}")
 
     history_path = store.root.parent / "history"
-    with LineEditor(history_path) as editor:
+    toolbar = []
+
+    def current_toolbar():
+        return toolbar
+
+    with LineEditor(
+        history_path,
+        commands=SLASH_COMMANDS,
+        status_provider=current_toolbar,
+    ) as editor:
         while True:
+            snapshot = loop.inspect_context(state)
+            toolbar = format_context_status(
+                snapshot,
+                pending=state.pending_turn is not None,
+            )
             try:
                 user_input = editor.read("you> ").strip()
             except KeyboardInterrupt:
@@ -196,10 +230,11 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
             if user_input == "/context":
                 snapshot = loop.inspect_context(state)
                 print(
-                    f"estimated={snapshot.estimated_tokens}/{snapshot.input_budget} "
-                    f"active_messages={snapshot.active_messages} "
-                    f"summarized_messages={snapshot.summarized_messages} "
-                    f"last_usage={state.last_input_tokens}+{state.last_output_tokens}"
+                    render_context_usage(
+                        snapshot,
+                        last_provider_input=state.last_input_tokens,
+                        color=sys.stdout.isatty(),
+                    )
                 )
                 continue
             if user_input == "/retry":
@@ -228,10 +263,10 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                 print("\n".join(registry.names()))
                 continue
             if user_input == "/help":
-                print(
-                    "/new /sessions /summary /context /retry /abort "
-                    "/trace /tools /help /exit"
-                )
+                print("Commands")
+                for command in SLASH_COMMANDS:
+                    print(f"  {command.name:<12}{command.description}")
+                print("\nType / to open the menu; use Tab/Shift-Tab to select.")
                 continue
             if user_input.startswith("/"):
                 print(f"unknown command: {user_input}")

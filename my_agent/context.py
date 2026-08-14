@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass
+from typing import Any
 
 from .messages import AssistantMessage, Message, ToolResultMessage, UserMessage
 from .session import SessionState
@@ -14,22 +15,57 @@ class ContextWindowError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class ContextBreakdown:
+    system_prompt_tokens: int
+    tool_definition_tokens: int
+    summary_tokens: int
+    conversation_tokens: int
+    protocol_tokens: int
+
+    @property
+    def total_tokens(self) -> int:
+        return (
+            self.system_prompt_tokens
+            + self.tool_definition_tokens
+            + self.summary_tokens
+            + self.conversation_tokens
+            + self.protocol_tokens
+        )
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "system_prompt_tokens": self.system_prompt_tokens,
+            "tool_definition_tokens": self.tool_definition_tokens,
+            "summary_tokens": self.summary_tokens,
+            "conversation_tokens": self.conversation_tokens,
+            "protocol_tokens": self.protocol_tokens,
+            "total_tokens": self.total_tokens,
+        }
+
+
+@dataclass(frozen=True)
 class ContextSnapshot:
     messages: list[Message]
     system_prompt: str
     estimated_tokens: int
+    context_window_tokens: int
     input_budget: int
+    reserve_output_tokens: int
     active_messages: int
     summarized_messages: int
+    breakdown: ContextBreakdown
     compacted_messages: int = 0
 
-    def to_dict(self) -> dict[str, int]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "estimated_tokens": self.estimated_tokens,
+            "context_window_tokens": self.context_window_tokens,
             "input_budget": self.input_budget,
+            "reserve_output_tokens": self.reserve_output_tokens,
             "active_messages": self.active_messages,
             "summarized_messages": self.summarized_messages,
             "compacted_messages": self.compacted_messages,
+            "breakdown": self.breakdown.to_dict(),
         }
 
 
@@ -128,14 +164,22 @@ class ContextManager:
             raise ContextWindowError("session summarized_message_count is invalid")
         active_messages = list(state.messages[start:])
         effective_prompt = _with_summary(system_prompt, state.context_summary)
-        estimated_tokens = estimate_request_tokens(effective_prompt, active_messages, tools)
+        breakdown = estimate_request_breakdown(
+            system_prompt=system_prompt,
+            conversation_summary=state.context_summary,
+            messages=active_messages,
+            tools=tools,
+        )
         return ContextSnapshot(
             messages=active_messages,
             system_prompt=effective_prompt,
-            estimated_tokens=estimated_tokens,
+            estimated_tokens=breakdown.total_tokens,
+            context_window_tokens=self.context_window_tokens,
             input_budget=self.input_budget,
+            reserve_output_tokens=self.reserve_output_tokens,
             active_messages=len(active_messages),
             summarized_messages=start,
+            breakdown=breakdown,
             compacted_messages=compacted_messages,
         )
 
@@ -152,6 +196,21 @@ def estimate_request_tokens(
     messages: list[Message],
     tools: list[ToolSpec],
 ) -> int:
+    return estimate_request_breakdown(
+        system_prompt=system_prompt,
+        conversation_summary="",
+        messages=messages,
+        tools=tools,
+    ).total_tokens
+
+
+def estimate_request_breakdown(
+    *,
+    system_prompt: str,
+    conversation_summary: str,
+    messages: list[Message],
+    tools: list[ToolSpec],
+) -> ContextBreakdown:
     tool_payload = [
         {
             "name": tool.name,
@@ -160,10 +219,28 @@ def estimate_request_tokens(
         }
         for tool in tools
     ]
-    total = estimate_text_tokens(system_prompt)
-    total += estimate_text_tokens(json.dumps(tool_payload, ensure_ascii=False))
-    total += sum(estimate_text_tokens(_message_payload(message)) for message in messages)
-    return total + 16
+    effective_prompt = _with_summary(system_prompt, conversation_summary)
+    effective_system_prompt = (
+        system_prompt.rstrip() if conversation_summary else system_prompt
+    )
+    system_prompt_tokens = estimate_text_tokens(effective_system_prompt)
+    summary_tokens = 0
+    if conversation_summary:
+        effective_prompt_tokens = estimate_text_tokens(effective_prompt)
+        summary_tokens = max(0, effective_prompt_tokens - system_prompt_tokens)
+    return ContextBreakdown(
+        system_prompt_tokens=system_prompt_tokens,
+        tool_definition_tokens=(
+            estimate_text_tokens(json.dumps(tool_payload, ensure_ascii=False))
+            if tool_payload
+            else 0
+        ),
+        summary_tokens=summary_tokens,
+        conversation_tokens=sum(
+            estimate_text_tokens(_message_payload(message)) for message in messages
+        ),
+        protocol_tokens=16,
+    )
 
 
 def estimate_text_tokens(text: str) -> int:
