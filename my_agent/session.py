@@ -12,6 +12,16 @@ from .messages import AssistantMessage, Message, ToolCall, ToolResultMessage, Us
 
 
 @dataclass
+class PendingTurn:
+    turn_id: str
+    task: str
+    message_start: int
+    step: int = 1
+    tool_calls_executed: int = 0
+    seen_calls: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
 class SessionState:
     session_id: str
     workspace: str
@@ -19,6 +29,11 @@ class SessionState:
     created_at: str
     updated_at: str
     messages: list[Message] = field(default_factory=list)
+    context_summary: str = ""
+    summarized_message_count: int = 0
+    last_input_tokens: int = 0
+    last_output_tokens: int = 0
+    pending_turn: PendingTurn | None = None
 
     @property
     def metadata_path(self) -> Path:
@@ -35,6 +50,16 @@ class SessionState:
     @property
     def trajectory_path(self) -> Path:
         return self.session_dir / "trajectory.json"
+
+    def abandon_pending_turn(self) -> PendingTurn:
+        if self.pending_turn is None:
+            raise ValueError("session has no pending turn")
+        pending = self.pending_turn
+        if pending.message_start < self.summarized_message_count:
+            raise ValueError("pending turn overlaps compacted context")
+        del self.messages[pending.message_start :]
+        self.pending_turn = None
+        return pending
 
 
 @dataclass(frozen=True)
@@ -100,6 +125,11 @@ class SessionStore:
             created_at=metadata["created_at"],
             updated_at=metadata["updated_at"],
             messages=messages,
+            context_summary=metadata.get("context_summary", ""),
+            summarized_message_count=int(metadata.get("summarized_message_count", 0)),
+            last_input_tokens=int(metadata.get("last_input_tokens", 0)),
+            last_output_tokens=int(metadata.get("last_output_tokens", 0)),
+            pending_turn=_pending_turn_from_dict(metadata.get("pending_turn")),
         )
 
     def save(self, state: SessionState) -> None:
@@ -111,6 +141,11 @@ class SessionStore:
             "created_at": state.created_at,
             "updated_at": state.updated_at,
             "message_count": len(state.messages),
+            "context_summary": state.context_summary,
+            "summarized_message_count": state.summarized_message_count,
+            "last_input_tokens": state.last_input_tokens,
+            "last_output_tokens": state.last_output_tokens,
+            "pending_turn": _pending_turn_to_dict(state.pending_turn),
         }
         state.metadata_path.write_text(
             json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
@@ -194,3 +229,31 @@ def message_from_dict(data: dict[str, Any]) -> Message:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _pending_turn_to_dict(pending: PendingTurn | None) -> dict[str, Any] | None:
+    if pending is None:
+        return None
+    return {
+        "turn_id": pending.turn_id,
+        "task": pending.task,
+        "message_start": pending.message_start,
+        "step": pending.step,
+        "tool_calls_executed": pending.tool_calls_executed,
+        "seen_calls": pending.seen_calls,
+    }
+
+
+def _pending_turn_from_dict(data: Any) -> PendingTurn | None:
+    if data is None:
+        return None
+    if not isinstance(data, dict):
+        raise ValueError("pending_turn must be an object")
+    return PendingTurn(
+        turn_id=str(data["turn_id"]),
+        task=str(data["task"]),
+        message_start=int(data["message_start"]),
+        step=int(data.get("step", 1)),
+        tool_calls_executed=int(data.get("tool_calls_executed", 0)),
+        seen_calls={str(key): int(value) for key, value in data.get("seen_calls", {}).items()},
+    )

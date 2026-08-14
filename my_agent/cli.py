@@ -8,6 +8,7 @@ from .agent_loop import AgentLoop
 from .permissions import PermissionPolicy
 from .providers.deepseek import DeepSeekProvider
 from .session import SessionState, SessionStore
+from .terminal import LineEditor, StreamRenderer
 from .tools import (
     ApplyPatchTool,
     ExecCommandTool,
@@ -63,6 +64,29 @@ def _add_runtime_options(parser: argparse.ArgumentParser) -> None:
         help="Session storage root. Defaults to <workspace>/.my-agent/sessions.",
     )
     parser.add_argument("--max-steps", type=int, default=12, help="Maximum model/tool loop steps per turn.")
+    parser.add_argument(
+        "--stream",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stream model text and tool progress. Enabled by default.",
+    )
+    parser.add_argument(
+        "--show-thinking",
+        action="store_true",
+        help="Display streamed reasoning_content before answer content.",
+    )
+    parser.add_argument(
+        "--context-window-tokens",
+        type=int,
+        default=None,
+        help="Override the provider context window used by the context manager.",
+    )
+    parser.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=None,
+        help="Maximum model output tokens reserved from the context window.",
+    )
 
 
 def _add_provider_options(parser: argparse.ArgumentParser) -> None:
@@ -92,11 +116,22 @@ def _run_ask(args: argparse.Namespace) -> int:
     state = store.create(workspace.root)
     print(f"session: {state.session_id}", file=sys.stderr)
     loop, _ = _build_runtime(args, workspace, state.trace_path)
+    renderer = StreamRenderer(answer_prefix="", show_thinking=args.show_thinking)
     try:
-        result = loop.run_turn(state, prompt)
+        result = loop.run_turn(
+            state,
+            prompt,
+            event_handler=renderer.handle if args.stream else None,
+        )
+    except Exception:
+        renderer.finish("")
+        raise
     finally:
         _save_session_artifacts(store, state)
-    print(result.answer)
+    if args.stream:
+        renderer.finish(result.answer)
+    else:
+        print(result.answer)
     return 0
 
 
@@ -119,52 +154,135 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
     loop, registry = _build_runtime(args, workspace, state.trace_path)
     print(f"session: {state.session_id}")
 
-    while True:
-        try:
-            user_input = input("you> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            _save_session_artifacts(store, state)
-            return 0
+    history_path = store.root.parent / "history"
+    with LineEditor(history_path) as editor:
+        while True:
+            try:
+                user_input = editor.read("you> ").strip()
+            except KeyboardInterrupt:
+                print("^C")
+                continue
+            except EOFError:
+                print()
+                _save_session_artifacts(store, state)
+                return 0
 
-        if not user_input:
-            continue
-        if user_input == "/exit":
-            _save_session_artifacts(store, state)
-            return 0
-        if user_input == "/new":
-            state = store.create(state.workspace)
-            workspace = Workspace(state.workspace)
-            loop, registry = _build_runtime(args, workspace, state.trace_path)
-            print(f"session: {state.session_id}")
-            continue
-        if user_input == "/sessions":
-            for summary in store.list_sessions():
+            if not user_input:
+                continue
+            if user_input == "/exit":
+                _save_session_artifacts(store, state)
+                return 0
+            if user_input == "/new":
+                state = store.create(state.workspace)
+                workspace = Workspace(state.workspace)
+                loop, registry = _build_runtime(args, workspace, state.trace_path)
+                print(f"session: {state.session_id}")
+                continue
+            if user_input == "/sessions":
+                for summary in store.list_sessions():
+                    print(
+                        f"{summary.session_id}  messages={summary.message_count}  "
+                        f"updated={summary.updated_at}"
+                    )
+                continue
+            if user_input == "/summary":
+                pending = state.pending_turn.turn_id if state.pending_turn else "none"
                 print(
-                    f"{summary.session_id}  messages={summary.message_count}  "
-                    f"updated={summary.updated_at}"
+                    f"session={state.session_id} workspace={state.workspace} "
+                    f"messages={len(state.messages)} summarized="
+                    f"{state.summarized_message_count} pending={pending}"
                 )
-            continue
-        if user_input == "/summary":
-            print(
-                f"session={state.session_id} workspace={state.workspace} "
-                f"messages={len(state.messages)}"
-            )
-            continue
-        if user_input == "/trace":
-            print(state.trace_path)
-            continue
-        if user_input == "/tools":
-            print("\n".join(registry.names()))
-            continue
-        if user_input.startswith("/"):
-            print(f"unknown command: {user_input}")
-            continue
+                continue
+            if user_input == "/context":
+                snapshot = loop.inspect_context(state)
+                print(
+                    f"estimated={snapshot.estimated_tokens}/{snapshot.input_budget} "
+                    f"active_messages={snapshot.active_messages} "
+                    f"summarized_messages={snapshot.summarized_messages} "
+                    f"last_usage={state.last_input_tokens}+{state.last_output_tokens}"
+                )
+                continue
+            if user_input == "/retry":
+                if state.pending_turn is None:
+                    print("no pending turn to retry")
+                    continue
+                _run_chat_turn(args, store, state, loop, retry=True)
+                continue
+            if user_input == "/abort":
+                if state.pending_turn is None:
+                    print("no pending turn to abort")
+                    continue
+                pending = loop.abort_turn(state)
+                _save_session_artifacts(store, state)
+                warning = (
+                    " Filesystem changes from completed tools were not reverted."
+                    if pending.tool_calls_executed
+                    else ""
+                )
+                print(f"aborted {pending.turn_id}.{warning}")
+                continue
+            if user_input == "/trace":
+                print(state.trace_path)
+                continue
+            if user_input == "/tools":
+                print("\n".join(registry.names()))
+                continue
+            if user_input == "/help":
+                print(
+                    "/new /sessions /summary /context /retry /abort "
+                    "/trace /tools /help /exit"
+                )
+                continue
+            if user_input.startswith("/"):
+                print(f"unknown command: {user_input}")
+                continue
 
-        try:
-            result = loop.run_turn(state, user_input)
-        finally:
-            _save_session_artifacts(store, state)
+            if state.pending_turn is not None:
+                print("pending turn exists; use /retry or /abort before sending a new message")
+                continue
+            _run_chat_turn(args, store, state, loop, user_input=user_input)
+
+
+def _run_chat_turn(
+    args: argparse.Namespace,
+    store: SessionStore,
+    state: SessionState,
+    loop: AgentLoop,
+    *,
+    user_input: str | None = None,
+    retry: bool = False,
+) -> None:
+    renderer = StreamRenderer(show_thinking=args.show_thinking)
+    try:
+        if retry:
+            result = loop.retry_turn(
+                state,
+                event_handler=renderer.handle if args.stream else None,
+            )
+        else:
+            if user_input is None:
+                raise ValueError("user_input is required for a new turn")
+            result = loop.run_turn(
+                state,
+                user_input,
+                event_handler=renderer.handle if args.stream else None,
+            )
+    except KeyboardInterrupt:
+        renderer.finish("")
+        print("generation interrupted; use /retry to continue or /abort to discard the turn")
+        return
+    except Exception as exc:
+        renderer.finish("")
+        if not args.stream:
+            print(f"error: {exc}")
+        print("use /retry to continue or /abort to discard the pending turn")
+        return
+    finally:
+        _save_session_artifacts(store, state)
+
+    if args.stream:
+        renderer.finish(result.answer)
+    else:
         print(f"assistant> {result.answer}")
 
 
@@ -174,7 +292,13 @@ def _build_runtime(
     trace_path: str | Path,
 ) -> tuple[AgentLoop, ToolRegistry]:
     registry = build_tool_registry()
-    provider = DeepSeekProvider(model=args.model, base_url=args.base_url, thinking=args.thinking)
+    provider = DeepSeekProvider(
+        model=args.model,
+        base_url=args.base_url,
+        thinking=args.thinking,
+        context_window_tokens=args.context_window_tokens,
+        max_output_tokens=args.max_output_tokens,
+    )
     loop = AgentLoop(
         workspace=workspace,
         provider=provider,

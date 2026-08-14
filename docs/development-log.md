@@ -123,6 +123,26 @@
 - agent loop、provider adapter、统一 message 和 trajectory schema 都不需要改变；它们只看到
   新的 tool schema 和通用 `ToolResult`。
 
+## Milestone 10: Streaming Usability Runtime
+
+这一阶段不增加新的代码修改能力，而是把已有 loop 变成可以持续使用和恢复的交互程序。
+
+- `Provider.send()` 被直接升级为 `Provider.stream()`；统一 `ProviderEvent` 表达 reasoning、
+  content、retry 和 completed，不保留旧 blocking provider 接口。
+- `DeepSeekProvider` 使用 Chat Completions SSE，逐块聚合 `reasoning_content`、`content`、
+  fragmented tool calls、finish reason 和 usage。
+- 429、500、503、连接失败和未完成 stream 只有在第一个可见 delta 之前才自动指数退避重试。
+- `AgentLoop` 把 provider delta、tool 生命周期、context compaction 和 turn error 转换为
+  provider-neutral `AgentEvent`；terminal renderer 只处理展示。
+- REPL 使用 Python `readline` 或 macOS `libedit`，获得左右移动、行内插入、历史导航、
+  `Ctrl-C` 清行和权限为 `0600` 的持久历史。
+- `PendingTurn` 持久化稳定的 `turn_id`、当前 step 和已执行 call ID。`/retry` 不重复用户消息
+  或已完成 tool，`/abort` 显式放弃 pending messages。
+- `ContextManager` 在发送前估算 context；达到阈值时按完整 user turn 边界压缩旧历史，并保留
+  active turn、最近原始消息和磁盘上的完整消息日志。
+- trajectory schema 升级为 `my-agent.trajectory.v3`，记录 context snapshot、provider retry、
+  turn error/abort 和新 metrics。
+
 ## Current Boundaries
 
 - `apply_patch` 可以自动修改 workspace 内的单个普通 UTF-8/LF 文件。
@@ -132,6 +152,10 @@
   被允许的项目代码仍可能写文件、读取用户文件或访问网络。
 - `exec_command` 不支持 shell command string、pipe/redirection、stdin、TTY、后台 session、
   package install 或交互 approval。
+- context token 是字符启发式估算，不是 DeepSeek tokenizer 的精确结果；compaction 使用
+  确定性 extractive summary，不是模型生成的语义摘要。
+- stream 在已经显示部分 delta 后不会自动重放；用户必须使用 `/retry` 或 `/abort`。
+- `/abort` 只清理 conversation state，不回滚已经执行的文件修改或进程副作用。
 - 本地 `.my-agent/`、`trace.jsonl` 和 `trajectory.json` 默认不提交到 Git。
 - 当前只有 DeepSeek adapter，provider abstraction 已为其他模型保留边界。
 
@@ -139,5 +163,6 @@
 
 - 使用 macOS Seatbelt、Linux bubblewrap 或 container 将允许的进程放入 OS sandbox。
 - 增加 allow/ask/deny approval flow，并把用户决策写入 trace。
-- 增加 context budget 和 conversation compaction。
+- 在确定性 compactor 之上增加可选的 provider semantic summary 和 summary 质量验证。
+- 增加更多 provider adapter，并对 streaming/tool-call edge cases 建立 contract tests。
 - 为真实任务建立 eval cases，并使用 trajectory 分析失败类型。

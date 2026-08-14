@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = "my-agent.trajectory.v2"
+SCHEMA_VERSION = "my-agent.trajectory.v3"
 
 
 def read_jsonl_trace(path: str | Path) -> list[dict[str, Any]]:
@@ -43,6 +43,8 @@ def _make_session_trajectory(
         turn_id = started.get("turn_id")
         turn_events = [event for event in events if event.get("turn_id") == turn_id]
         final = _first_event(turn_events, "final_answer")
+        aborted = _first_event(turn_events, "turn_aborted")
+        errors = [event for event in turn_events if event.get("event") == "turn_error"]
         turns.append(
             {
                 "turn_id": turn_id,
@@ -54,9 +56,26 @@ def _make_session_trajectory(
                     _make_step(step, step_events)
                     for step, step_events in _group_step_events(turn_events)
                 ],
+                "errors": [
+                    {
+                        "step": error.get("step"),
+                        "error": error.get("error", ""),
+                        "retryable": error.get("retryable", False),
+                        "ts": error.get("ts"),
+                    }
+                    for error in errors
+                ],
                 "final_answer": final.get("answer", "") if final else "",
                 "outcome": {
-                    "status": "completed" if final else "incomplete",
+                    "status": (
+                        "completed"
+                        if final
+                        else "aborted"
+                        if aborted
+                        else "failed"
+                        if errors
+                        else "incomplete"
+                    ),
                     "final_step": final.get("step") if final else None,
                 },
                 "metrics": _make_metrics(
@@ -80,6 +99,10 @@ def _make_session_trajectory(
         "outcome": {
             "status": "completed"
             if turns and all(turn["outcome"]["status"] == "completed" for turn in turns)
+            else "failed"
+            if any(turn["outcome"]["status"] == "failed" for turn in turns)
+            else "aborted"
+            if any(turn["outcome"]["status"] == "aborted" for turn in turns)
             else "incomplete",
             "turn_count": len(turns),
         },
@@ -114,11 +137,14 @@ def _make_step(step: int, events: list[dict[str, Any]]) -> dict[str, Any]:
         "model_request": {
             "messages": model_request.get("messages"),
             "tools": model_request.get("tools", []),
+            "context": model_request.get("context", {}),
             "ts": model_request.get("ts"),
         },
         "model_response": {
             "content": model_response.get("content", ""),
             "tool_calls": model_response.get("tool_calls", []),
+            "finish_reason": model_response.get("finish_reason"),
+            "usage": model_response.get("usage", {}),
             "ts": model_response.get("ts"),
         },
         "actions": [_make_action(event) for event in events if event.get("event") == "tool_call"],
@@ -164,6 +190,12 @@ def _make_metrics(events: list[dict[str, Any]], started_at: float | None, ended_
         "events": len(events),
         "model_requests": sum(1 for event in events if event.get("event") == "model_request"),
         "model_responses": sum(1 for event in events if event.get("event") == "model_response"),
+        "provider_retries": sum(1 for event in events if event.get("event") == "provider_retry"),
+        "turn_errors": sum(1 for event in events if event.get("event") == "turn_error"),
+        "turn_aborts": sum(1 for event in events if event.get("event") == "turn_aborted"),
+        "context_compactions": sum(
+            1 for event in events if event.get("event") == "context_compacted"
+        ),
         "tool_calls": sum(1 for event in events if event.get("event") == "tool_call"),
         "failed_tool_calls": sum(
             1 for event in tool_results if not event.get("result", {}).get("ok", False)

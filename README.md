@@ -1,6 +1,7 @@
 # My Agent
 
-一个从只读诊断 loop 逐步生长出来的最小 coding agent。当前主循环是：
+一个从只读诊断 loop 逐步生长出来的最小 coding agent。它现在具备流式模型输出、
+tool 进度、可恢复失败、命令行历史和自动 context compaction。当前主循环是：
 
 ```text
 user task -> model -> tool call -> tool result -> model -> final answer
@@ -67,8 +68,8 @@ python3 cli.py ask \
   "Inspect this repo and suggest what to test."
 ```
 
-`session: <session_id>` 会写到 stderr，最终答案写到 stdout。之后可以用同一个 ID
-继续对话：
+`session: <session_id>`、tool 状态和重试信息写到 stderr；模型正文以 delta 形式流式写到
+stdout。之后可以用同一个 ID 继续对话：
 
 ```bash
 python3 cli.py resume <session_id> --workspace .
@@ -88,6 +89,25 @@ REPL 支持这些本地命令：
 - `/summary`：显示当前 session 摘要
 - `/trace`：显示当前 raw trace 路径
 - `/tools`：列出可用工具
+- `/context`：查看估算的 context 使用量和 compaction 状态
+- `/retry`：从失败的 model step 恢复，不重复用户消息或已完成 tool
+- `/abort`：丢弃 pending turn 的消息；已经产生的文件或进程副作用不会回滚
+- `/help`：显示命令帮助
+
+REPL 使用系统 `readline`/macOS `libedit`，支持左右移动光标、行内插入、上下方向键历史
+和 Emacs 风格快捷键。历史保存在 `.my-agent/history`，权限设为 `0600`。输入过程中按
+`Ctrl-C` 只清空当前行；模型调用失败后可以执行 `/retry` 或 `/abort`。
+
+默认启用流式输出；`--no-stream` 可以只在本轮结束时显示完整答案。thinking 默认仍会发给
+DeepSeek，但 CLI 只显示 `thinking...` 状态；使用 `--show-thinking` 才会流式打印
+`reasoning_content`。context 上限和输出预留可以显式覆盖：
+
+```bash
+python3 cli.py chat \
+  --context-window-tokens 1000000 \
+  --max-output-tokens 64000 \
+  --show-thinking
+```
 
 默认 session 目录是：
 
@@ -97,14 +117,15 @@ REPL 支持这些本地命令：
   messages.jsonl
   trace.jsonl
   trajectory.json
+<workspace>/.my-agent/history
 ```
 
 可以用 `--sessions-dir` 把 session 放到 workspace 之外。`list_files` 默认会忽略
 `.my-agent`，避免 agent 把自己的运行记录当成待诊断源码。
 
 如果没有设置 `DEEPSEEK_API_KEY`，CLI 会直接报错，不会假装完成诊断。
-`trace.jsonl` 会记录 `model_request`、`model_response`、`tool_call`、`tool_result`
-和 `final_answer`，后续可以用来做失败分析、eval 或训练数据整理。
+`trace.jsonl` 还会记录 provider retry、context compaction、pending turn 恢复和错误，后续
+可以用来做失败分析、eval 或训练数据整理。
 
 默认 provider 是 `deepseek`，使用 DeepSeek 的 OpenAI-format Chat Completions API。
 默认模型是 `deepseek-v4-flash`；也可以通过 `DEEPSEEK_MODEL` 或 `--model` 覆盖。
@@ -117,10 +138,12 @@ REPL 支持这些本地命令：
 代码按这几个边界拆分：
 
 - `cli.py`：解析 `ask/chat/resume`，控制 REPL，并在每轮后保存 session
-- `session.py`：序列化统一 `Message`，不包含任何 DeepSeek 专属格式
-- `agent_loop.py`：维护 model -> tool -> observation -> model 循环，并判断本轮何时结束
-- `provider.py`：定义统一 provider 协议和统一模型返回值
-- `providers/deepseek.py`：在统一消息与 DeepSeek Chat Completions 格式之间转换
+- `terminal.py`：封装 line editor/history 和流式终端渲染，不参与 agent 决策
+- `session.py`：序列化统一 `Message`、context 状态和可重试的 `PendingTurn`
+- `context.py`：估算 token、保留 active turn，并摘要压缩较老的 completed turns
+- `agent_loop.py`：维护 model -> tool -> observation -> model 循环，并发出统一 `AgentEvent`
+- `provider.py`：定义 provider streaming event 和统一模型返回值
+- `providers/deepseek.py`：转换协议、解析 SSE delta、聚合 tool calls 并执行有限重试
 - `tools.py`：定义 tool schema、registry、执行入口和统一 `ToolResult`
 - `execution.py`：在清理后的环境中管理子进程、输出捕获、timeout 和 process group
 - `patches.py`：解析并提交单文件 patch，不依赖 shell 命令
@@ -132,8 +155,12 @@ REPL 支持这些本地命令：
 ```text
 CLI loads SessionState
   -> AgentLoop appends UserMessage
-  -> Provider converts messages and tool schemas to DeepSeek payload
-  -> model returns content/reasoning_content/tool_calls
+  -> PendingTurn records the stable turn_id, step, and completed tool calls
+  -> ContextManager estimates the next request
+     -> if needed, summarize old completed turns and keep recent raw messages
+  -> Provider converts messages and tool schemas to a DeepSeek streaming payload
+  -> SSE deltas become ProviderEvent, then AgentEvent, then terminal output
+  -> completed response contains content/reasoning_content/tool_calls
   -> AgentLoop either accepts a final answer
      or asks ToolRegistry to execute every tool call
   -> ToolResult becomes ToolResultMessage
@@ -142,6 +169,16 @@ CLI loads SessionState
   -> exec_command runs the narrowest allowlisted validation
   -> CLI saves messages, trace, and trajectory
 ```
+
+Context token 数量是保守估算，不是 provider tokenizer 的精确计数。达到输入预算的 85% 时，
+`ContextManager` 会按完整 user turn 边界压缩较老历史，目标降到 70%；当前 active turn、最近
+原始消息和完整本地 `messages.jsonl` 会保留。摘要是确定性的 extractive summary，不会递归
+调用模型，因此它便宜且可预测，但不等同于语义无损记忆。
+
+DeepSeek adapter 只会在尚未向终端输出任何 `content`/`reasoning_content` delta 时自动重试
+可重试错误。流中途失败时自动重放可能造成重复文本，所以 harness 保留 `PendingTurn`，由用户
+执行 `/retry` 从同一个 model step 恢复。已经成功执行的 tool call ID 会被记住，不会在恢复时
+再次执行。
 
 `exec_command` 的 allowlist 是 harness policy，不是安全 sandbox。被允许的 test/build
 命令仍会执行仓库中的代码，因此仍可能写文件、访问用户可读路径或尝试网络访问。
@@ -172,6 +209,7 @@ PYTHONPATH=. python3 scripts/export_trajectory.py \
 ```
 
 `trace.jsonl` 是原始事件流；导出的 `trajectory.json` 使用
-`my-agent.trajectory.v2`，先按 turn 分组，再按 step 分组，避免不同
+`my-agent.trajectory.v3`，先按 turn 分组，再按 step 分组，避免不同
 turn 中相同 step 编号发生碰撞。每轮结束后会自动刷新 `trajectory.json`，手动导出主要
-用于重新生成或校验现有 session trajectory。
+用于重新生成或校验现有 session trajectory。v3 还包含 context snapshot、provider retry、
+turn error/abort 和对应 metrics。

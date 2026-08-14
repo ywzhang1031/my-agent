@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Iterator, Protocol
 
 from .messages import Message, ToolCall
 from .tools import ToolSpec
@@ -25,28 +25,72 @@ class ProviderResponse:
     raw_response: dict[str, Any] | None = None
 
 
+class ProviderError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = False,
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+        self.status_code = status_code
+
+
+@dataclass(frozen=True)
+class ProviderEvent:
+    kind: str
+    text: str = ""
+    response: ProviderResponse | None = None
+    data: dict[str, Any] = field(default_factory=dict)
+
+
 class Provider(Protocol):
-    def send(
+    context_window_tokens: int
+    max_output_tokens: int
+
+    def stream(
         self,
         messages: list[Message],
         tools: list[ToolSpec],
         system_prompt: str,
-    ) -> ProviderResponse:
+    ) -> Iterator[ProviderEvent]:
         ...
 
 
 class ScriptedProvider:
-    def __init__(self, replies: list[ProviderResponse]) -> None:
+    def __init__(
+        self,
+        replies: list[ProviderResponse | Exception],
+        *,
+        context_window_tokens: int = 1_000_000,
+        max_output_tokens: int = 64_000,
+    ) -> None:
         self._replies = list(replies)
+        self.context_window_tokens = context_window_tokens
+        self.max_output_tokens = max_output_tokens
         self.requests: list[list[Message]] = []
+        self.system_prompts: list[str] = []
 
-    def send(
+    def stream(
         self,
         messages: list[Message],
         tools: list[ToolSpec],
         system_prompt: str,
-    ) -> ProviderResponse:
+    ) -> Iterator[ProviderEvent]:
         self.requests.append(list(messages))
+        self.system_prompts.append(system_prompt)
         if not self._replies:
-            return ProviderResponse(content="No scripted replies remain.")
-        return self._replies.pop(0)
+            reply: ProviderResponse | Exception = ProviderResponse(
+                content="No scripted replies remain."
+            )
+        else:
+            reply = self._replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        if reply.reasoning_content:
+            yield ProviderEvent(kind="reasoning_delta", text=reply.reasoning_content)
+        if reply.content:
+            yield ProviderEvent(kind="content_delta", text=reply.content)
+        yield ProviderEvent(kind="completed", response=reply)
