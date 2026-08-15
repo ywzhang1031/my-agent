@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import redirect_stderr
@@ -20,10 +21,18 @@ from prompt_toolkit.output import DummyOutput
 from my_agent.agent_loop import AgentEvent, AgentLoop
 from my_agent.cli import build_parser, build_tool_registry
 from my_agent.context import ContextManager, estimate_text_tokens
+from my_agent.control import ApprovalDecision, raise_if_cancelled
 from my_agent.messages import AssistantMessage, ToolCall, ToolResultMessage, UserMessage
 from my_agent.permissions import PermissionPolicy
 from my_agent.provider import ProviderError, ProviderResponse, ScriptedProvider
 from my_agent.providers.deepseek import DeepSeekProvider
+from my_agent.runtime import (
+    AgentRuntime,
+    InterruptTurn,
+    ResolveApproval,
+    RuntimeState,
+    StartTurn,
+)
 from my_agent.session import PendingTurn, SessionStore
 from my_agent.terminal import (
     LineEditor,
@@ -249,7 +258,7 @@ class MyAgentTests(unittest.TestCase):
                 {state.session_id + ":1"},
             )
             trajectory = make_trajectory(trace_events, source_path=state.trace_path)
-            self.assertEqual(trajectory["schema_version"], "my-agent.trajectory.v3")
+            self.assertEqual(trajectory["schema_version"], "my-agent.trajectory.v4")
             self.assertEqual(trajectory["turns"][0]["outcome"]["status"], "completed")
             self.assertEqual(len(trajectory["turns"][0]["errors"]), 1)
             self.assertEqual(trajectory["metrics"]["turn_errors"], 1)
@@ -327,6 +336,398 @@ class MyAgentTests(unittest.TestCase):
             self.assertEqual(state.messages, [])
             self.assertEqual(trajectory["turns"][0]["outcome"]["status"], "aborted")
             self.assertEqual(trajectory["metrics"]["turn_aborts"], 1)
+
+    def test_agent_runtime_waits_for_patch_approval_then_resumes_same_turn(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace_path = Path(tmpdir, "workspace")
+            workspace_path.mkdir()
+            target = workspace_path / "app.py"
+            target.write_text("value = 1\n", encoding="utf-8")
+            state = SessionStore(Path(tmpdir, "sessions")).create(workspace_path)
+            provider = ScriptedProvider(
+                [
+                    ProviderResponse(
+                        tool_calls=[
+                            ToolCall(
+                                call_id="call_patch",
+                                name="apply_patch",
+                                arguments={
+                                    "patch": (
+                                        "*** Begin Patch\n"
+                                        "*** Update File: app.py\n"
+                                        "@@\n"
+                                        "-value = 1\n"
+                                        "+value = 2\n"
+                                        "*** End Patch"
+                                    )
+                                },
+                            )
+                        ],
+                        finish_reason="tool_calls",
+                    ),
+                    ProviderResponse(content="Updated app.py."),
+                ]
+            )
+            loop = AgentLoop(
+                workspace=Workspace(workspace_path),
+                provider=provider,
+                tools=ToolRegistry([ApplyPatchTool()]),
+                permissions=PermissionPolicy(),
+                trace=TraceRecorder(state.trace_path),
+                max_steps=3,
+            )
+            runtime = AgentRuntime(loop, state, interactive_approvals=True)
+
+            runtime.send(StartTurn(user_input="Update app.py"))
+            events = []
+            while True:
+                event = runtime.next_event(timeout=2)
+                events.append(event)
+                if event.kind == "approval_requested":
+                    break
+
+            self.assertEqual(runtime.state, RuntimeState.WAITING_APPROVAL)
+            self.assertEqual(target.read_text(encoding="utf-8"), "value = 1\n")
+            runtime.send(
+                ResolveApproval(
+                    request_id=events[-1].data["request_id"],
+                    decision=ApprovalDecision.ALLOW_ONCE,
+                )
+            )
+
+            while events[-1].kind != "turn_completed":
+                events.append(runtime.next_event(timeout=2))
+
+            runtime.close()
+            self.assertEqual(target.read_text(encoding="utf-8"), "value = 2\n")
+            self.assertIsNone(state.pending_turn)
+            self.assertEqual(events[-1].result.answer, "Updated app.py.")
+            event_names = [event.kind for event in events]
+            self.assertIn("tool_proposed", event_names)
+            self.assertIn("approval_resolved", event_names)
+            self.assertIn("tool_started", event_names)
+            trace_names = [
+                event["event"] for event in read_jsonl_trace(state.trace_path)
+            ]
+            self.assertIn("approval_requested", trace_names)
+            self.assertIn("approval_resolved", trace_names)
+            trajectory = make_trajectory(
+                read_jsonl_trace(state.trace_path),
+                state.trace_path,
+            )
+            approval = trajectory["turns"][0]["steps"][0]["approvals"][0]
+            self.assertEqual(approval["call_id"], "call_patch")
+            self.assertEqual(approval["decision"], "allow_once")
+            self.assertEqual(approval["source"], "prompt")
+            self.assertTrue(approval["prompted"])
+            self.assertEqual(trajectory["metrics"]["approval_requests"], 1)
+
+    def test_agent_runtime_reuses_exact_session_approval(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace_path = Path(tmpdir, "workspace")
+            workspace_path.mkdir()
+            target = workspace_path / "app.py"
+            target.write_text("value = 1\n", encoding="utf-8")
+            state = SessionStore(Path(tmpdir, "sessions")).create(workspace_path)
+            provider = ScriptedProvider(
+                [
+                    ProviderResponse(
+                        tool_calls=[
+                            ToolCall(
+                                call_id="call_patch_1",
+                                name="apply_patch",
+                                arguments={
+                                    "patch": (
+                                        "*** Begin Patch\n"
+                                        "*** Update File: app.py\n"
+                                        "@@\n"
+                                        "-value = 1\n"
+                                        "+value = 2\n"
+                                        "*** End Patch"
+                                    )
+                                },
+                            )
+                        ],
+                        finish_reason="tool_calls",
+                    ),
+                    ProviderResponse(
+                        tool_calls=[
+                            ToolCall(
+                                call_id="call_patch_2",
+                                name="apply_patch",
+                                arguments={
+                                    "patch": (
+                                        "*** Begin Patch\n"
+                                        "*** Update File: app.py\n"
+                                        "@@\n"
+                                        "-value = 2\n"
+                                        "+value = 3\n"
+                                        "*** End Patch"
+                                    )
+                                },
+                            )
+                        ],
+                        finish_reason="tool_calls",
+                    ),
+                    ProviderResponse(content="Updated app.py twice."),
+                ]
+            )
+            loop = AgentLoop(
+                workspace=Workspace(workspace_path),
+                provider=provider,
+                tools=ToolRegistry([ApplyPatchTool()]),
+                permissions=PermissionPolicy(),
+                trace=TraceRecorder(state.trace_path),
+                max_steps=4,
+            )
+            runtime = AgentRuntime(loop, state, interactive_approvals=True)
+
+            runtime.send(StartTurn(user_input="Update app.py twice"))
+            events = []
+            while True:
+                event = runtime.next_event(timeout=2)
+                events.append(event)
+                if event.kind == "approval_requested":
+                    runtime.send(
+                        ResolveApproval(
+                            request_id=event.data["request_id"],
+                            decision=ApprovalDecision.ALLOW_SESSION,
+                        )
+                    )
+                if event.kind == "turn_completed":
+                    break
+
+            runtime.close()
+            self.assertEqual(target.read_text(encoding="utf-8"), "value = 3\n")
+            self.assertEqual(
+                sum(event.kind == "approval_requested" for event in events),
+                1,
+            )
+            resolved = [event for event in events if event.kind == "approval_resolved"]
+            self.assertEqual(len(resolved), 2)
+            self.assertEqual(resolved[0].data["source"], "prompt")
+            self.assertEqual(resolved[1].data["source"], "session")
+
+    def test_agent_runtime_interrupts_approval_with_complete_tool_results(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace_path = Path(tmpdir, "workspace")
+            workspace_path.mkdir()
+            first = workspace_path / "first.py"
+            second = workspace_path / "second.py"
+            first.write_text("value = 1\n", encoding="utf-8")
+            second.write_text("value = 1\n", encoding="utf-8")
+            state = SessionStore(Path(tmpdir, "sessions")).create(workspace_path)
+            provider = ScriptedProvider(
+                [
+                    ProviderResponse(
+                        tool_calls=[
+                            ToolCall(
+                                call_id="call_first",
+                                name="apply_patch",
+                                arguments={
+                                    "patch": (
+                                        "*** Begin Patch\n"
+                                        "*** Update File: first.py\n"
+                                        "@@\n"
+                                        "-value = 1\n"
+                                        "+value = 2\n"
+                                        "*** End Patch"
+                                    )
+                                },
+                            ),
+                            ToolCall(
+                                call_id="call_second",
+                                name="apply_patch",
+                                arguments={
+                                    "patch": (
+                                        "*** Begin Patch\n"
+                                        "*** Update File: second.py\n"
+                                        "@@\n"
+                                        "-value = 1\n"
+                                        "+value = 2\n"
+                                        "*** End Patch"
+                                    )
+                                },
+                            ),
+                        ],
+                        finish_reason="tool_calls",
+                    ),
+                    ProviderResponse(content="No files were changed."),
+                ]
+            )
+            loop = AgentLoop(
+                workspace=Workspace(workspace_path),
+                provider=provider,
+                tools=ToolRegistry([ApplyPatchTool()]),
+                permissions=PermissionPolicy(),
+                trace=TraceRecorder(state.trace_path),
+                max_steps=3,
+            )
+            runtime = AgentRuntime(loop, state, interactive_approvals=True)
+
+            runtime.send(StartTurn(user_input="Update both files"))
+            while True:
+                event = runtime.next_event(timeout=2)
+                if event.kind == "approval_requested":
+                    runtime.send(InterruptTurn())
+                if event.kind == "turn_interrupted":
+                    break
+
+            self.assertEqual(first.read_text(encoding="utf-8"), "value = 1\n")
+            self.assertEqual(second.read_text(encoding="utf-8"), "value = 1\n")
+            tool_results = [
+                message
+                for message in state.messages
+                if isinstance(message, ToolResultMessage)
+            ]
+            self.assertEqual(len(tool_results), 2)
+            self.assertTrue(
+                all(
+                    json.loads(message.content)["metadata"]["status"] == "interrupted"
+                    for message in tool_results
+                )
+            )
+
+            runtime.send(StartTurn(retry=True))
+            while True:
+                event = runtime.next_event(timeout=2)
+                if event.kind == "turn_completed":
+                    break
+
+            runtime.close()
+            self.assertEqual(event.result.answer, "No files were changed.")
+            self.assertEqual(len(provider.requests), 2)
+            self.assertEqual(
+                sum(isinstance(message, ToolResultMessage) for message in provider.requests[1]),
+                2,
+            )
+
+    def test_agent_runtime_denial_becomes_a_tool_observation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace_path = Path(tmpdir, "workspace")
+            workspace_path.mkdir()
+            target = workspace_path / "app.py"
+            target.write_text("value = 1\n", encoding="utf-8")
+            state = SessionStore(Path(tmpdir, "sessions")).create(workspace_path)
+            provider = ScriptedProvider(
+                [
+                    ProviderResponse(
+                        tool_calls=[
+                            ToolCall(
+                                call_id="call_denied",
+                                name="apply_patch",
+                                arguments={
+                                    "patch": (
+                                        "*** Begin Patch\n"
+                                        "*** Update File: app.py\n"
+                                        "@@\n"
+                                        "-value = 1\n"
+                                        "+value = 2\n"
+                                        "*** End Patch"
+                                    )
+                                },
+                            )
+                        ],
+                        finish_reason="tool_calls",
+                    ),
+                    ProviderResponse(content="The change was denied."),
+                ]
+            )
+            loop = AgentLoop(
+                workspace=Workspace(workspace_path),
+                provider=provider,
+                tools=ToolRegistry([ApplyPatchTool()]),
+                permissions=PermissionPolicy(),
+                trace=TraceRecorder(state.trace_path),
+                max_steps=3,
+            )
+            runtime = AgentRuntime(loop, state, interactive_approvals=True)
+
+            runtime.send(StartTurn(user_input="Update app.py"))
+            events = []
+            while True:
+                event = runtime.next_event(timeout=2)
+                events.append(event)
+                if event.kind == "approval_requested":
+                    runtime.send(
+                        ResolveApproval(
+                            request_id=event.data["request_id"],
+                            decision=ApprovalDecision.DENY,
+                        )
+                    )
+                if event.kind == "turn_completed":
+                    break
+
+            runtime.close()
+            self.assertEqual(target.read_text(encoding="utf-8"), "value = 1\n")
+            self.assertNotIn("tool_started", [event.kind for event in events])
+            trajectory = make_trajectory(
+                read_jsonl_trace(state.trace_path),
+                state.trace_path,
+            )
+            observation = trajectory["turns"][0]["steps"][0]["observations"][0]
+            self.assertEqual(observation["output"]["metadata"]["status"], "denied")
+            self.assertEqual(trajectory["metrics"]["approval_denials"], 1)
+
+    def test_agent_runtime_interrupts_active_turn_and_keeps_it_retryable(self):
+        class BlockingProvider:
+            context_window_tokens = 10_000
+            max_output_tokens = 1_000
+
+            def __init__(self):
+                self.started = threading.Event()
+
+            def stream(
+                self,
+                messages,
+                tools,
+                system_prompt,
+                cancel_event=None,
+            ):
+                self.started.set()
+                while cancel_event is None or not cancel_event.wait(0.01):
+                    pass
+                raise_if_cancelled(cancel_event)
+                yield
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace_path = Path(tmpdir, "workspace")
+            workspace_path.mkdir()
+            state = SessionStore(Path(tmpdir, "sessions")).create(workspace_path)
+            provider = BlockingProvider()
+            loop = AgentLoop(
+                workspace=Workspace(workspace_path),
+                provider=provider,
+                tools=ToolRegistry([]),
+                permissions=PermissionPolicy(),
+                trace=TraceRecorder(state.trace_path),
+                max_steps=2,
+            )
+            runtime = AgentRuntime(loop, state, interactive_approvals=True)
+
+            runtime.send(StartTurn(user_input="Wait for interrupt"))
+            self.assertTrue(provider.started.wait(1))
+            runtime.send(InterruptTurn())
+
+            while True:
+                event = runtime.next_event(timeout=2)
+                if event.kind == "turn_interrupted":
+                    break
+
+            runtime.close()
+            self.assertEqual(runtime.state, RuntimeState.INTERRUPTED)
+            self.assertIsNotNone(state.pending_turn)
+            self.assertEqual(state.pending_turn.step, 1)
+            self.assertIn(
+                "turn_interrupted",
+                [event["event"] for event in read_jsonl_trace(state.trace_path)],
+            )
+            trajectory = make_trajectory(
+                read_jsonl_trace(state.trace_path),
+                state.trace_path,
+            )
+            self.assertEqual(trajectory["outcome"]["status"], "interrupted")
+            self.assertEqual(trajectory["metrics"]["turn_interruptions"], 1)
 
     def test_context_manager_compacts_old_turns_and_preserves_recent_messages(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -625,7 +1026,7 @@ class MyAgentTests(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("/help       Show slash commands", completed.stdout)
-        self.assertIn("use Tab/Shift-Tab to select", completed.stdout)
+        self.assertIn("Tab accepts or runs a command", completed.stdout)
 
     def test_stream_renderer_displays_reasoning_content_and_tool_progress(self):
         output = io.StringIO()
@@ -862,6 +1263,38 @@ class MyAgentTests(unittest.TestCase):
             self.assertEqual(result.metadata["status"], "timed_out")
             self.assertTrue(result.metadata["timed_out"])
             self.assertFalse(marker.exists())
+
+    def test_exec_command_interrupt_kills_the_running_process(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "test_interrupt.py").write_text(
+                "import time\n"
+                "import unittest\n\n"
+                "class InterruptTest(unittest.TestCase):\n"
+                "    def test_wait(self):\n"
+                "        time.sleep(30)\n",
+                encoding="utf-8",
+            )
+            cancel_event = threading.Event()
+            ctx = ToolContext(
+                workspace=Workspace(tmpdir),
+                permissions=PermissionPolicy(),
+                timeout_seconds=10,
+                cancel_event=cancel_event,
+            )
+            timer = threading.Timer(0.2, cancel_event.set)
+            timer.start()
+            started = time.monotonic()
+
+            result = ExecCommandTool().run(
+                {"argv": ["python3", "-m", "unittest", "discover", "-s", "."]},
+                ctx,
+            )
+            timer.join()
+
+            self.assertLess(time.monotonic() - started, 2)
+            self.assertFalse(result.ok)
+            self.assertEqual(result.metadata["status"], "interrupted")
+            self.assertTrue(result.metadata["interrupted"])
 
     def test_git_diff_reports_tracked_and_untracked_changes_without_mutating_status(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1498,7 +1931,7 @@ class MyAgentTests(unittest.TestCase):
         )
         attempts = 0
 
-        def fake_stream_once(_payload):
+        def fake_stream_once(_payload, _cancel_event):
             nonlocal attempts
             attempts += 1
             if attempts == 1:
@@ -1532,7 +1965,7 @@ class MyAgentTests(unittest.TestCase):
         )
         attempts = 0
 
-        def interrupted_stream(_payload):
+        def interrupted_stream(_payload, _cancel_event):
             nonlocal attempts
             attempts += 1
 
@@ -1576,7 +2009,7 @@ class MyAgentTests(unittest.TestCase):
 
         provider = DeepSeekProvider(api_key="test-key")
         with patch("urllib.request.urlopen", return_value=FakeResponse()):
-            chunks = list(provider._stream_once({"stream": True}))
+            chunks = list(provider._stream_once({"stream": True}, None))
 
         self.assertEqual(chunks[0]["choices"][0]["delta"]["content"], "Hi")
 
@@ -1686,7 +2119,7 @@ class MyAgentTests(unittest.TestCase):
 
         self.assertEqual(
             trajectory["schema_version"],
-            "my-agent.trajectory.v3",
+            "my-agent.trajectory.v4",
         )
         self.assertEqual(trajectory["workspace"], "/tmp/repo")
         turn = trajectory["turns"][0]
@@ -1796,7 +2229,7 @@ class MyAgentTests(unittest.TestCase):
 
         self.assertEqual(
             trajectory["schema_version"],
-            "my-agent.trajectory.v3",
+            "my-agent.trajectory.v4",
         )
         self.assertEqual(trajectory["session_id"], "session-1")
         self.assertEqual(len(trajectory["turns"]), 2)

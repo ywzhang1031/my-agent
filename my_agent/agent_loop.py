@@ -1,15 +1,24 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .context import ContextManager, ContextSnapshot
-from .messages import AssistantMessage, Message, ToolResultMessage, UserMessage
+from .control import (
+    ApprovalBroker,
+    ApprovalDecision,
+    AutoApproveBroker,
+    PermissionRequest,
+    TurnInterrupted,
+    raise_if_cancelled,
+)
+from .messages import AssistantMessage, Message, ToolCall, ToolResultMessage, UserMessage
 from .permissions import PermissionPolicy
 from .provider import Provider, ProviderError, ProviderResponse
 from .session import PendingTurn, SessionState
-from .tools import ToolContext, ToolRegistry
+from .tools import ToolContext, ToolRegistry, ToolResult
 from .trace import TraceRecorder
 from .workspace import Workspace
 
@@ -73,6 +82,8 @@ class AgentLoop:
         state: SessionState,
         user_input: str,
         event_handler: EventHandler | None = None,
+        cancel_event: threading.Event | None = None,
+        approvals: ApprovalBroker | None = None,
     ) -> TurnResult:
         if state.workspace != str(self.workspace.root):
             raise ValueError(
@@ -104,13 +115,19 @@ class AgentLoop:
                 "messages_before_request": len(state.messages),
             },
         )
+        self._emit(
+            event_handler,
+            AgentEvent(kind="turn_started", data={**event_context, "task": user_input}),
+        )
 
-        return self._continue_turn(state, event_handler)
+        return self._continue_turn(state, event_handler, cancel_event, approvals)
 
     def retry_turn(
         self,
         state: SessionState,
         event_handler: EventHandler | None = None,
+        cancel_event: threading.Event | None = None,
+        approvals: ApprovalBroker | None = None,
     ) -> TurnResult:
         pending = state.pending_turn
         if pending is None:
@@ -128,7 +145,7 @@ class AgentLoop:
             event_handler,
             AgentEvent(kind="turn_resumed", data={"step": pending.step}),
         )
-        return self._continue_turn(state, event_handler)
+        return self._continue_turn(state, event_handler, cancel_event, approvals)
 
     def inspect_context(self, state: SessionState) -> ContextSnapshot:
         return self.context_manager.inspect(
@@ -154,12 +171,19 @@ class AgentLoop:
         self,
         state: SessionState,
         event_handler: EventHandler | None,
+        cancel_event: threading.Event | None,
+        approvals: ApprovalBroker | None,
     ) -> TurnResult:
         pending = state.pending_turn
         if pending is None:
             raise ValueError("session has no pending turn")
         messages = state.messages
-        ctx = ToolContext(workspace=self.workspace, permissions=self.permissions)
+        ctx = ToolContext(
+            workspace=self.workspace,
+            permissions=self.permissions,
+            approvals=approvals or AutoApproveBroker(),
+            cancel_event=cancel_event,
+        )
         event_context = {
             "session_id": state.session_id,
             "turn_id": pending.turn_id,
@@ -168,6 +192,7 @@ class AgentLoop:
         for step in range(pending.step, self.max_steps + 1):
             pending.step = step
             try:
+                raise_if_cancelled(cancel_event)
                 snapshot = self.context_manager.prepare(
                     state=state,
                     tools=self.tools.specs(),
@@ -197,7 +222,17 @@ class AgentLoop:
                     step=step,
                     event_context=event_context,
                     event_handler=event_handler,
+                    cancel_event=cancel_event,
                 )
+            except TurnInterrupted as exc:
+                self._record_turn_interrupted(
+                    pending,
+                    step,
+                    event_context,
+                    str(exc),
+                    event_handler,
+                )
+                raise
             except KeyboardInterrupt:
                 self._record_turn_error(
                     pending,
@@ -275,35 +310,6 @@ class AgentLoop:
             )
 
             for call in reply.tool_calls:
-                call_key = json.dumps(
-                    {"name": call.name, "arguments": call.arguments},
-                    sort_keys=True,
-                    ensure_ascii=False,
-                )
-                pending.seen_calls[call_key] = pending.seen_calls.get(call_key, 0) + 1
-                if pending.seen_calls[call_key] > 3:
-                    result = {
-                        "ok": False,
-                        "stderr": "repeated identical tool call stopped",
-                    }
-                    self.trace.write(
-                        "tool_result",
-                        {
-                            **event_context,
-                            "step": step,
-                            "call": call.to_dict(),
-                            "result": result,
-                        },
-                    )
-                    messages.append(
-                        ToolResultMessage(
-                            tool_call_id=call.call_id,
-                            tool_name=call.name,
-                            content=json.dumps(result, ensure_ascii=False),
-                        )
-                    )
-                    continue
-
                 self.trace.write(
                     "tool_call",
                     {**event_context, "step": step, "call": call.to_dict()},
@@ -311,42 +317,99 @@ class AgentLoop:
                 self._emit(
                     event_handler,
                     AgentEvent(
-                        kind="tool_started",
+                        kind="tool_proposed",
                         data={"name": call.name, "arguments": call.arguments},
                     ),
                 )
-                tool_result = self.tools.run(call, ctx)
-                pending.tool_calls_executed += 1
-                result_payload = tool_result.to_dict()
-                self.trace.write(
-                    "tool_result",
-                    {
-                        **event_context,
-                        "step": step,
-                        "call": call.to_dict(),
-                        "result": result_payload,
-                    },
-                )
-                self._emit(
-                    event_handler,
-                    AgentEvent(
-                        kind="tool_finished",
-                        data={
-                            "name": call.name,
-                            "ok": tool_result.ok,
-                            "status": tool_result.metadata.get("status")
-                            or ("success" if tool_result.ok else "failed"),
-                            "duration_ms": tool_result.metadata.get("duration_ms"),
-                        },
-                    ),
-                )
-                messages.append(
-                    ToolResultMessage(
-                        tool_call_id=call.call_id,
-                        tool_name=call.name,
-                        content=json.dumps(result_payload, ensure_ascii=False),
+
+            for call_index, call in enumerate(reply.tool_calls):
+                observation_recorded = False
+                try:
+                    raise_if_cancelled(cancel_event)
+                    call_key = json.dumps(
+                        {"name": call.name, "arguments": call.arguments},
+                        sort_keys=True,
+                        ensure_ascii=False,
                     )
-                )
+                    pending.seen_calls[call_key] = pending.seen_calls.get(call_key, 0) + 1
+                    if pending.seen_calls[call_key] > 3:
+                        tool_result = ToolResult(
+                            ok=False,
+                            stderr="repeated identical tool call stopped",
+                            metadata={"status": "repeated_call"},
+                        )
+                    else:
+                        request = self.tools.permission_request(call, ctx)
+                        tool_result = self._authorize_tool_call(
+                            request=request,
+                            call_id=call.call_id,
+                            call_name=call.name,
+                            step=step,
+                            event_context=event_context,
+                            ctx=ctx,
+                            event_handler=event_handler,
+                        )
+                        if tool_result is None:
+                            self._emit(
+                                event_handler,
+                                AgentEvent(
+                                    kind="tool_started",
+                                    data={"name": call.name, "arguments": call.arguments},
+                                ),
+                            )
+                            tool_result = self.tools.run(call, ctx)
+                            pending.tool_calls_executed += 1
+
+                    result_payload = tool_result.to_dict()
+                    self.trace.write(
+                        "tool_result",
+                        {
+                            **event_context,
+                            "step": step,
+                            "call": call.to_dict(),
+                            "result": result_payload,
+                        },
+                    )
+                    self._emit(
+                        event_handler,
+                        AgentEvent(
+                            kind="tool_finished",
+                            data={
+                                "name": call.name,
+                                "ok": tool_result.ok,
+                                "status": tool_result.metadata.get("status")
+                                or ("success" if tool_result.ok else "failed"),
+                                "duration_ms": tool_result.metadata.get("duration_ms"),
+                            },
+                        ),
+                    )
+                    messages.append(
+                        ToolResultMessage(
+                            tool_call_id=call.call_id,
+                            tool_name=call.name,
+                            content=json.dumps(result_payload, ensure_ascii=False),
+                        )
+                    )
+                    observation_recorded = True
+                    raise_if_cancelled(cancel_event)
+                except TurnInterrupted as exc:
+                    first_unobserved = call_index + int(observation_recorded)
+                    for interrupted_call in reply.tool_calls[first_unobserved:]:
+                        self._record_interrupted_tool_result(
+                            interrupted_call,
+                            messages,
+                            step,
+                            event_context,
+                            event_handler,
+                        )
+                    self._record_turn_interrupted(
+                        pending,
+                        step,
+                        event_context,
+                        str(exc),
+                        event_handler,
+                    )
+                    raise
             pending.step = step + 1
 
         answer = f"Stopped after reaching max_steps={self.max_steps} without a final answer."
@@ -363,6 +426,119 @@ class AgentLoop:
             stopped_by="max_steps",
         )
 
+    def _authorize_tool_call(
+        self,
+        *,
+        request: PermissionRequest | None,
+        call_id: str,
+        call_name: str,
+        step: int,
+        event_context: dict[str, str],
+        ctx: ToolContext,
+        event_handler: EventHandler | None,
+    ) -> ToolResult | None:
+        if request is None:
+            return None
+
+        waited = False
+
+        def on_waiting() -> None:
+            nonlocal waited
+            waited = True
+            payload = {
+                **event_context,
+                "step": step,
+                "call_id": call_id,
+                "tool_name": call_name,
+                **request.to_dict(),
+            }
+            self.trace.write("approval_requested", payload)
+            self._emit(
+                event_handler,
+                AgentEvent(kind="approval_requested", data=payload),
+            )
+
+        decision = ctx.approvals.authorize(
+            request,
+            cancel_event=ctx.cancel_event,
+            on_waiting=on_waiting,
+        )
+        payload = {
+            **event_context,
+            "step": step,
+            "call_id": call_id,
+            "tool_name": call_name,
+            "request_id": request.request_id,
+            "action": request.action,
+            "resource": request.resource,
+            "description": request.description,
+            "details": request.details,
+            "decision": decision.value,
+            "prompted": waited,
+            "source": (
+                "prompt"
+                if waited
+                else "session"
+                if decision == ApprovalDecision.ALLOW_SESSION
+                else "automatic"
+            ),
+        }
+        self.trace.write("approval_resolved", payload)
+        self._emit(
+            event_handler,
+            AgentEvent(kind="approval_resolved", data=payload),
+        )
+        if decision == ApprovalDecision.DENY:
+            return ToolResult(
+                ok=False,
+                stderr=f"user denied {request.description}",
+                metadata={
+                    "status": "denied",
+                    "request_id": request.request_id,
+                    "action": request.action,
+                    "resource": request.resource,
+                },
+            )
+        return None
+
+    def _record_interrupted_tool_result(
+        self,
+        call: ToolCall,
+        messages: list[Message],
+        step: int,
+        event_context: dict[str, str],
+        event_handler: EventHandler | None,
+    ) -> None:
+        tool_result = ToolResult(
+            ok=False,
+            stderr="tool call cancelled because the turn was interrupted",
+            metadata={"status": "interrupted"},
+        )
+        result_payload = tool_result.to_dict()
+        self.trace.write(
+            "tool_result",
+            {
+                **event_context,
+                "step": step,
+                "call": call.to_dict(),
+                "result": result_payload,
+            },
+        )
+        self._emit(
+            event_handler,
+            AgentEvent(
+                kind="tool_finished",
+                data={"name": call.name, "ok": False, "status": "interrupted"},
+            ),
+        )
+        messages.append(
+            ToolResultMessage(
+                tool_call_id=call.call_id,
+                tool_name=call.name,
+                content=json.dumps(result_payload, ensure_ascii=False),
+            )
+        )
+
     def _stream_model_response(
         self,
         *,
@@ -370,14 +546,18 @@ class AgentLoop:
         step: int,
         event_context: dict[str, str],
         event_handler: EventHandler | None,
+        cancel_event: threading.Event | None,
     ) -> ProviderResponse:
+        raise_if_cancelled(cancel_event)
         self._emit(event_handler, AgentEvent(kind="model_started", data={"step": step}))
         response: ProviderResponse | None = None
         for event in self.provider.stream(
             messages=snapshot.messages,
             tools=self.tools.specs(),
             system_prompt=snapshot.system_prompt,
+            cancel_event=cancel_event,
         ):
+            raise_if_cancelled(cancel_event)
             if event.kind in {"content_delta", "reasoning_delta"}:
                 self._emit(
                     event_handler,
@@ -397,6 +577,28 @@ class AgentLoop:
         if response is None:
             raise ProviderError("provider stream completed without a response", retryable=True)
         return response
+
+    def _record_turn_interrupted(
+        self,
+        pending: PendingTurn,
+        step: int,
+        event_context: dict[str, str],
+        reason: str,
+        event_handler: EventHandler | None,
+    ) -> None:
+        pending.step = step
+        self.trace.write(
+            "turn_interrupted",
+            {**event_context, "step": step, "reason": reason},
+        )
+        self._emit(
+            event_handler,
+            AgentEvent(
+                kind="turn_interrupted",
+                text=reason,
+                data={"step": step},
+            ),
+        )
 
     def _record_turn_error(
         self,

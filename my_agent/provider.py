@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Protocol
 
+from .control import raise_if_cancelled
 from .messages import Message, ToolCall
 from .tools import ToolSpec
 
@@ -55,6 +57,7 @@ class Provider(Protocol):
         messages: list[Message],
         tools: list[ToolSpec],
         system_prompt: str,
+        cancel_event: threading.Event | None = None,
     ) -> Iterator[ProviderEvent]:
         ...
 
@@ -78,7 +81,9 @@ class ScriptedProvider:
         messages: list[Message],
         tools: list[ToolSpec],
         system_prompt: str,
+        cancel_event: threading.Event | None = None,
     ) -> Iterator[ProviderEvent]:
+        raise_if_cancelled(cancel_event)
         self.requests.append(list(messages))
         self.system_prompts.append(system_prompt)
         if not self._replies:
@@ -90,7 +95,10 @@ class ScriptedProvider:
         if isinstance(reply, Exception):
             raise reply
         if reply.reasoning_content:
+            raise_if_cancelled(cancel_event)
             yield ProviderEvent(kind="reasoning_delta", text=reply.reasoning_content)
         if reply.content:
+            raise_if_cancelled(cancel_event)
             yield ProviderEvent(kind="content_delta", text=reply.content)
+        raise_if_cancelled(cancel_event)
         yield ProviderEvent(kind="completed", response=reply)

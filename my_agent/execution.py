@@ -4,6 +4,7 @@ import os
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,6 +34,7 @@ class ProcessResult:
     exit_code: int | None = None
     truncated: bool = False
     timed_out: bool = False
+    interrupted: bool = False
     duration_ms: int = 0
     environment_keys: tuple[str, ...] = ()
 
@@ -46,6 +48,7 @@ class ProcessRunner:
         argv: list[str],
         cwd: Path,
         timeout_seconds: int,
+        cancel_event: threading.Event | None = None,
     ) -> ProcessResult:
         environment = _subprocess_environment()
         started = time.monotonic()
@@ -70,12 +73,25 @@ class ProcessRunner:
                 )
 
             timed_out = False
-            try:
-                exit_code = process.wait(timeout=timeout_seconds)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                _kill_process_group(process)
-                exit_code = process.wait()
+            interrupted = False
+            deadline = time.monotonic() + timeout_seconds
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    interrupted = True
+                    _kill_process_group(process)
+                    exit_code = process.wait()
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    _kill_process_group(process)
+                    exit_code = process.wait()
+                    break
+                try:
+                    exit_code = process.wait(timeout=min(0.1, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
 
             stdout, stdout_truncated = _read_capture(stdout_file, self.max_output_bytes)
             stderr, stderr_truncated = _read_capture(stderr_file, self.max_output_bytes)
@@ -84,7 +100,9 @@ class ProcessRunner:
 
         return ProcessResult(
             status=(
-                "timed_out"
+                "interrupted"
+                if interrupted
+                else "timed_out"
                 if timed_out
                 else "success"
                 if exit_code == 0
@@ -95,6 +113,7 @@ class ProcessRunner:
             exit_code=exit_code,
             truncated=stdout_truncated or stderr_truncated,
             timed_out=timed_out,
+            interrupted=interrupted,
             duration_ms=_duration_ms(started),
             environment_keys=tuple(sorted(environment)),
         )

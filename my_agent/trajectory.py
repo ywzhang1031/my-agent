@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = "my-agent.trajectory.v3"
+SCHEMA_VERSION = "my-agent.trajectory.v4"
 
 
 def read_jsonl_trace(path: str | Path) -> list[dict[str, Any]]:
@@ -44,6 +44,7 @@ def _make_session_trajectory(
         turn_events = [event for event in events if event.get("turn_id") == turn_id]
         final = _first_event(turn_events, "final_answer")
         aborted = _first_event(turn_events, "turn_aborted")
+        interrupted = _first_event(turn_events, "turn_interrupted")
         errors = [event for event in turn_events if event.get("event") == "turn_error"]
         turns.append(
             {
@@ -72,6 +73,8 @@ def _make_session_trajectory(
                         if final
                         else "aborted"
                         if aborted
+                        else "interrupted"
+                        if interrupted
                         else "failed"
                         if errors
                         else "incomplete"
@@ -101,6 +104,8 @@ def _make_session_trajectory(
             if turns and all(turn["outcome"]["status"] == "completed" for turn in turns)
             else "failed"
             if any(turn["outcome"]["status"] == "failed" for turn in turns)
+            else "interrupted"
+            if any(turn["outcome"]["status"] == "interrupted" for turn in turns)
             else "aborted"
             if any(turn["outcome"]["status"] == "aborted" for turn in turns)
             else "incomplete",
@@ -148,11 +153,56 @@ def _make_step(step: int, events: list[dict[str, Any]]) -> dict[str, Any]:
             "ts": model_response.get("ts"),
         },
         "actions": [_make_action(event) for event in events if event.get("event") == "tool_call"],
+        "approvals": _make_approvals(events),
         "observations": [
             _make_observation(event) for event in events if event.get("event") == "tool_result"
         ],
         "final_answer": final.get("answer") if final else None,
     }
+
+
+def _make_approvals(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    approvals: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for event in events:
+        if event.get("event") not in {"approval_requested", "approval_resolved"}:
+            continue
+        request_id = event.get("request_id", "")
+        if request_id not in approvals:
+            approvals[request_id] = {
+                "request_id": request_id,
+                "call_id": event.get("call_id", ""),
+                "tool_name": event.get("tool_name", ""),
+                "action": event.get("action", ""),
+                "resource": event.get("resource", ""),
+                "description": event.get("description", ""),
+                "details": event.get("details", {}),
+                "decision": None,
+                "source": None,
+                "prompted": event.get("event") == "approval_requested",
+                "requested_at": None,
+                "resolved_at": None,
+            }
+            order.append(request_id)
+        approval = approvals[request_id]
+        if event.get("event") == "approval_requested":
+            approval["requested_at"] = event.get("ts")
+        else:
+            approval.update(
+                {
+                    "call_id": event.get("call_id", approval["call_id"]),
+                    "tool_name": event.get("tool_name", approval["tool_name"]),
+                    "action": event.get("action", approval["action"]),
+                    "resource": event.get("resource", approval["resource"]),
+                    "description": event.get("description", approval["description"]),
+                    "details": event.get("details", approval["details"]),
+                    "decision": event.get("decision"),
+                    "source": event.get("source"),
+                    "prompted": event.get("prompted", approval["prompted"]),
+                    "resolved_at": event.get("ts"),
+                }
+            )
+    return [approvals[request_id] for request_id in order]
 
 
 def _make_action(event: dict[str, Any]) -> dict[str, Any]:
@@ -193,6 +243,21 @@ def _make_metrics(events: list[dict[str, Any]], started_at: float | None, ended_
         "provider_retries": sum(1 for event in events if event.get("event") == "provider_retry"),
         "turn_errors": sum(1 for event in events if event.get("event") == "turn_error"),
         "turn_aborts": sum(1 for event in events if event.get("event") == "turn_aborted"),
+        "turn_interruptions": sum(
+            1 for event in events if event.get("event") == "turn_interrupted"
+        ),
+        "approval_requests": sum(
+            1 for event in events if event.get("event") == "approval_requested"
+        ),
+        "approval_decisions": sum(
+            1 for event in events if event.get("event") == "approval_resolved"
+        ),
+        "approval_denials": sum(
+            1
+            for event in events
+            if event.get("event") == "approval_resolved"
+            and event.get("decision") == "deny"
+        ),
         "context_compactions": sum(
             1 for event in events if event.get("event") == "context_compacted"
         ),

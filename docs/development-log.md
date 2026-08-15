@@ -161,20 +161,46 @@ request breakdown，而不是只展示一个总数。
 - UI 不显示当前 request 中不存在的 Rules、Skills、MCP 或 subagent 分类。
 - history 继续持久化到 `.my-agent/history`，每次读取后收紧为 `0600`。
 
+## Milestone 12: Bidirectional Runtime and Approval Flow
+
+CLI 与 agent loop 之间从同步函数调用升级为双向 runtime protocol，为交互审批和主动中断提供
+稳定边界。
+
+- `AgentRuntime` 在单独 worker 中执行一个 turn；CLI 发送 `StartTurn`、`InterruptTurn` 和
+  `ResolveApproval`，只消费 provider-neutral `RuntimeEvent`。
+- runtime 状态显式区分 `idle`、`running_model`、`waiting_approval`、`running_tool`、
+  `completed`、`failed` 和 `interrupted`。
+- `AgentLoop` 仍负责 model/tool loop，但不再负责 stdin、审批 UI 或线程调度；终端可以在
+  `approval_requested` 后暂停，并用同一 `request_id` 恢复原 tool call。
+- 静态 `PermissionPolicy` 先判断操作是否合法；`PermissionRequest` 再询问用户是否授权这个
+  合法副作用。两层职责不同，拒绝不会绕过 policy，也不会执行工具。
+- `allow_once` 只批准当前请求；`allow_session` 按精确 `(action, resource)` 缓存在当前
+  runtime；`deny` 转换为失败 `ToolResult`，让模型能看到并调整计划。
+- cancellation token 贯穿 provider、approval wait、agent loop 和 `ProcessRunner`。中断会记录
+  `turn_interrupted` 并保留 `PendingTurn`；正在运行的子进程会终止整个 process group。
+- 如果中断发生在一组 tool calls 尚未全部形成 observation 时，harness 会为未处理 call 写入
+  `interrupted` ToolResult，保证 `/retry` 发给 provider 的 assistant/tool 消息序列完整。
+- trajectory schema 升级为 `my-agent.trajectory.v4`。每个 step 增加 approvals，记录
+  `call_id`、decision、source、prompted 和时间；metrics 增加 approval 与 interruption 计数。
+- `chat/resume` 使用交互审批；非交互 `ask` 保持自动批准静态 policy 已允许的操作，避免脚本
+  因等待 stdin 卡住。该模式适用于受信任调用，不是 unattended sandbox。
+
 ## Current Boundaries
 
 - `apply_patch` 可以自动修改 workspace 内的单个普通 UTF-8/LF 文件。
 - `git_diff` 只比较 `HEAD` 和当前工作树；untracked 文件只展示名称，不展示内容。
-- 文件写入没有交互 approval，也没有操作系统级 sandbox。
+- `chat/resume` 会为 `apply_patch` 和 `exec_command` 请求交互 approval；`ask` 自动批准静态
+  policy 已允许的操作。两种模式都没有操作系统级 sandbox。
 - `exec_command` 只执行 allowlisted test/check/build argv，但不是操作系统级 sandbox；
   被允许的项目代码仍可能写文件、读取用户文件或访问网络。
 - `exec_command` 不支持 shell command string、pipe/redirection、stdin、TTY、后台 session、
-  package install 或交互 approval。
+  package install。
 - context token 是字符启发式估算，不是 DeepSeek tokenizer 的精确结果；compaction 使用
   确定性 extractive summary，不是模型生成的语义摘要。
 - context breakdown 同样是估算值；provider usage 只能给出精确总 input，不能反推每类的精确
   tokenizer 计数。
 - stream 在已经显示部分 delta 后不会自动重放；用户必须使用 `/retry` 或 `/abort`。
+- model cancellation 是协作式检查；底层网络 read 期间可能要等待 I/O 返回或 timeout。
 - `/abort` 只清理 conversation state，不回滚已经执行的文件修改或进程副作用。
 - 本地 `.my-agent/`、`trace.jsonl` 和 `trajectory.json` 默认不提交到 Git。
 - 当前只有 DeepSeek adapter，provider abstraction 已为其他模型保留边界。
@@ -182,7 +208,6 @@ request breakdown，而不是只展示一个总数。
 ## Next Candidates
 
 - 使用 macOS Seatbelt、Linux bubblewrap 或 container 将允许的进程放入 OS sandbox。
-- 增加 allow/ask/deny approval flow，并把用户决策写入 trace。
 - 在确定性 compactor 之上增加可选的 provider semantic summary 和 summary 质量验证。
 - 增加更多 provider adapter，并对 streaming/tool-call edge cases 建立 contract tests。
 - 为真实任务建立 eval cases，并使用 trajectory 分析失败类型。

@@ -1,10 +1,10 @@
 # My Agent
 
 一个从只读诊断 loop 逐步生长出来的最小 coding agent。它现在具备流式模型输出、
-tool 进度、可恢复失败、命令行历史和自动 context compaction。当前主循环是：
+tool 进度、交互审批、可中断/恢复 turn、命令行历史和自动 context compaction。当前主循环是：
 
 ```text
-user task -> model -> tool call -> tool result -> model -> final answer
+user task -> model -> tool proposal -> approval -> tool result -> model -> final answer
 ```
 
 当前暴露这些工具：
@@ -88,6 +88,17 @@ stdout。之后可以用同一个 ID 继续对话：
 .venv/bin/python cli.py chat --workspace .
 ```
 
+`chat` 和 `resume` 中，`apply_patch` 与 `exec_command` 在执行前会暂停当前 turn 并要求审批：
+
+- `y` / `once`：只允许本次调用
+- `a` / `session`：本进程内允许相同的 action/resource
+- `n` / `deny`：不执行工具，将拒绝作为 tool observation 返回给模型
+
+`apply_patch` 的 session resource 是同一 workspace-relative path；`exec_command` 是同一组
+normalized `argv` 与 `cwd`。`/new` 会创建新 runtime，因此也会清空 session approvals。
+非交互 `ask` 不会等待 stdin 审批：它会自动批准已经通过静态 file/command policy 的操作，
+适合明确受信任的任务，不应作为无人值守安全边界。
+
 REPL 支持这些本地命令：
 
 - `/exit`：保存并退出
@@ -105,7 +116,9 @@ REPL 使用 `prompt_toolkit`，支持左右移动光标、行内插入和上下�
 全部 slash commands 及说明；`Shift-Tab` 反向选择候选，`Tab` 接受当前候选，再按一次 `Tab`
 可执行完整命令，`Enter` 也可执行。底部状态栏持续显示 context 百分比、估算用量和 pending
 状态。历史保存在 `.my-agent/history`，权限设为 `0600`。
-输入过程中按 `Ctrl-C` 只清空当前行；模型调用失败后可以执行 `/retry` 或 `/abort`。
+输入过程中按 `Ctrl-C` 只清空当前行；turn 运行或等待审批时按 `Ctrl-C` 会发送
+`InterruptTurn`。中断后的 pending turn 可以执行 `/retry` 继续，或用 `/abort` 丢弃。
+模型调用失败后同样可以执行 `/retry` 或 `/abort`。
 交互 stdin/stdout 是 TTY 时，CLI 会显式启用完整 terminal layout；即使宿主错误地报告
 `TERM=dumb`，slash menu 也不会退化为纯文本 `input()`。
 
@@ -155,6 +168,8 @@ DeepSeek，但 CLI 只显示 `thinking...` 状态；使用 `--show-thinking` 才
 
 - `cli.py`：解析 `ask/chat/resume`，控制 REPL，并在每轮后保存 session
 - `terminal.py`：封装 command completion、context UI、history 和流式渲染，不参与 agent 决策
+- `runtime.py`：接收 `RuntimeCommand`、在 worker 中驱动 turn，并发布 `RuntimeEvent`
+- `control.py`：定义 cancellation、permission request 和 approval decision 契约
 - `session.py`：序列化统一 `Message`、context 状态和可重试的 `PendingTurn`
 - `context.py`：估算 token、保留 active turn，并摘要压缩较老的 completed turns
 - `agent_loop.py`：维护 model -> tool -> observation -> model 循环，并发出统一 `AgentEvent`
@@ -170,6 +185,8 @@ DeepSeek，但 CLI 只显示 `thinking...` 状态；使用 `--show-thinking` 才
 
 ```text
 CLI loads SessionState
+  -> CLI sends StartTurn to AgentRuntime
+  -> AgentRuntime starts one worker and publishes lifecycle events
   -> AgentLoop appends UserMessage
   -> PendingTurn records the stable turn_id, step, and completed tool calls
   -> ContextManager estimates the next request
@@ -178,13 +195,24 @@ CLI loads SessionState
   -> SSE deltas become ProviderEvent, then AgentEvent, then terminal output
   -> completed response contains content/reasoning_content/tool_calls
   -> AgentLoop either accepts a final answer
-     or asks ToolRegistry to execute every tool call
+     or asks ToolRegistry to validate and describe every tool call
+  -> write/exec action becomes PermissionRequest
+     -> CLI receives approval_requested
+     -> user sends ResolveApproval(allow_once/allow_session/deny)
+     -> the same suspended tool call resumes; the model is not called again first
+  -> approved call executes; denied call becomes a failed ToolResult
   -> ToolResult becomes ToolResultMessage
   -> next model request sees the new observation
   -> after edits, git_diff exposes the actual working-tree delta
   -> exec_command runs the narrowest allowlisted validation
   -> CLI saves messages, trace, and trajectory
 ```
+
+`AgentRuntime` 是 CLI 和 harness 的双向边界。输入命令目前是 `StartTurn`、
+`InterruptTurn`、`ResolveApproval`；输出事件覆盖 model delta、tool lifecycle、approval lifecycle
+和 turn terminal state。状态机使用 `idle`、`running_model`、`waiting_approval`、
+`running_tool`、`completed`、`failed`、`interrupted`。`AgentLoop` 不读取 stdin，也不知道
+prompt_toolkit，因此未来替换为 TUI、IDE 或远程客户端时不需要把交互逻辑塞回 loop。
 
 Context token 数量是保守估算，不是 provider tokenizer 的精确计数。达到输入预算的 85% 时，
 `ContextManager` 会按完整 user turn 边界压缩较老历史，目标降到 70%；当前 active turn、最近
@@ -195,10 +223,13 @@ Context token 数量是保守估算，不是 provider tokenizer 的精确计数�
 DeepSeek adapter 只会在尚未向终端输出任何 `content`/`reasoning_content` delta 时自动重试
 可重试错误。流中途失败时自动重放可能造成重复文本，所以 harness 保留 `PendingTurn`，由用户
 执行 `/retry` 从同一个 model step 恢复。已经成功执行的 tool call ID 会被记住，不会在恢复时
-再次执行。
+再次执行。中断检查发生在 request、SSE chunk、重试等待和工具执行边界；Python `urllib`
+正在等待网络读取时无法立即强制关闭底层 socket，因此模型中断最坏仍可能等到当前 I/O 返回
+或请求 timeout。子进程中断会直接终止整个 process group。
 
 `exec_command` 的 allowlist 是 harness policy，不是安全 sandbox。被允许的 test/build
 命令仍会执行仓库中的代码，因此仍可能写文件、访问用户可读路径或尝试网络访问。
+交互 approval 表达用户意图，也不改变这一安全边界。
 
 `final_answer` 仍然是 harness 的判断：当规范化后的 `ProviderResponse.tool_calls`
 为空时，这次 turn 完成。它不代表整个 session 结束；是否继续下一轮由 CLI REPL 决定。
@@ -226,7 +257,7 @@ PYTHONPATH=. python3 scripts/export_trajectory.py \
 ```
 
 `trace.jsonl` 是原始事件流；导出的 `trajectory.json` 使用
-`my-agent.trajectory.v3`，先按 turn 分组，再按 step 分组，避免不同
+`my-agent.trajectory.v4`，先按 turn 分组，再按 step 分组，避免不同
 turn 中相同 step 编号发生碰撞。每轮结束后会自动刷新 `trajectory.json`，手动导出主要
-用于重新生成或校验现有 session trajectory。v3 还包含 context snapshot、provider retry、
-turn error/abort 和对应 metrics。
+用于重新生成或校验现有 session trajectory。v4 在 context snapshot、provider retry 和
+turn error/abort 基础上，增加 approvals、interrupted outcome 及对应 metrics。

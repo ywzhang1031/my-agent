@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -9,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterator
 
 from ..messages import AssistantMessage, Message, ToolCall, ToolResultMessage, UserMessage
+from ..control import raise_if_cancelled
 from ..provider import ProviderError, ProviderEvent, ProviderResponse, TokenUsage
 from ..tools import ToolSpec
 
@@ -52,17 +54,21 @@ class DeepSeekProvider:
         messages: list[Message],
         tools: list[ToolSpec],
         system_prompt: str,
+        cancel_event: threading.Event | None = None,
     ) -> Iterator[ProviderEvent]:
+        raise_if_cancelled(cancel_event)
         if not self.api_key:
             raise ProviderError("DEEPSEEK_API_KEY is required for the DeepSeek provider")
 
         payload = self.build_payload(messages, tools, system_prompt)
         for attempt in range(1, self.max_retries + 2):
+            raise_if_cancelled(cancel_event)
             accumulator = _StreamAccumulator()
             emitted_delta = False
             try:
-                for chunk in self._stream_once(payload):
+                for chunk in self._stream_once(payload, cancel_event):
                     for event in accumulator.consume(chunk):
+                        raise_if_cancelled(cancel_event)
                         emitted_delta = True
                         yield event
                 response = accumulator.finish()
@@ -86,12 +92,20 @@ class DeepSeekProvider:
                         "status_code": exc.status_code,
                     },
                 )
-                if delay > 0:
+                if delay > 0 and cancel_event is not None:
+                    if cancel_event.wait(delay):
+                        raise_if_cancelled(cancel_event)
+                elif delay > 0:
                     time.sleep(delay)
 
         raise ProviderError("DeepSeek stream exhausted retries")
 
-    def _stream_once(self, payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    def _stream_once(
+        self,
+        payload: dict[str, Any],
+        cancel_event: threading.Event | None,
+    ) -> Iterator[dict[str, Any]]:
+        raise_if_cancelled(cancel_event)
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
@@ -105,6 +119,7 @@ class DeepSeekProvider:
             with urllib.request.urlopen(request, timeout=120) as response:
                 saw_done = False
                 for raw_line in response:
+                    raise_if_cancelled(cancel_event)
                     line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line or line.startswith(":"):
                         continue

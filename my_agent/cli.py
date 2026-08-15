@@ -3,10 +3,19 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from queue import Empty
 
-from .agent_loop import AgentLoop
+from .agent_loop import AgentEvent, AgentLoop
+from .control import ApprovalDecision
 from .permissions import PermissionPolicy
 from .providers.deepseek import DeepSeekProvider
+from .runtime import (
+    AgentRuntime,
+    InterruptTurn,
+    ResolveApproval,
+    RuntimeEvent,
+    StartTurn,
+)
 from .session import SessionState, SessionStore
 from .terminal import (
     LineEditor,
@@ -136,17 +145,16 @@ def _run_ask(args: argparse.Namespace) -> int:
     state = store.create(workspace.root)
     print(f"session: {state.session_id}", file=sys.stderr)
     loop, _ = _build_runtime(args, workspace, state.trace_path)
+    runtime = AgentRuntime(loop, state, interactive_approvals=False)
     renderer = StreamRenderer(answer_prefix="", show_thinking=args.show_thinking)
     try:
-        result = loop.run_turn(
-            state,
-            prompt,
-            event_handler=renderer.handle if args.stream else None,
-        )
-    except Exception:
-        renderer.finish("")
-        raise
+        runtime.send(StartTurn(user_input=prompt))
+        terminal_event = _consume_runtime_events(args, runtime, renderer)
+        if terminal_event.kind != "turn_completed" or terminal_event.result is None:
+            raise RuntimeError(terminal_event.text or terminal_event.kind)
+        result = terminal_event.result
     finally:
+        runtime.close()
         _save_session_artifacts(store, state)
     if args.stream:
         renderer.finish(result.answer)
@@ -172,6 +180,7 @@ def _run_resume(args: argparse.Namespace) -> int:
 def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) -> int:
     workspace = Workspace(state.workspace)
     loop, registry = _build_runtime(args, workspace, state.trace_path)
+    runtime = AgentRuntime(loop, state, interactive_approvals=True)
     print(f"session: {state.session_id}")
 
     history_path = store.root.parent / "history"
@@ -180,145 +189,221 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
     def current_toolbar():
         return toolbar
 
-    with LineEditor(
-        history_path,
-        commands=SLASH_COMMANDS,
-        status_provider=current_toolbar,
-    ) as editor:
-        while True:
-            snapshot = loop.inspect_context(state)
-            toolbar = format_context_status(
-                snapshot,
-                pending=state.pending_turn is not None,
-            )
-            try:
-                user_input = editor.read("you> ").strip()
-            except KeyboardInterrupt:
-                print("^C")
-                continue
-            except EOFError:
-                print()
-                _save_session_artifacts(store, state)
-                return 0
-
-            if not user_input:
-                continue
-            if user_input == "/exit":
-                _save_session_artifacts(store, state)
-                return 0
-            if user_input == "/new":
-                state = store.create(state.workspace)
-                workspace = Workspace(state.workspace)
-                loop, registry = _build_runtime(args, workspace, state.trace_path)
-                print(f"session: {state.session_id}")
-                continue
-            if user_input == "/sessions":
-                for summary in store.list_sessions():
-                    print(
-                        f"{summary.session_id}  messages={summary.message_count}  "
-                        f"updated={summary.updated_at}"
-                    )
-                continue
-            if user_input == "/summary":
-                pending = state.pending_turn.turn_id if state.pending_turn else "none"
-                print(
-                    f"session={state.session_id} workspace={state.workspace} "
-                    f"messages={len(state.messages)} summarized="
-                    f"{state.summarized_message_count} pending={pending}"
-                )
-                continue
-            if user_input == "/context":
+    try:
+        with LineEditor(
+            history_path,
+            commands=SLASH_COMMANDS,
+            status_provider=current_toolbar,
+        ) as editor:
+            while True:
                 snapshot = loop.inspect_context(state)
-                print(
-                    render_context_usage(
-                        snapshot,
-                        last_provider_input=state.last_input_tokens,
-                        color=sys.stdout.isatty(),
-                    )
+                toolbar = format_context_status(
+                    snapshot,
+                    pending=state.pending_turn is not None,
                 )
-                continue
-            if user_input == "/retry":
-                if state.pending_turn is None:
-                    print("no pending turn to retry")
+                try:
+                    user_input = editor.read("you> ").strip()
+                except KeyboardInterrupt:
+                    print("^C")
                     continue
-                _run_chat_turn(args, store, state, loop, retry=True)
-                continue
-            if user_input == "/abort":
-                if state.pending_turn is None:
-                    print("no pending turn to abort")
-                    continue
-                pending = loop.abort_turn(state)
-                _save_session_artifacts(store, state)
-                warning = (
-                    " Filesystem changes from completed tools were not reverted."
-                    if pending.tool_calls_executed
-                    else ""
-                )
-                print(f"aborted {pending.turn_id}.{warning}")
-                continue
-            if user_input == "/trace":
-                print(state.trace_path)
-                continue
-            if user_input == "/tools":
-                print("\n".join(registry.names()))
-                continue
-            if user_input == "/help":
-                print("Commands")
-                for command in SLASH_COMMANDS:
-                    print(f"  {command.name:<12}{command.description}")
-                print("\nType / to open the menu; use Tab/Shift-Tab to select.")
-                continue
-            if user_input.startswith("/"):
-                print(f"unknown command: {user_input}")
-                continue
+                except EOFError:
+                    print()
+                    _save_session_artifacts(store, state)
+                    return 0
 
-            if state.pending_turn is not None:
-                print("pending turn exists; use /retry or /abort before sending a new message")
-                continue
-            _run_chat_turn(args, store, state, loop, user_input=user_input)
+                if not user_input:
+                    continue
+                if user_input == "/exit":
+                    _save_session_artifacts(store, state)
+                    return 0
+                if user_input == "/new":
+                    runtime.close()
+                    state = store.create(state.workspace)
+                    workspace = Workspace(state.workspace)
+                    loop, registry = _build_runtime(args, workspace, state.trace_path)
+                    runtime = AgentRuntime(loop, state, interactive_approvals=True)
+                    print(f"session: {state.session_id}")
+                    continue
+                if user_input == "/sessions":
+                    for summary in store.list_sessions():
+                        print(
+                            f"{summary.session_id}  messages={summary.message_count}  "
+                            f"updated={summary.updated_at}"
+                        )
+                    continue
+                if user_input == "/summary":
+                    pending = state.pending_turn.turn_id if state.pending_turn else "none"
+                    print(
+                        f"session={state.session_id} workspace={state.workspace} "
+                        f"messages={len(state.messages)} summarized="
+                        f"{state.summarized_message_count} pending={pending}"
+                    )
+                    continue
+                if user_input == "/context":
+                    snapshot = loop.inspect_context(state)
+                    print(
+                        render_context_usage(
+                            snapshot,
+                            last_provider_input=state.last_input_tokens,
+                            color=sys.stdout.isatty(),
+                        )
+                    )
+                    continue
+                if user_input == "/retry":
+                    if state.pending_turn is None:
+                        print("no pending turn to retry")
+                        continue
+                    _run_chat_turn(args, store, state, runtime, editor, retry=True)
+                    continue
+                if user_input == "/abort":
+                    if state.pending_turn is None:
+                        print("no pending turn to abort")
+                        continue
+                    pending = loop.abort_turn(state)
+                    _save_session_artifacts(store, state)
+                    warning = (
+                        " Filesystem changes from completed tools were not reverted."
+                        if pending.tool_calls_executed
+                        else ""
+                    )
+                    print(f"aborted {pending.turn_id}.{warning}")
+                    continue
+                if user_input == "/trace":
+                    print(state.trace_path)
+                    continue
+                if user_input == "/tools":
+                    print("\n".join(registry.names()))
+                    continue
+                if user_input == "/help":
+                    print("Commands")
+                    for command in SLASH_COMMANDS:
+                        print(f"  {command.name:<12}{command.description}")
+                    print("\nType / to open the menu; Tab accepts or runs a command.")
+                    continue
+                if user_input.startswith("/"):
+                    print(f"unknown command: {user_input}")
+                    continue
+
+                if state.pending_turn is not None:
+                    print("pending turn exists; use /retry or /abort before sending a new message")
+                    continue
+                _run_chat_turn(args, store, state, runtime, editor, user_input=user_input)
+    finally:
+        runtime.close()
 
 
 def _run_chat_turn(
     args: argparse.Namespace,
     store: SessionStore,
     state: SessionState,
-    loop: AgentLoop,
+    runtime: AgentRuntime,
+    editor: LineEditor,
     *,
     user_input: str | None = None,
     retry: bool = False,
 ) -> None:
     renderer = StreamRenderer(show_thinking=args.show_thinking)
     try:
-        if retry:
-            result = loop.retry_turn(
-                state,
-                event_handler=renderer.handle if args.stream else None,
-            )
-        else:
-            if user_input is None:
-                raise ValueError("user_input is required for a new turn")
-            result = loop.run_turn(
-                state,
-                user_input,
-                event_handler=renderer.handle if args.stream else None,
-            )
-    except KeyboardInterrupt:
-        renderer.finish("")
-        print("generation interrupted; use /retry to continue or /abort to discard the turn")
-        return
-    except Exception as exc:
-        renderer.finish("")
-        if not args.stream:
-            print(f"error: {exc}")
-        print("use /retry to continue or /abort to discard the pending turn")
-        return
+        runtime.send(StartTurn(user_input=user_input or "", retry=retry))
+        terminal_event = _consume_runtime_events(args, runtime, renderer, editor)
     finally:
         _save_session_artifacts(store, state)
 
-    if args.stream:
-        renderer.finish(result.answer)
+    if terminal_event.kind == "turn_completed" and terminal_event.result is not None:
+        if args.stream:
+            renderer.finish(terminal_event.result.answer)
+        else:
+            print(f"assistant> {terminal_event.result.answer}")
+        return
+    renderer.finish("")
+    if terminal_event.kind == "turn_interrupted":
+        print("generation interrupted; use /retry to continue or /abort to discard the turn")
     else:
-        print(f"assistant> {result.answer}")
+        if not args.stream:
+            print(f"error: {terminal_event.text}")
+        print("use /retry to continue or /abort to discard the pending turn")
+
+
+def _consume_runtime_events(
+    args: argparse.Namespace,
+    runtime: AgentRuntime,
+    renderer: StreamRenderer,
+    editor: LineEditor | None = None,
+) -> RuntimeEvent:
+    interrupt_requested = False
+    while True:
+        try:
+            event = runtime.next_event(timeout=0.1)
+        except Empty:
+            continue
+        except KeyboardInterrupt:
+            if not interrupt_requested:
+                runtime.send(InterruptTurn())
+                print("interrupt requested", file=sys.stderr)
+                interrupt_requested = True
+            continue
+
+        if args.stream:
+            renderer.handle(AgentEvent(kind=event.kind, text=event.text, data=event.data))
+        if event.kind == "approval_requested":
+            if args.stream:
+                renderer.finish("")
+            if editor is None:
+                raise RuntimeError("non-interactive runtime requested approval")
+            decision = _prompt_for_approval(editor, event)
+            if decision is None:
+                runtime.send(InterruptTurn())
+                interrupt_requested = True
+            else:
+                runtime.send(
+                    ResolveApproval(
+                        request_id=event.data["request_id"],
+                        decision=decision,
+                    )
+                )
+        if event.kind in {"turn_completed", "turn_failed", "turn_interrupted"}:
+            if args.stream and event.kind != "turn_completed":
+                renderer.finish("")
+            runtime.wait()
+            return event
+
+
+def _prompt_for_approval(
+    editor: LineEditor,
+    event: RuntimeEvent,
+) -> ApprovalDecision | None:
+    details = event.data.get("details", {})
+    print(f"approval> {event.data.get('description', event.data.get('action', 'tool action'))}")
+    if details.get("argv"):
+        print(f"  argv: {details['argv']}")
+        print(f"  cwd: {details.get('cwd', '.')}")
+    if details.get("patch_preview"):
+        print(details["patch_preview"])
+        if details.get("preview_truncated"):
+            print("...[approval preview truncated]")
+
+    choices = {
+        "y": ApprovalDecision.ALLOW_ONCE,
+        "once": ApprovalDecision.ALLOW_ONCE,
+        "a": ApprovalDecision.ALLOW_SESSION,
+        "session": ApprovalDecision.ALLOW_SESSION,
+        "n": ApprovalDecision.DENY,
+        "deny": ApprovalDecision.DENY,
+    }
+    while True:
+        try:
+            value = editor.read(
+                "approve [y] once / [a] session / [n] deny> "
+            ).strip().lower()
+        except KeyboardInterrupt:
+            print("^C")
+            return None
+        except EOFError:
+            return ApprovalDecision.DENY
+        decision = choices.get(value)
+        if decision is not None:
+            return decision
+        print("enter y, a, or n")
 
 
 def _build_runtime(

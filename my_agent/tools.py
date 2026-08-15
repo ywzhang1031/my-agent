@@ -3,13 +3,15 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
 from .execution import ProcessRunner
 from .messages import ToolCall
-from .patches import MAX_PATCH_CHARS, apply_patch
+from .control import ApprovalBroker, AutoApproveBroker, PermissionRequest
+from .patches import MAX_PATCH_CHARS, apply_patch, parse_patch
 from .permissions import PermissionPolicy
 from .workspace import Workspace, WorkspaceError
 
@@ -55,6 +57,8 @@ class ToolContext:
     workspace: Workspace
     permissions: PermissionPolicy
     timeout_seconds: int = 60
+    approvals: ApprovalBroker = field(default_factory=AutoApproveBroker)
+    cancel_event: threading.Event | None = None
 
 
 class BaseTool(Protocol):
@@ -64,6 +68,13 @@ class BaseTool(Protocol):
     required: list[str]
 
     def run(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        ...
+
+    def permission_request(
+        self,
+        arguments: dict[str, Any],
+        ctx: ToolContext,
+    ) -> PermissionRequest | None:
         ...
 
 
@@ -83,6 +94,13 @@ class ToolBase:
             strict=self.strict,
         )
 
+    def permission_request(
+        self,
+        arguments: dict[str, Any],
+        ctx: ToolContext,
+    ) -> PermissionRequest | None:
+        return None
+
 
 class ToolRegistry:
     def __init__(self, tools: list[BaseTool]) -> None:
@@ -99,6 +117,16 @@ class ToolRegistry:
         if tool is None:
             return ToolResult(ok=False, stderr=f"unknown tool: {call.name}")
         return tool.run(call.arguments, ctx)
+
+    def permission_request(
+        self,
+        call: ToolCall,
+        ctx: ToolContext,
+    ) -> PermissionRequest | None:
+        tool = self._tools.get(call.name)
+        if tool is None:
+            return None
+        return tool.permission_request(call.arguments, ctx)
 
 
 class ListFilesTool(ToolBase):
@@ -224,6 +252,36 @@ class ExecCommandTool(ToolBase):
     required = ["argv"]
     strict = True
 
+    def permission_request(
+        self,
+        arguments: dict[str, Any],
+        ctx: ToolContext,
+    ) -> PermissionRequest | None:
+        decision = ctx.permissions.decide_command(arguments.get("argv"))
+        if not decision.allowed:
+            return None
+        try:
+            _, relative_cwd = _command_cwd(arguments.get("cwd", "."), ctx.workspace)
+            timeout = _command_timeout(arguments.get("timeout_seconds"), ctx.timeout_seconds)
+        except (ValueError, WorkspaceError):
+            return None
+        resource = json.dumps(
+            {"argv": list(decision.argv), "cwd": relative_cwd},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        return PermissionRequest(
+            action="exec_command",
+            resource=resource,
+            description=f"run {' '.join(decision.argv)} in {relative_cwd}",
+            details={
+                "argv": list(decision.argv),
+                "cwd": relative_cwd,
+                "timeout_seconds": timeout,
+                "category": decision.category,
+            },
+        )
+
     def run(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         decision = ctx.permissions.decide_command(arguments.get("argv"))
         if not decision.allowed:
@@ -257,6 +315,7 @@ class ExecCommandTool(ToolBase):
             argv=list(decision.argv),
             cwd=cwd,
             timeout_seconds=timeout,
+            cancel_event=ctx.cancel_event,
         )
         return ToolResult(
             ok=execution.status == "success",
@@ -271,6 +330,7 @@ class ExecCommandTool(ToolBase):
                 "cwd": relative_cwd,
                 "timeout_seconds": timeout,
                 "timed_out": execution.timed_out,
+                "interrupted": execution.interrupted,
                 "duration_ms": execution.duration_ms,
                 "environment_keys": list(execution.environment_keys),
             },
@@ -297,6 +357,35 @@ class ApplyPatchTool(ToolBase):
     }
     required = ["patch"]
     strict = True
+
+    def permission_request(
+        self,
+        arguments: dict[str, Any],
+        ctx: ToolContext,
+    ) -> PermissionRequest | None:
+        patch = arguments.get("patch")
+        if not isinstance(patch, str):
+            return None
+        try:
+            operation = parse_patch(patch)
+            _, relative_path = ctx.workspace.resolve_patch_path(operation.path)
+            allowed, _ = ctx.permissions.allow_file_change(operation.kind, relative_path)
+        except (WorkspaceError, OSError, ValueError):
+            return None
+        if not allowed:
+            return None
+        preview_limit = 4_000
+        return PermissionRequest(
+            action="apply_patch",
+            resource=relative_path,
+            description=f"{operation.kind} {relative_path}",
+            details={
+                "operation": operation.kind,
+                "path": relative_path,
+                "patch_preview": patch[:preview_limit],
+                "preview_truncated": len(patch) > preview_limit,
+            },
+        )
 
     def run(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         patch = arguments.get("patch")
