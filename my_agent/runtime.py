@@ -15,6 +15,7 @@ from .control import (
     TurnInterrupted,
     raise_if_cancelled,
 )
+from .model_invoker import ModelInvoker
 from .session import SessionState
 
 
@@ -161,6 +162,14 @@ class AgentRuntime:
 
     def next_event(self, timeout: float | None = None) -> RuntimeEvent:
         return self._events.get(timeout=timeout)
+
+    def switch_model(self, model: ModelInvoker) -> None:
+        with self._lock:
+            if self._worker is not None and self._worker.is_alive():
+                raise RuntimeError("cannot switch model while a turn is running")
+        if self.session.pending_turn is not None:
+            raise RuntimeError("cannot switch model while a turn is pending")
+        self.loop.switch_model(model)
 
     def wait(self, timeout: float = 5.0) -> None:
         with self._lock:

@@ -7,8 +7,14 @@ from queue import Empty
 
 from .agent_loop import AgentEvent, AgentLoop
 from .control import ApprovalDecision
+from .model_invoker import ModelInvoker
 from .permissions import PermissionPolicy
-from .providers.deepseek import DeepSeekProvider
+from .providers.factory import (
+    SUPPORTED_PROVIDER_IDS,
+    ProviderConfig,
+    create_provider_adapter,
+    model_catalog,
+)
 from .runtime import (
     AgentRuntime,
     InterruptTurn,
@@ -19,6 +25,7 @@ from .runtime import (
 from .session import SessionState, SessionStore
 from .terminal import (
     LineEditor,
+    SelectionOption,
     SlashCommand,
     StreamRenderer,
     format_context_status,
@@ -43,6 +50,7 @@ SLASH_COMMANDS = (
     SlashCommand("/sessions", "List saved sessions"),
     SlashCommand("/summary", "Show current session state"),
     SlashCommand("/context", "Show detailed context usage"),
+    SlashCommand("/model", "Choose the model"),
     SlashCommand("/retry", "Resume the pending model step"),
     SlashCommand("/abort", "Discard the pending turn"),
     SlashCommand("/trace", "Show the raw trace path"),
@@ -119,16 +127,21 @@ def _add_runtime_options(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_provider_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--provider", default="deepseek", choices=["deepseek"], help="LLM provider.")
+    parser.add_argument(
+        "--provider",
+        default="deepseek",
+        choices=SUPPORTED_PROVIDER_IDS,
+        help="LLM provider adapter.",
+    )
     parser.add_argument(
         "--model",
         default=None,
-        help="Model name. Defaults to DEEPSEEK_MODEL or deepseek-v4-flash.",
+        help="Provider model ID. Uses the selected provider's default when omitted.",
     )
     parser.add_argument(
         "--base-url",
         default=None,
-        help="Provider base URL. Defaults to DEEPSEEK_BASE_URL or DeepSeek API.",
+        help="Override the selected provider's API base URL.",
     )
     parser.add_argument(
         "--thinking",
@@ -145,6 +158,7 @@ def _run_ask(args: argparse.Namespace) -> int:
     state = store.create(workspace.root)
     print(f"session: {state.session_id}", file=sys.stderr)
     loop, _ = _build_runtime(args, workspace, state.trace_path)
+    _sync_session_model(state, loop)
     runtime = AgentRuntime(loop, state, interactive_approvals=False)
     renderer = StreamRenderer(answer_prefix="", show_thinking=args.show_thinking)
     try:
@@ -178,8 +192,11 @@ def _run_resume(args: argparse.Namespace) -> int:
 
 
 def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) -> int:
+    _restore_session_model(args, state)
     workspace = Workspace(state.workspace)
     loop, registry = _build_runtime(args, workspace, state.trace_path)
+    _sync_session_model(state, loop)
+    _save_session_artifacts(store, state)
     runtime = AgentRuntime(loop, state, interactive_approvals=True)
     print(f"session: {state.session_id}")
 
@@ -199,6 +216,8 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                 snapshot = loop.inspect_context(state)
                 toolbar = format_context_status(
                     snapshot,
+                    provider_id=loop.model.profile.provider_id,
+                    model_id=loop.model.profile.model_id,
                     pending=state.pending_turn is not None,
                 )
                 try:
@@ -222,6 +241,8 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                     workspace = Workspace(state.workspace)
                     loop, registry = _build_runtime(args, workspace, state.trace_path)
                     runtime = AgentRuntime(loop, state, interactive_approvals=True)
+                    _sync_session_model(state, loop)
+                    _save_session_artifacts(store, state)
                     print(f"session: {state.session_id}")
                     continue
                 if user_input == "/sessions":
@@ -235,9 +256,51 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                     pending = state.pending_turn.turn_id if state.pending_turn else "none"
                     print(
                         f"session={state.session_id} workspace={state.workspace} "
+                        f"model={loop.model.profile.provider_id}/"
+                        f"{loop.model.profile.model_id} "
                         f"messages={len(state.messages)} summarized="
                         f"{state.summarized_message_count} pending={pending}"
                     )
+                    continue
+                if user_input == "/model":
+                    if state.pending_turn is not None:
+                        print("pending turn exists; use /retry or /abort before switching model")
+                        continue
+                    current_profile = loop.model.profile
+                    entries = model_catalog(current_profile.provider_id)
+                    if not entries:
+                        print(f"no selectable models for {current_profile.provider_id}")
+                        continue
+                    if not editor.supports_interactive_selection:
+                        _print_model_catalog(
+                            current_profile.provider_id,
+                            current_profile.model_id,
+                        )
+                        print("interactive model selection requires a TTY")
+                        continue
+                    requested_model = editor.select(
+                        "model> ",
+                        (
+                            SelectionOption(entry.model_id, entry.description)
+                            for entry in entries
+                        ),
+                        current_value=current_profile.model_id,
+                    )
+                    if requested_model is None:
+                        print("model selection cancelled")
+                        continue
+                    if requested_model == current_profile.model_id:
+                        print(
+                            f"already using {current_profile.provider_id}/"
+                            f"{current_profile.model_id}"
+                        )
+                        continue
+                    model = _build_model(args, model_id=requested_model)
+                    runtime.switch_model(model)
+                    args.model = model.profile.model_id
+                    _sync_session_model(state, loop)
+                    _save_session_artifacts(store, state)
+                    print(f"model: {model.profile.provider_id}/{model.profile.model_id}")
                     continue
                 if user_input == "/context":
                     snapshot = loop.inspect_context(state)
@@ -278,7 +341,9 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                     print("Commands")
                     for command in SLASH_COMMANDS:
                         print(f"  {command.name:<12}{command.description}")
-                    print("\nType / to open the menu; Tab accepts or runs a command.")
+                    print("\nType / to open the menu; use Up/Down and Enter to run.")
+                    print("Tab remains available for completion and quick execution.")
+                    print("/model uses Up/Down to choose, Enter to switch, and Esc to cancel.")
                     continue
                 if user_input.startswith("/"):
                     print(f"unknown command: {user_input}")
@@ -412,22 +477,52 @@ def _build_runtime(
     trace_path: str | Path,
 ) -> tuple[AgentLoop, ToolRegistry]:
     registry = build_tool_registry()
-    provider = DeepSeekProvider(
-        model=args.model,
-        base_url=args.base_url,
-        thinking=args.thinking,
-        context_window_tokens=args.context_window_tokens,
-        max_output_tokens=args.max_output_tokens,
-    )
+    model = _build_model(args)
     loop = AgentLoop(
         workspace=workspace,
-        provider=provider,
+        model=model,
         tools=registry,
         permissions=PermissionPolicy(),
         trace=TraceRecorder(trace_path),
         max_steps=args.max_steps,
     )
     return loop, registry
+
+
+def _build_model(
+    args: argparse.Namespace,
+    *,
+    model_id: str | None = None,
+) -> ModelInvoker:
+    adapter = create_provider_adapter(
+        ProviderConfig(
+            provider_id=args.provider,
+            model_id=model_id if model_id is not None else args.model,
+            base_url=args.base_url,
+            context_window_tokens=args.context_window_tokens,
+            max_output_tokens=args.max_output_tokens,
+            options={"thinking": args.thinking} if args.thinking is not None else {},
+        )
+    )
+    return ModelInvoker(adapter)
+
+
+def _restore_session_model(args: argparse.Namespace, state: SessionState) -> None:
+    if args.model is None and state.model_id and state.provider_id == args.provider:
+        args.model = state.model_id
+
+
+def _sync_session_model(state: SessionState, loop: AgentLoop) -> None:
+    state.provider_id = loop.model.profile.provider_id
+    state.model_id = loop.model.profile.model_id
+
+
+def _print_model_catalog(provider_id: str, current_model_id: str) -> None:
+    print(f"Current model: {provider_id}/{current_model_id}")
+    print("Available models")
+    for entry in model_catalog(provider_id):
+        marker = "*" if entry.model_id == current_model_id else " "
+        print(f"  {marker} {entry.model_id:<24}{entry.description}")
 
 
 def build_tool_registry() -> ToolRegistry:

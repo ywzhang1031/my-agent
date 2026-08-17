@@ -7,25 +7,41 @@ import tempfile
 import threading
 import time
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from prompt_toolkit.buffer import Buffer, CompletionState
-from prompt_toolkit.completion import CompleteEvent
+from prompt_toolkit.completion import CompleteEvent, Completion
 from prompt_toolkit.document import Document
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.output import DummyOutput
 
 from my_agent.agent_loop import AgentEvent, AgentLoop
-from my_agent.cli import build_parser, build_tool_registry
+from my_agent.cli import build_parser, build_tool_registry, main
 from my_agent.context import ContextManager, estimate_text_tokens
 from my_agent.control import ApprovalDecision, raise_if_cancelled
 from my_agent.messages import AssistantMessage, ToolCall, ToolResultMessage, UserMessage
+from my_agent.model_invoker import ModelInvoker, RetryPolicy, RetryScheduled
 from my_agent.permissions import PermissionPolicy
-from my_agent.provider import ProviderError, ProviderResponse, ScriptedProvider
-from my_agent.providers.deepseek import DeepSeekProvider
+from my_agent.provider import (
+    ModelCompleted,
+    ModelError,
+    ModelErrorKind,
+    ModelMetadata,
+    ModelProfile,
+    ModelRequest,
+    ModelResponse,
+    ModelUsage,
+    ProviderCapabilities,
+    ReasoningDelta,
+    ScriptedProviderAdapter,
+    StopReason,
+    TextDelta,
+)
+from my_agent.providers.deepseek import DeepSeekAdapter
+from my_agent.providers.factory import ProviderConfig, create_provider_adapter
 from my_agent.runtime import (
     AgentRuntime,
     InterruptTurn,
@@ -36,10 +52,13 @@ from my_agent.runtime import (
 from my_agent.session import PendingTurn, SessionStore
 from my_agent.terminal import (
     LineEditor,
+    SelectionCompleter,
+    SelectionOption,
     SlashCommand,
     SlashCommandCompleter,
     StreamRenderer,
     _completion_key_bindings,
+    _selection_key_bindings,
     format_context_status,
     render_context_usage,
 )
@@ -80,6 +99,35 @@ def _commit_workspace(root: Path) -> None:
         "commit",
         "-qm",
         "initial",
+    )
+
+
+def _model_response(
+    *,
+    content: str = "",
+    reasoning_content: str = "",
+    tool_calls: list[ToolCall] | tuple[ToolCall, ...] = (),
+    finish_reason: str = "stop",
+    usage: ModelUsage | None = None,
+) -> ModelResponse:
+    return ModelResponse.from_parts(
+        text=content,
+        reasoning=reasoning_content,
+        tool_calls=tool_calls,
+        stop_reason=StopReason(finish_reason),
+        usage=usage,
+        metadata=ModelMetadata(provider_id="scripted", model_id="scripted-model"),
+    )
+
+
+def _model(adapter, *, max_attempts: int = 1) -> ModelInvoker:
+    return ModelInvoker(
+        adapter,
+        RetryPolicy(
+            max_attempts=max_attempts,
+            initial_delay_seconds=0,
+            max_delay_seconds=0,
+        ),
     )
 
 
@@ -126,6 +174,8 @@ class MyAgentTests(unittest.TestCase):
             state.summarized_message_count = 1
             state.last_input_tokens = 123
             state.last_output_tokens = 45
+            state.provider_id = "deepseek"
+            state.model_id = "deepseek-v4-pro"
             state.messages.append(UserMessage(content="Retry this request"))
             state.pending_turn = PendingTurn(
                 turn_id=f"{state.session_id}:2",
@@ -146,6 +196,8 @@ class MyAgentTests(unittest.TestCase):
             self.assertEqual(loaded.summarized_message_count, 1)
             self.assertEqual(loaded.last_input_tokens, 123)
             self.assertEqual(loaded.last_output_tokens, 45)
+            self.assertEqual(loaded.provider_id, "deepseek")
+            self.assertEqual(loaded.model_id, "deepseek-v4-pro")
             self.assertEqual(loaded.pending_turn, state.pending_turn)
             self.assertTrue(loaded.metadata_path.exists())
             self.assertTrue(loaded.messages_path.exists())
@@ -157,18 +209,19 @@ class MyAgentTests(unittest.TestCase):
             workspace_path.mkdir()
             store = SessionStore(Path(tmpdir, "sessions"))
             state = store.create(workspace_path)
-            provider = ScriptedProvider(
+            provider = ScriptedProviderAdapter(
                 [
-                    ProviderResponse(
+                    _model_response(
                         content="First answer.",
                         reasoning_content="First reasoning.",
+                        usage=ModelUsage(input_tokens=10, output_tokens=2),
                     ),
-                    ProviderResponse(content="Second answer."),
+                    _model_response(content="Second answer."),
                 ]
             )
             loop = AgentLoop(
                 workspace=Workspace(workspace_path),
-                provider=provider,
+                model=_model(provider),
                 tools=ToolRegistry([ListFilesTool()]),
                 permissions=PermissionPolicy(),
                 trace=TraceRecorder(state.trace_path),
@@ -182,17 +235,23 @@ class MyAgentTests(unittest.TestCase):
             self.assertEqual(first.answer, "First answer.")
             self.assertEqual(first.stopped_by, "final_answer")
             self.assertEqual(second.answer, "Second answer.")
-            self.assertEqual(len(provider.requests[0]), 1)
-            self.assertEqual(len(provider.requests[1]), 3)
-            self.assertEqual(provider.requests[1][0], UserMessage(content="First question"))
+            self.assertEqual(len(provider.requests[0].messages), 1)
+            self.assertEqual(len(provider.requests[1].messages), 3)
             self.assertEqual(
-                provider.requests[1][1],
+                provider.requests[1].messages[0],
+                UserMessage(content="First question"),
+            )
+            self.assertEqual(
+                provider.requests[1].messages[1],
                 AssistantMessage(
                     content="First answer.",
                     reasoning_content="First reasoning.",
                 ),
             )
-            self.assertEqual(provider.requests[1][2], UserMessage(content="Second question"))
+            self.assertEqual(
+                provider.requests[1].messages[2],
+                UserMessage(content="Second question"),
+            )
             self.assertEqual(store.load(state.session_id).messages, state.messages)
 
             events = [
@@ -200,8 +259,11 @@ class MyAgentTests(unittest.TestCase):
                 for line in state.trace_path.read_text(encoding="utf-8").splitlines()
             ]
             turn_events = [event for event in events if event["event"] == "turn_started"]
+            model_events = [event for event in events if event["event"] == "model_response"]
             self.assertEqual(len(turn_events), 2)
             self.assertNotEqual(turn_events[0]["turn_id"], turn_events[1]["turn_id"])
+            self.assertEqual(model_events[0]["usage"]["input_tokens"], 10)
+            self.assertIsNone(model_events[1]["usage"])
 
     def test_agent_loop_retries_pending_turn_without_duplicating_user_message(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -209,23 +271,23 @@ class MyAgentTests(unittest.TestCase):
             workspace_path.mkdir()
             store = SessionStore(Path(tmpdir, "sessions"))
             state = store.create(workspace_path)
-            provider = ScriptedProvider(
+            provider = ScriptedProviderAdapter(
                 [
-                    ProviderError("temporary provider failure", retryable=True),
-                    ProviderResponse(content="Recovered answer."),
+                    ModelError("temporary provider failure", retryable=True),
+                    _model_response(content="Recovered answer."),
                 ]
             )
             events: list[AgentEvent] = []
             loop = AgentLoop(
                 workspace=Workspace(workspace_path),
-                provider=provider,
+                model=_model(provider),
                 tools=ToolRegistry([ListFilesTool()]),
                 permissions=PermissionPolicy(),
                 trace=TraceRecorder(state.trace_path),
                 max_steps=4,
             )
 
-            with self.assertRaisesRegex(ProviderError, "temporary provider failure"):
+            with self.assertRaisesRegex(ModelError, "temporary provider failure"):
                 loop.run_turn(state, "Inspect this repository.", event_handler=events.append)
 
             self.assertIsNotNone(state.pending_turn)
@@ -263,15 +325,58 @@ class MyAgentTests(unittest.TestCase):
             self.assertEqual(len(trajectory["turns"][0]["errors"]), 1)
             self.assertEqual(trajectory["metrics"]["turn_errors"], 1)
 
+    def test_agent_loop_records_harness_retry_without_creating_pending_error(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace_path = Path(tmpdir, "workspace")
+            workspace_path.mkdir()
+            state = SessionStore(Path(tmpdir, "sessions")).create(workspace_path)
+            provider = ScriptedProviderAdapter(
+                [
+                    ModelError(
+                        "server overloaded",
+                        kind=ModelErrorKind.SERVER,
+                        retryable=True,
+                        provider_id="scripted",
+                        model_id="scripted-model",
+                        status_code=503,
+                    ),
+                    _model_response(content="Recovered answer."),
+                ]
+            )
+            events: list[AgentEvent] = []
+            loop = AgentLoop(
+                workspace=Workspace(workspace_path),
+                model=_model(provider, max_attempts=2),
+                tools=ToolRegistry([]),
+                permissions=PermissionPolicy(),
+                trace=TraceRecorder(state.trace_path),
+                max_steps=2,
+            )
+
+            result = loop.run_turn(state, "Retry transient failures", events.append)
+            trace_events = read_jsonl_trace(state.trace_path)
+            retry = next(event for event in trace_events if event["event"] == "provider_retry")
+
+            self.assertEqual(result.answer, "Recovered answer.")
+            self.assertEqual(len(provider.requests), 2)
+            self.assertEqual(retry["kind"], "server")
+            self.assertEqual(retry["status_code"], 503)
+            self.assertEqual(retry["attempt"], 2)
+            request = next(event for event in trace_events if event["event"] == "model_request")
+            self.assertEqual(request["provider_id"], "scripted")
+            self.assertEqual(request["model_id"], "scripted-model")
+            self.assertNotIn("turn_error", [event["event"] for event in trace_events])
+            self.assertIn("provider_retry", [event.kind for event in events])
+
     def test_agent_loop_retry_after_tool_result_does_not_repeat_the_tool(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace_path = Path(tmpdir, "workspace")
             workspace_path.mkdir()
             (workspace_path / "app.py").write_text("value = 1\n", encoding="utf-8")
             state = SessionStore(Path(tmpdir, "sessions")).create(workspace_path)
-            provider = ScriptedProvider(
+            provider = ScriptedProviderAdapter(
                 [
-                    ProviderResponse(
+                    _model_response(
                         tool_calls=[
                             ToolCall(
                                 call_id="call_list",
@@ -281,20 +386,20 @@ class MyAgentTests(unittest.TestCase):
                         ],
                         finish_reason="tool_calls",
                     ),
-                    ProviderError("second model request failed", retryable=True),
-                    ProviderResponse(content="Found app.py."),
+                    ModelError("second model request failed", retryable=True),
+                    _model_response(content="Found app.py."),
                 ]
             )
             loop = AgentLoop(
                 workspace=Workspace(workspace_path),
-                provider=provider,
+                model=_model(provider),
                 tools=ToolRegistry([ListFilesTool()]),
                 permissions=PermissionPolicy(),
                 trace=TraceRecorder(state.trace_path),
                 max_steps=4,
             )
 
-            with self.assertRaisesRegex(ProviderError, "second model request failed"):
+            with self.assertRaisesRegex(ModelError, "second model request failed"):
                 loop.run_turn(state, "Inspect files")
 
             self.assertEqual(state.pending_turn.step, 2)
@@ -319,14 +424,14 @@ class MyAgentTests(unittest.TestCase):
             state = SessionStore(Path(tmpdir, "sessions")).create(workspace_path)
             loop = AgentLoop(
                 workspace=Workspace(workspace_path),
-                provider=ScriptedProvider([ProviderError("failed")]),
+                model=_model(ScriptedProviderAdapter([ModelError("failed")])),
                 tools=ToolRegistry([]),
                 permissions=PermissionPolicy(),
                 trace=TraceRecorder(state.trace_path),
                 max_steps=2,
             )
 
-            with self.assertRaises(ProviderError):
+            with self.assertRaises(ModelError):
                 loop.run_turn(state, "Failed request")
             pending = loop.abort_turn(state)
             trajectory = make_trajectory(read_jsonl_trace(state.trace_path), state.trace_path)
@@ -344,9 +449,9 @@ class MyAgentTests(unittest.TestCase):
             target = workspace_path / "app.py"
             target.write_text("value = 1\n", encoding="utf-8")
             state = SessionStore(Path(tmpdir, "sessions")).create(workspace_path)
-            provider = ScriptedProvider(
+            provider = ScriptedProviderAdapter(
                 [
-                    ProviderResponse(
+                    _model_response(
                         tool_calls=[
                             ToolCall(
                                 call_id="call_patch",
@@ -365,12 +470,12 @@ class MyAgentTests(unittest.TestCase):
                         ],
                         finish_reason="tool_calls",
                     ),
-                    ProviderResponse(content="Updated app.py."),
+                    _model_response(content="Updated app.py."),
                 ]
             )
             loop = AgentLoop(
                 workspace=Workspace(workspace_path),
-                provider=provider,
+                model=_model(provider),
                 tools=ToolRegistry([ApplyPatchTool()]),
                 permissions=PermissionPolicy(),
                 trace=TraceRecorder(state.trace_path),
@@ -429,9 +534,9 @@ class MyAgentTests(unittest.TestCase):
             target = workspace_path / "app.py"
             target.write_text("value = 1\n", encoding="utf-8")
             state = SessionStore(Path(tmpdir, "sessions")).create(workspace_path)
-            provider = ScriptedProvider(
+            provider = ScriptedProviderAdapter(
                 [
-                    ProviderResponse(
+                    _model_response(
                         tool_calls=[
                             ToolCall(
                                 call_id="call_patch_1",
@@ -450,7 +555,7 @@ class MyAgentTests(unittest.TestCase):
                         ],
                         finish_reason="tool_calls",
                     ),
-                    ProviderResponse(
+                    _model_response(
                         tool_calls=[
                             ToolCall(
                                 call_id="call_patch_2",
@@ -469,12 +574,12 @@ class MyAgentTests(unittest.TestCase):
                         ],
                         finish_reason="tool_calls",
                     ),
-                    ProviderResponse(content="Updated app.py twice."),
+                    _model_response(content="Updated app.py twice."),
                 ]
             )
             loop = AgentLoop(
                 workspace=Workspace(workspace_path),
-                provider=provider,
+                model=_model(provider),
                 tools=ToolRegistry([ApplyPatchTool()]),
                 permissions=PermissionPolicy(),
                 trace=TraceRecorder(state.trace_path),
@@ -517,9 +622,9 @@ class MyAgentTests(unittest.TestCase):
             first.write_text("value = 1\n", encoding="utf-8")
             second.write_text("value = 1\n", encoding="utf-8")
             state = SessionStore(Path(tmpdir, "sessions")).create(workspace_path)
-            provider = ScriptedProvider(
+            provider = ScriptedProviderAdapter(
                 [
-                    ProviderResponse(
+                    _model_response(
                         tool_calls=[
                             ToolCall(
                                 call_id="call_first",
@@ -552,12 +657,12 @@ class MyAgentTests(unittest.TestCase):
                         ],
                         finish_reason="tool_calls",
                     ),
-                    ProviderResponse(content="No files were changed."),
+                    _model_response(content="No files were changed."),
                 ]
             )
             loop = AgentLoop(
                 workspace=Workspace(workspace_path),
-                provider=provider,
+                model=_model(provider),
                 tools=ToolRegistry([ApplyPatchTool()]),
                 permissions=PermissionPolicy(),
                 trace=TraceRecorder(state.trace_path),
@@ -598,7 +703,10 @@ class MyAgentTests(unittest.TestCase):
             self.assertEqual(event.result.answer, "No files were changed.")
             self.assertEqual(len(provider.requests), 2)
             self.assertEqual(
-                sum(isinstance(message, ToolResultMessage) for message in provider.requests[1]),
+                sum(
+                    isinstance(message, ToolResultMessage)
+                    for message in provider.requests[1].messages
+                ),
                 2,
             )
 
@@ -609,9 +717,9 @@ class MyAgentTests(unittest.TestCase):
             target = workspace_path / "app.py"
             target.write_text("value = 1\n", encoding="utf-8")
             state = SessionStore(Path(tmpdir, "sessions")).create(workspace_path)
-            provider = ScriptedProvider(
+            provider = ScriptedProviderAdapter(
                 [
-                    ProviderResponse(
+                    _model_response(
                         tool_calls=[
                             ToolCall(
                                 call_id="call_denied",
@@ -630,12 +738,12 @@ class MyAgentTests(unittest.TestCase):
                         ],
                         finish_reason="tool_calls",
                     ),
-                    ProviderResponse(content="The change was denied."),
+                    _model_response(content="The change was denied."),
                 ]
             )
             loop = AgentLoop(
                 workspace=Workspace(workspace_path),
-                provider=provider,
+                model=_model(provider),
                 tools=ToolRegistry([ApplyPatchTool()]),
                 permissions=PermissionPolicy(),
                 trace=TraceRecorder(state.trace_path),
@@ -670,18 +778,20 @@ class MyAgentTests(unittest.TestCase):
             self.assertEqual(trajectory["metrics"]["approval_denials"], 1)
 
     def test_agent_runtime_interrupts_active_turn_and_keeps_it_retryable(self):
-        class BlockingProvider:
-            context_window_tokens = 10_000
-            max_output_tokens = 1_000
-
+        class BlockingAdapter:
             def __init__(self):
                 self.started = threading.Event()
+                self.profile = ModelProfile(
+                    provider_id="blocking",
+                    model_id="blocking-model",
+                    context_window_tokens=10_000,
+                    max_output_tokens=1_000,
+                    capabilities=ProviderCapabilities(),
+                )
 
-            def stream(
+            def stream_once(
                 self,
-                messages,
-                tools,
-                system_prompt,
+                request,
                 cancel_event=None,
             ):
                 self.started.set()
@@ -694,10 +804,10 @@ class MyAgentTests(unittest.TestCase):
             workspace_path = Path(tmpdir, "workspace")
             workspace_path.mkdir()
             state = SessionStore(Path(tmpdir, "sessions")).create(workspace_path)
-            provider = BlockingProvider()
+            provider = BlockingAdapter()
             loop = AgentLoop(
                 workspace=Workspace(workspace_path),
-                provider=provider,
+                model=_model(provider),
                 tools=ToolRegistry([]),
                 permissions=PermissionPolicy(),
                 trace=TraceRecorder(state.trace_path),
@@ -728,6 +838,46 @@ class MyAgentTests(unittest.TestCase):
             )
             self.assertEqual(trajectory["outcome"]["status"], "interrupted")
             self.assertEqual(trajectory["metrics"]["turn_interruptions"], 1)
+
+    def test_agent_runtime_switches_model_and_context_limits_while_idle(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace_path = Path(tmpdir, "workspace")
+            workspace_path.mkdir()
+            state = SessionStore(Path(tmpdir, "sessions")).create(workspace_path)
+            initial = ScriptedProviderAdapter(
+                [],
+                context_window_tokens=10_000,
+                max_output_tokens=1_000,
+            )
+            replacement = ScriptedProviderAdapter(
+                [],
+                context_window_tokens=20_000,
+                max_output_tokens=2_000,
+            )
+            loop = AgentLoop(
+                workspace=Workspace(workspace_path),
+                model=_model(initial),
+                tools=ToolRegistry([]),
+                permissions=PermissionPolicy(),
+                trace=TraceRecorder(state.trace_path),
+            )
+            runtime = AgentRuntime(loop, state, interactive_approvals=True)
+
+            runtime.switch_model(_model(replacement))
+            snapshot = loop.inspect_context(state)
+
+            self.assertIs(loop.model.adapter, replacement)
+            self.assertEqual(snapshot.context_window_tokens, 20_000)
+            self.assertEqual(snapshot.reserve_output_tokens, 2_000)
+
+            state.messages.append(UserMessage(content="pending"))
+            state.pending_turn = PendingTurn(
+                turn_id=f"{state.session_id}:1",
+                task="pending",
+                message_start=0,
+            )
+            with self.assertRaisesRegex(RuntimeError, "turn is pending"):
+                runtime.switch_model(_model(initial))
 
     def test_context_manager_compacts_old_turns_and_preserves_recent_messages(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -861,6 +1011,31 @@ class MyAgentTests(unittest.TestCase):
         self.assertEqual(prose_matches, [])
         self.assertEqual(exact_matches, [])
 
+    def test_selection_completer_puts_current_value_first(self):
+        completer = SelectionCompleter(
+            [
+                SelectionOption("deepseek-v4-flash", "DeepSeek V4 Flash"),
+                SelectionOption("deepseek-v4-pro", "DeepSeek V4 Pro"),
+            ],
+            current_value="deepseek-v4-pro",
+        )
+
+        completions = list(
+            completer.get_completions(
+                Document(),
+                CompleteEvent(completion_requested=True),
+            )
+        )
+
+        self.assertEqual(
+            [completion.text for completion in completions],
+            ["deepseek-v4-pro", "deepseek-v4-flash"],
+        )
+        self.assertEqual(
+            completions[0].display_meta_text,
+            "current | DeepSeek V4 Pro",
+        )
+
     def test_tab_accepts_completion_then_submits_complete_slash_command(self):
         bindings = _completion_key_bindings(
             [SlashCommand("/context", "Show context usage")]
@@ -900,6 +1075,56 @@ class MyAgentTests(unittest.TestCase):
         self.assertEqual(accepted, ["/context"])
         self.assertEqual(buffer.text, "")
 
+    def test_slash_menu_uses_arrows_and_enter_to_run_command(self):
+        commands = [
+            SlashCommand("/context", "Show context usage"),
+            SlashCommand("/model", "Choose the model"),
+        ]
+        bindings = _completion_key_bindings(commands)
+        up_handler = next(
+            binding.handler
+            for binding in bindings.bindings
+            if binding.keys == (Keys.Up,)
+        )
+        down_handler = next(
+            binding.handler
+            for binding in bindings.bindings
+            if binding.keys == (Keys.Down,)
+        )
+        enter_handler = next(
+            binding.handler
+            for binding in bindings.bindings
+            if binding.keys == (Keys.ControlM,)
+        )
+        accepted = []
+        buffer = Buffer(
+            document=Document(text="/", cursor_position=1),
+            accept_handler=lambda current: accepted.append(current.text),
+            multiline=False,
+        )
+        buffer.complete_state = CompletionState(
+            buffer.document,
+            list(
+                SlashCommandCompleter(commands).get_completions(
+                    buffer.document,
+                    CompleteEvent(completion_requested=True),
+                )
+            ),
+        )
+        event = SimpleNamespace(app=SimpleNamespace(current_buffer=buffer))
+
+        down_handler(event)
+        self.assertEqual(buffer.complete_state.current_completion.text, "/context")
+        down_handler(event)
+        self.assertEqual(buffer.complete_state.current_completion.text, "/model")
+        up_handler(event)
+        self.assertEqual(buffer.complete_state.current_completion.text, "/context")
+        down_handler(event)
+        enter_handler(event)
+
+        self.assertEqual(accepted, ["/model"])
+        self.assertEqual(buffer.text, "")
+
     def test_tab_does_not_submit_regular_text(self):
         bindings = _completion_key_bindings(
             [SlashCommand("/context", "Show context usage")]
@@ -921,6 +1146,53 @@ class MyAgentTests(unittest.TestCase):
 
         self.assertEqual(buffer.text, "inspect this repo")
         self.assertEqual(accepted, [])
+
+    def test_model_selector_uses_arrows_enter_and_escape(self):
+        bindings = _selection_key_bindings(
+            ["deepseek-v4-flash", "deepseek-v4-pro"]
+        )
+        down_handler = next(
+            binding.handler
+            for binding in bindings.bindings
+            if binding.keys == (Keys.Down,)
+        )
+        enter_handler = next(
+            binding.handler
+            for binding in bindings.bindings
+            if binding.keys == (Keys.ControlM,)
+        )
+        escape_handler = next(
+            binding.handler
+            for binding in bindings.bindings
+            if binding.keys == (Keys.Escape,)
+        )
+        buffer = Buffer(
+            document=Document(),
+            multiline=False,
+        )
+        buffer.complete_state = CompletionState(
+            buffer.document,
+            [
+                Completion("deepseek-v4-flash"),
+                Completion("deepseek-v4-pro"),
+            ],
+            complete_index=0,
+        )
+        app = SimpleNamespace(
+            current_buffer=buffer,
+            result="unset",
+        )
+        app.exit = lambda *, result=None: setattr(app, "result", result)
+        event = SimpleNamespace(app=app)
+
+        down_handler(event)
+        enter_handler(event)
+
+        self.assertEqual(app.result, "deepseek-v4-pro")
+
+        app.result = "unset"
+        escape_handler(event)
+        self.assertIsNone(app.result)
 
     def test_line_editor_passes_status_toolbar_and_secures_history(self):
         class FakePromptSession:
@@ -970,6 +1242,45 @@ class MyAgentTests(unittest.TestCase):
             self.assertIs(editor.session._output, output)
             self.assertTrue(editor.session.default_buffer.complete_while_typing())
 
+    def test_line_editor_opens_interactive_selection_menu(self):
+        class FakePromptSession:
+            def prompt(self, prompt, **kwargs):
+                return "input"
+
+        class FakeSelectionSession:
+            def __init__(self):
+                self.calls = []
+
+            def prompt(self, prompt, **kwargs):
+                self.calls.append((prompt, kwargs))
+                return "deepseek-v4-pro"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            selection_session = FakeSelectionSession()
+            editor = LineEditor(
+                history_path=Path(tmpdir, "history"),
+                commands=[SlashCommand("/model", "Choose the model")],
+                prompt_session=FakePromptSession(),
+                selection_session=selection_session,
+            )
+
+            selected = editor.select(
+                "model> ",
+                [
+                    SelectionOption("deepseek-v4-flash", "DeepSeek V4 Flash"),
+                    SelectionOption("deepseek-v4-pro", "DeepSeek V4 Pro"),
+                ],
+                current_value="deepseek-v4-flash",
+            )
+
+        self.assertEqual(selected, "deepseek-v4-pro")
+        self.assertEqual(selection_session.calls[0][0], "model> ")
+        self.assertIsInstance(
+            selection_session.calls[0][1]["completer"],
+            SelectionCompleter,
+        )
+        self.assertTrue(callable(selection_session.calls[0][1]["pre_run"]))
+
     def test_context_usage_panel_and_toolbar_show_real_breakdown(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace_path = Path(tmpdir, "workspace")
@@ -992,7 +1303,14 @@ class MyAgentTests(unittest.TestCase):
                 width=24,
                 color=False,
             )
-            toolbar = "".join(text for _, text in format_context_status(snapshot))
+            toolbar = "".join(
+                text
+                for _, text in format_context_status(
+                    snapshot,
+                    provider_id="deepseek",
+                    model_id="deepseek-v4-flash",
+                )
+            )
 
             self.assertIn("Context Usage", panel)
             self.assertIn("System prompt", panel)
@@ -1001,9 +1319,11 @@ class MyAgentTests(unittest.TestCase):
             self.assertIn("Conversation", panel)
             self.assertIn("Protocol overhead", panel)
             self.assertIn("Last provider input", panel)
+            self.assertIn("model deepseek/deepseek-v4-flash", toolbar)
             self.assertIn("context", toolbar)
             self.assertIn("/ commands", toolbar)
-            self.assertIn("Tab accept/run", toolbar)
+            self.assertIn("Up/Down select", toolbar)
+            self.assertIn("Enter run", toolbar)
 
     def test_chat_help_lists_itself(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1026,7 +1346,78 @@ class MyAgentTests(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("/help       Show slash commands", completed.stdout)
-        self.assertIn("Tab accepts or runs a command", completed.stdout)
+        self.assertIn("use Up/Down and Enter to run", completed.stdout)
+
+    def test_chat_switches_model_and_persists_it_in_session(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sessions_dir = Path(tmpdir, "sessions")
+            class FakeLineEditor:
+                supports_interactive_selection = True
+
+                def __init__(self):
+                    self.inputs = iter(["/model", "/summary", "/exit"])
+                    self.selections = []
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, traceback):
+                    return None
+
+                def read(self, prompt):
+                    return next(self.inputs)
+
+                def select(self, prompt, options, *, current_value=None):
+                    self.selections.append((prompt, tuple(options), current_value))
+                    return "deepseek-v4-pro"
+
+            editor = FakeLineEditor()
+            output = io.StringIO()
+            with patch("my_agent.cli.LineEditor", return_value=editor), redirect_stdout(output):
+                return_code = main(
+                    [
+                        "chat",
+                        "--workspace",
+                        tmpdir,
+                        "--sessions-dir",
+                        str(sessions_dir),
+                    ]
+                )
+
+            self.assertEqual(return_code, 0)
+            self.assertIn("model: deepseek/deepseek-v4-pro", output.getvalue())
+            self.assertIn("model=deepseek/deepseek-v4-pro", output.getvalue())
+            self.assertEqual(editor.selections[0][0], "model> ")
+            self.assertEqual(editor.selections[0][2], "deepseek-v4-flash")
+            self.assertEqual(
+                [option.value for option in editor.selections[0][1]],
+                ["deepseek-v4-flash", "deepseek-v4-pro"],
+            )
+            session_id = next(path.name for path in sessions_dir.iterdir() if path.is_dir())
+            state = SessionStore(sessions_dir).load(session_id)
+            self.assertEqual(state.provider_id, "deepseek")
+            self.assertEqual(state.model_id, "deepseek-v4-pro")
+
+            resumed = subprocess.run(
+                [
+                    sys.executable,
+                    "cli.py",
+                    "resume",
+                    session_id,
+                    "--workspace",
+                    tmpdir,
+                    "--sessions-dir",
+                    str(sessions_dir),
+                ],
+                input="/summary\n/exit\n",
+                text=True,
+                capture_output=True,
+                cwd=Path(__file__).resolve().parents[1],
+                check=False,
+            )
+
+            self.assertEqual(resumed.returncode, 0, resumed.stderr)
+            self.assertIn("model=deepseek/deepseek-v4-pro", resumed.stdout)
 
     def test_stream_renderer_displays_reasoning_content_and_tool_progress(self):
         output = io.StringIO()
@@ -1626,9 +2017,9 @@ class MyAgentTests(unittest.TestCase):
                     ExecCommandTool(),
                 ]
             )
-            provider = ScriptedProvider(
+            provider = ScriptedProviderAdapter(
                 [
-                    ProviderResponse(
+                    _model_response(
                         content="I should inspect the files.",
                         reasoning_content="Need list_files before answering.",
                         tool_calls=[
@@ -1640,13 +2031,13 @@ class MyAgentTests(unittest.TestCase):
                         ],
                         finish_reason="tool_calls",
                     ),
-                    ProviderResponse(content="Found app.py.", finish_reason="stop"),
+                    _model_response(content="Found app.py.", finish_reason="stop"),
                 ]
             )
 
             loop = AgentLoop(
                 workspace=Workspace(workspace_path),
-                provider=provider,
+                model=_model(provider),
                 tools=registry,
                 permissions=PermissionPolicy(),
                 trace=TraceRecorder(state.trace_path),
@@ -1655,13 +2046,13 @@ class MyAgentTests(unittest.TestCase):
             result = loop.run_turn(state, "Inspect this repository.")
 
             self.assertEqual(result.answer, "Found app.py.")
-            self.assertIsInstance(provider.requests[0][0], UserMessage)
-            self.assertIsInstance(provider.requests[1][1], AssistantMessage)
+            self.assertIsInstance(provider.requests[0].messages[0], UserMessage)
+            self.assertIsInstance(provider.requests[1].messages[1], AssistantMessage)
             self.assertEqual(
-                provider.requests[1][1].reasoning_content,
+                provider.requests[1].messages[1].reasoning_content,
                 "Need list_files before answering.",
             )
-            self.assertIsInstance(provider.requests[1][2], ToolResultMessage)
+            self.assertIsInstance(provider.requests[1].messages[2], ToolResultMessage)
             events = [
                 json.loads(line)
                 for line in state.trace_path.read_text(encoding="utf-8").splitlines()
@@ -1687,9 +2078,9 @@ class MyAgentTests(unittest.TestCase):
 -value = 1
 +value = 2
 *** End Patch"""
-            provider = ScriptedProvider(
+            provider = ScriptedProviderAdapter(
                 [
-                    ProviderResponse(
+                    _model_response(
                         tool_calls=[
                             ToolCall(
                                 call_id="call_patch",
@@ -1699,12 +2090,12 @@ class MyAgentTests(unittest.TestCase):
                         ],
                         finish_reason="tool_calls",
                     ),
-                    ProviderResponse(content="Updated app.py.", finish_reason="stop"),
+                    _model_response(content="Updated app.py.", finish_reason="stop"),
                 ]
             )
             loop = AgentLoop(
                 workspace=Workspace(workspace_path),
-                provider=provider,
+                model=_model(provider),
                 tools=ToolRegistry([ApplyPatchTool()]),
                 permissions=PermissionPolicy(),
                 trace=TraceRecorder(state.trace_path),
@@ -1738,9 +2129,9 @@ class MyAgentTests(unittest.TestCase):
             store = SessionStore(Path(tmpdir, "sessions"))
             state = store.create(workspace_path)
             argv = ["python3", "-m", "unittest", "discover", "-s", "."]
-            provider = ScriptedProvider(
+            provider = ScriptedProviderAdapter(
                 [
-                    ProviderResponse(
+                    _model_response(
                         tool_calls=[
                             ToolCall(
                                 call_id="call_exec",
@@ -1750,12 +2141,12 @@ class MyAgentTests(unittest.TestCase):
                         ],
                         finish_reason="tool_calls",
                     ),
-                    ProviderResponse(content="Validation passed.", finish_reason="stop"),
+                    _model_response(content="Validation passed.", finish_reason="stop"),
                 ]
             )
             loop = AgentLoop(
                 workspace=Workspace(workspace_path),
-                provider=provider,
+                model=_model(provider),
                 tools=ToolRegistry([ExecCommandTool()]),
                 permissions=PermissionPolicy(),
                 trace=TraceRecorder(state.trace_path),
@@ -1780,7 +2171,7 @@ class MyAgentTests(unittest.TestCase):
             self.assertEqual(observation["output"]["metadata"]["cwd"], ".")
 
     def test_deepseek_provider_translates_canonical_messages_and_tools(self):
-        provider = DeepSeekProvider(
+        provider = DeepSeekAdapter(
             api_key="test-key",
             model="deepseek-v4-flash",
             max_output_tokens=16000,
@@ -1805,7 +2196,13 @@ class MyAgentTests(unittest.TestCase):
             ),
         ]
 
-        payload = provider.build_payload(messages, [tool_schema], "system prompt")
+        payload = provider.build_payload(
+            ModelRequest(
+                messages=tuple(messages),
+                tools=(tool_schema,),
+                system_prompt="system prompt",
+            )
+        )
 
         self.assertEqual(payload["model"], "deepseek-v4-flash")
         self.assertEqual(payload["thinking"], {"type": "enabled"})
@@ -1822,7 +2219,7 @@ class MyAgentTests(unittest.TestCase):
         self.assertEqual(payload["tools"][0]["function"]["name"], "list_files")
 
     def test_deepseek_provider_streams_and_assembles_reasoning_and_tool_calls(self):
-        provider = DeepSeekProvider(api_key="test-key", model="deepseek-v4-flash")
+        provider = DeepSeekAdapter(api_key="test-key", model="deepseek-v4-flash")
         chunks = [
             {
                 "choices": [
@@ -1886,48 +2283,61 @@ class MyAgentTests(unittest.TestCase):
         ]
 
         with patch.object(provider, "_stream_once", return_value=iter(chunks)):
-            events = list(provider.stream([UserMessage(content="Inspect files")], [], "prompt"))
+            events = list(
+                provider.stream_once(
+                    ModelRequest(
+                        messages=(UserMessage(content="Inspect files"),),
+                        tools=(),
+                        system_prompt="prompt",
+                    )
+                )
+            )
 
+        self.assertIsInstance(events[-1], ModelCompleted)
         response = events[-1].response
-        self.assertIsNotNone(response)
         self.assertEqual(
-            [event.text for event in events if event.kind == "reasoning_delta"],
+            [event.text for event in events if isinstance(event, ReasoningDelta)],
             ["I need to inspect ", "files first."],
         )
         self.assertEqual(
-            [event.text for event in events if event.kind == "content_delta"],
+            [event.text for event in events if isinstance(event, TextDelta)],
             ["I will inspect the repository."],
         )
-        self.assertEqual(response.reasoning_content, "I need to inspect files first.")
-        self.assertEqual(response.content, "I will inspect the repository.")
+        self.assertEqual(response.reasoning, "I need to inspect files first.")
+        self.assertEqual(response.text, "I will inspect the repository.")
         self.assertEqual(response.tool_calls[0].call_id, "call_1")
         self.assertEqual(response.tool_calls[0].name, "list_files")
         self.assertEqual(response.tool_calls[0].arguments, {"path": "."})
         self.assertEqual(response.usage.input_tokens, 10)
+        self.assertEqual(response.metadata.provider_id, "deepseek")
 
         messages = [
             UserMessage(content="Inspect files"),
             AssistantMessage(
-                content=response.content,
-                reasoning_content=response.reasoning_content,
+                content=response.text,
+                reasoning_content=response.reasoning,
                 tool_calls=response.tool_calls,
             ),
         ]
 
-        payload = provider.build_payload(messages, [], "system prompt")
+        payload = provider.build_payload(
+            ModelRequest(
+                messages=tuple(messages),
+                tools=(),
+                system_prompt="system prompt",
+            )
+        )
 
-        self.assertEqual(response.reasoning_content, "I need to inspect files first.")
+        self.assertEqual(response.reasoning, "I need to inspect files first.")
         self.assertEqual(
             payload["messages"][2]["reasoning_content"],
             "I need to inspect files first.",
         )
 
-    def test_deepseek_provider_retries_transient_error_before_first_delta(self):
-        provider = DeepSeekProvider(
+    def test_model_invoker_retries_transient_error_before_first_delta(self):
+        provider = DeepSeekAdapter(
             api_key="test-key",
             model="deepseek-v4-flash",
-            max_retries=1,
-            retry_base_seconds=0,
         )
         attempts = 0
 
@@ -1935,7 +2345,7 @@ class MyAgentTests(unittest.TestCase):
             nonlocal attempts
             attempts += 1
             if attempts == 1:
-                raise ProviderError("server overloaded", retryable=True, status_code=503)
+                raise ModelError("server overloaded", retryable=True, status_code=503)
             return iter(
                 [
                     {
@@ -1951,18 +2361,23 @@ class MyAgentTests(unittest.TestCase):
             )
 
         with patch.object(provider, "_stream_once", new=fake_stream_once):
-            events = list(provider.stream([UserMessage(content="Hello")], [], "prompt"))
+            events = list(
+                _model(provider, max_attempts=2).stream(
+                    ModelRequest(
+                        messages=(UserMessage(content="Hello"),),
+                        tools=(),
+                        system_prompt="prompt",
+                    )
+                )
+            )
 
         self.assertEqual(attempts, 2)
-        self.assertEqual([event.kind for event in events].count("retry"), 1)
-        self.assertEqual(events[-1].response.content, "Recovered.")
+        self.assertEqual(sum(isinstance(event, RetryScheduled) for event in events), 1)
+        self.assertIsInstance(events[-1], ModelCompleted)
+        self.assertEqual(events[-1].response.text, "Recovered.")
 
-    def test_deepseek_provider_does_not_auto_retry_after_visible_delta(self):
-        provider = DeepSeekProvider(
-            api_key="test-key",
-            max_retries=2,
-            retry_base_seconds=0,
-        )
+    def test_model_invoker_does_not_retry_after_visible_delta(self):
+        provider = DeepSeekAdapter(api_key="test-key")
         attempts = 0
 
         def interrupted_stream(_payload, _cancel_event):
@@ -1975,18 +2390,103 @@ class MyAgentTests(unittest.TestCase):
                         {"finish_reason": None, "delta": {"content": "partial"}}
                     ]
                 }
-                raise ProviderError("stream disconnected", retryable=True)
+                raise ModelError("stream disconnected", retryable=True)
 
             return chunks()
 
         events = []
         with patch.object(provider, "_stream_once", new=interrupted_stream):
-            with self.assertRaisesRegex(ProviderError, "stream disconnected"):
-                for event in provider.stream([UserMessage(content="Hello")], [], "prompt"):
+            with self.assertRaisesRegex(ModelError, "stream disconnected"):
+                for event in _model(provider, max_attempts=3).stream(
+                    ModelRequest(
+                        messages=(UserMessage(content="Hello"),),
+                        tools=(),
+                        system_prompt="prompt",
+                    )
+                ):
                     events.append(event)
 
         self.assertEqual(attempts, 1)
-        self.assertEqual([event.kind for event in events], ["content_delta"])
+        self.assertEqual(len(events), 1)
+        self.assertIsInstance(events[0], TextDelta)
+
+    def test_model_invoker_requires_one_terminal_completed_event(self):
+        class IncompleteAdapter:
+            profile = ModelProfile(
+                provider_id="incomplete",
+                model_id="incomplete-model",
+                context_window_tokens=10_000,
+                max_output_tokens=1_000,
+            )
+
+            def stream_once(self, _request, _cancel_event=None):
+                return iter(())
+
+        with self.assertRaises(ModelError) as raised:
+            list(
+                _model(IncompleteAdapter()).stream(
+                    ModelRequest(
+                        messages=(UserMessage(content="Hello"),),
+                        tools=(),
+                    )
+                )
+            )
+
+        self.assertEqual(raised.exception.kind, ModelErrorKind.PROTOCOL)
+        self.assertTrue(raised.exception.retryable)
+
+    def test_deepseek_adapter_rejects_invalid_tool_arguments(self):
+        provider = DeepSeekAdapter(api_key="test-key")
+        chunks = [
+            {
+                "choices": [
+                    {
+                        "finish_reason": "tool_calls",
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "function": {
+                                        "name": "list_files",
+                                        "arguments": "{bad json",
+                                    },
+                                }
+                            ]
+                        },
+                    }
+                ]
+            }
+        ]
+
+        with patch.object(provider, "_stream_once", return_value=iter(chunks)):
+            with self.assertRaises(ModelError) as raised:
+                list(
+                    provider.stream_once(
+                        ModelRequest(
+                            messages=(UserMessage(content="Inspect files"),),
+                            tools=(),
+                        )
+                    )
+                )
+
+        self.assertEqual(raised.exception.kind, ModelErrorKind.PROTOCOL)
+        self.assertFalse(raised.exception.retryable)
+
+    def test_provider_factory_returns_selected_adapter_and_rejects_unknown_provider(self):
+        adapter = create_provider_adapter(
+            ProviderConfig(
+                provider_id="deepseek",
+                model_id="deepseek-v4-flash",
+                options={"thinking": "enabled"},
+            )
+        )
+
+        self.assertIsInstance(adapter, DeepSeekAdapter)
+        self.assertEqual(adapter.profile.provider_id, "deepseek")
+        self.assertEqual(adapter.profile.model_id, "deepseek-v4-flash")
+        with self.assertRaisesRegex(ValueError, "unsupported provider"):
+            create_provider_adapter(ProviderConfig(provider_id="unknown"))
 
     def test_deepseek_sse_parser_ignores_keepalive_and_requires_done(self):
         class FakeResponse:
@@ -2007,7 +2507,7 @@ class MyAgentTests(unittest.TestCase):
                     ]
                 )
 
-        provider = DeepSeekProvider(api_key="test-key")
+        provider = DeepSeekAdapter(api_key="test-key")
         with patch("urllib.request.urlopen", return_value=FakeResponse()):
             chunks = list(provider._stream_once({"stream": True}, None))
 

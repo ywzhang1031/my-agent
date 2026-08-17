@@ -33,6 +33,8 @@ class SessionState:
     summarized_message_count: int = 0
     last_input_tokens: int = 0
     last_output_tokens: int = 0
+    provider_id: str | None = None
+    model_id: str | None = None
     pending_turn: PendingTurn | None = None
 
     @property
@@ -129,6 +131,8 @@ class SessionStore:
             summarized_message_count=int(metadata.get("summarized_message_count", 0)),
             last_input_tokens=int(metadata.get("last_input_tokens", 0)),
             last_output_tokens=int(metadata.get("last_output_tokens", 0)),
+            provider_id=metadata.get("provider_id"),
+            model_id=metadata.get("model_id"),
             pending_turn=_pending_turn_from_dict(metadata.get("pending_turn")),
         )
 
@@ -145,6 +149,8 @@ class SessionStore:
             "summarized_message_count": state.summarized_message_count,
             "last_input_tokens": state.last_input_tokens,
             "last_output_tokens": state.last_output_tokens,
+            "provider_id": state.provider_id,
+            "model_id": state.model_id,
             "pending_turn": _pending_turn_to_dict(state.pending_turn),
         }
         state.metadata_path.write_text(

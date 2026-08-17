@@ -15,8 +15,17 @@ from .control import (
     raise_if_cancelled,
 )
 from .messages import AssistantMessage, Message, ToolCall, ToolResultMessage, UserMessage
+from .model_invoker import ModelInvoker, RetryScheduled
 from .permissions import PermissionPolicy
-from .provider import Provider, ProviderError, ProviderResponse
+from .provider import (
+    ModelCompleted,
+    ModelError,
+    ModelRequest,
+    ModelResponse,
+    ReasoningDelta,
+    StopReason,
+    TextDelta,
+)
 from .session import PendingTurn, SessionState
 from .tools import ToolContext, ToolRegistry, ToolResult
 from .trace import TraceRecorder
@@ -57,7 +66,7 @@ class AgentLoop:
     def __init__(
         self,
         workspace: Workspace,
-        provider: Provider,
+        model: ModelInvoker,
         tools: ToolRegistry,
         permissions: PermissionPolicy,
         trace: TraceRecorder,
@@ -66,15 +75,15 @@ class AgentLoop:
         context_manager: ContextManager | None = None,
     ) -> None:
         self.workspace = workspace
-        self.provider = provider
+        self.model = model
         self.tools = tools
         self.permissions = permissions
         self.trace = trace
         self.max_steps = max_steps
         self.instructions = instructions
         self.context_manager = context_manager or ContextManager(
-            context_window_tokens=provider.context_window_tokens,
-            reserve_output_tokens=provider.max_output_tokens,
+            context_window_tokens=model.profile.context_window_tokens,
+            reserve_output_tokens=model.profile.max_output_tokens,
         )
 
     def run_turn(
@@ -154,6 +163,17 @@ class AgentLoop:
             system_prompt=self.instructions,
         )
 
+    def switch_model(self, model: ModelInvoker) -> None:
+        current = self.context_manager
+        self.model = model
+        self.context_manager = ContextManager(
+            context_window_tokens=model.profile.context_window_tokens,
+            reserve_output_tokens=model.profile.max_output_tokens,
+            compact_threshold=current.compact_threshold,
+            compact_target=current.compact_target,
+            summary_tokens=current.summary_tokens,
+        )
+
     def abort_turn(self, state: SessionState) -> PendingTurn:
         pending = state.abandon_pending_turn()
         self.trace.write(
@@ -212,6 +232,8 @@ class AgentLoop:
                     {
                         **event_context,
                         "step": step,
+                        "provider_id": self.model.profile.provider_id,
+                        "model_id": self.model.profile.model_id,
                         "messages": len(snapshot.messages),
                         "tools": self.tools.names(),
                         "context": snapshot.to_dict(),
@@ -249,35 +271,55 @@ class AgentLoop:
                     step,
                     event_context,
                     str(exc),
-                    retryable=isinstance(exc, ProviderError) and exc.retryable,
+                    retryable=isinstance(exc, ModelError) and exc.retryable,
                     event_handler=event_handler,
                 )
                 raise
 
             if reply.usage is not None:
-                state.last_input_tokens = reply.usage.input_tokens
-                state.last_output_tokens = reply.usage.output_tokens
+                if reply.usage.input_tokens is not None:
+                    state.last_input_tokens = reply.usage.input_tokens
+                if reply.usage.output_tokens is not None:
+                    state.last_output_tokens = reply.usage.output_tokens
+            response_usage = (
+                {
+                    "input_tokens": reply.usage.input_tokens,
+                    "output_tokens": reply.usage.output_tokens,
+                    "total_tokens": reply.usage.total_tokens,
+                    "reasoning_tokens": reply.usage.reasoning_tokens,
+                    "cache_read_tokens": reply.usage.cache_read_tokens,
+                    "cache_write_tokens": reply.usage.cache_write_tokens,
+                }
+                if reply.usage is not None
+                else None
+            )
+            response_metadata = {
+                "provider_id": reply.metadata.provider_id,
+                "model_id": reply.metadata.model_id,
+                "response_model_id": reply.metadata.response_model_id,
+                "response_id": reply.metadata.response_id,
+                "request_id": reply.metadata.request_id,
+                "native": reply.metadata.native,
+            }
             self.trace.write(
                 "model_response",
                 {
                     **event_context,
                     "step": step,
-                    "content": reply.content,
+                    "content": reply.text,
                     "tool_calls": [call.to_dict() for call in reply.tool_calls],
-                    "finish_reason": reply.finish_reason,
-                    "usage": {
-                        "input_tokens": state.last_input_tokens,
-                        "output_tokens": state.last_output_tokens,
-                    },
+                    "finish_reason": reply.stop_reason.value,
+                    "usage": response_usage,
+                    "metadata": response_metadata,
                 },
             )
 
             if not reply.tool_calls:
-                answer = reply.content.strip() or "(model returned no final content)"
+                answer = reply.text.strip() or "(model returned no final content)"
                 messages.append(
                     AssistantMessage(
                         content=answer,
-                        reasoning_content=reply.reasoning_content,
+                        reasoning_content=reply.reasoning,
                     )
                 )
                 self.trace.write(
@@ -286,7 +328,7 @@ class AgentLoop:
                         **event_context,
                         "step": step,
                         "answer": answer,
-                        "finish_reason": reply.finish_reason,
+                        "finish_reason": reply.stop_reason.value,
                     },
                 )
                 state.pending_turn = None
@@ -296,15 +338,15 @@ class AgentLoop:
                     steps=step,
                     stopped_by=(
                         "model_length"
-                        if reply.finish_reason == "length"
+                        if reply.stop_reason is StopReason.LENGTH
                         else "final_answer"
                     ),
                 )
 
             messages.append(
                 AssistantMessage(
-                    content=reply.content,
-                    reasoning_content=reply.reasoning_content,
+                    content=reply.text,
+                    reasoning_content=reply.reasoning,
                     tool_calls=reply.tool_calls,
                 )
             )
@@ -547,35 +589,55 @@ class AgentLoop:
         event_context: dict[str, str],
         event_handler: EventHandler | None,
         cancel_event: threading.Event | None,
-    ) -> ProviderResponse:
+    ) -> ModelResponse:
         raise_if_cancelled(cancel_event)
         self._emit(event_handler, AgentEvent(kind="model_started", data={"step": step}))
-        response: ProviderResponse | None = None
-        for event in self.provider.stream(
-            messages=snapshot.messages,
-            tools=self.tools.specs(),
+        response: ModelResponse | None = None
+        request = ModelRequest(
+            messages=tuple(snapshot.messages),
+            tools=tuple(self.tools.specs()),
             system_prompt=snapshot.system_prompt,
-            cancel_event=cancel_event,
-        ):
+        )
+        for event in self.model.stream(request, cancel_event=cancel_event):
             raise_if_cancelled(cancel_event)
-            if event.kind in {"content_delta", "reasoning_delta"}:
+            if isinstance(event, TextDelta):
                 self._emit(
                     event_handler,
-                    AgentEvent(kind=event.kind, text=event.text, data={"step": step}),
+                    AgentEvent(kind="content_delta", text=event.text, data={"step": step}),
                 )
-            elif event.kind == "retry":
+            elif isinstance(event, ReasoningDelta):
+                self._emit(
+                    event_handler,
+                    AgentEvent(kind="reasoning_delta", text=event.text, data={"step": step}),
+                )
+            elif isinstance(event, RetryScheduled):
+                retry_data = {
+                    "attempt": event.next_attempt,
+                    "failed_attempt": event.failed_attempt,
+                    "delay_seconds": event.delay_seconds,
+                    **event.error.to_dict(),
+                }
                 self.trace.write(
                     "provider_retry",
-                    {**event_context, "step": step, "error": event.text, **event.data},
+                    {
+                        **event_context,
+                        "step": step,
+                        "error": str(event.error),
+                        **retry_data,
+                    },
                 )
                 self._emit(
                     event_handler,
-                    AgentEvent(kind="provider_retry", text=event.text, data=event.data),
+                    AgentEvent(
+                        kind="provider_retry",
+                        text=str(event.error),
+                        data=retry_data,
+                    ),
                 )
-            elif event.kind == "completed":
+            elif isinstance(event, ModelCompleted):
                 response = event.response
         if response is None:
-            raise ProviderError("provider stream completed without a response", retryable=True)
+            raise ModelError("model invocation completed without a response", retryable=True)
         return response
 
     def _record_turn_interrupted(

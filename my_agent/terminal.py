@@ -8,8 +8,10 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, TextIO
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.application.current import get_app
 from prompt_toolkit.completion import CompleteEvent, Completer, Completion
 from prompt_toolkit.document import Document
+from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import AnyFormattedText
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
@@ -28,6 +30,12 @@ class SlashCommand:
     description: str
 
 
+@dataclass(frozen=True)
+class SelectionOption:
+    value: str
+    description: str
+
+
 class SlashCommandCompleter(Completer):
     def __init__(self, commands: Iterable[SlashCommand]) -> None:
         self.commands = tuple(commands)
@@ -38,7 +46,9 @@ class SlashCommandCompleter(Completer):
         complete_event: CompleteEvent,
     ) -> Iterable[Completion]:
         prefix = document.text_before_cursor
-        if not prefix.startswith("/") or any(character.isspace() for character in prefix):
+        if not prefix.startswith("/"):
+            return
+        if " " in prefix:
             return
         lowered = prefix.lower()
         for command in self.commands:
@@ -52,10 +62,42 @@ class SlashCommandCompleter(Completer):
                 )
 
 
+class SelectionCompleter(Completer):
+    def __init__(
+        self,
+        options: Iterable[SelectionOption],
+        *,
+        current_value: str | None = None,
+    ) -> None:
+        option_list = tuple(options)
+        self.options = tuple(
+            sorted(option_list, key=lambda option: option.value != current_value)
+        )
+        self.current_value = current_value
+
+    def get_completions(
+        self,
+        document: Document,
+        complete_event: CompleteEvent,
+    ) -> Iterable[Completion]:
+        prefix = document.text_before_cursor.lower()
+        for option in self.options:
+            if prefix and not option.value.lower().startswith(prefix):
+                continue
+            marker = "current | " if option.value == self.current_value else ""
+            yield Completion(
+                option.value,
+                start_position=-len(prefix),
+                display=option.value,
+                display_meta=marker + option.description,
+            )
+
+
 TERMINAL_STYLE = Style.from_dict(
     {
         "bottom-toolbar": "bg:#262626 #bcbcbc",
         "bottom-toolbar.label": "bg:#262626 #87afff bold",
+        "bottom-toolbar.model": "bg:#262626 #afff87 bold",
         "bottom-toolbar.pending": "bg:#262626 #ffaf5f bold",
         "bottom-toolbar.hint": "bg:#262626 #8a8a8a",
         "completion-menu.completion": "bg:#303030 #eeeeee",
@@ -74,10 +116,15 @@ class LineEditor:
         commands: Iterable[SlashCommand],
         status_provider: Callable[[], AnyFormattedText] | None = None,
         prompt_session: Any | None = None,
+        selection_session: Any | None = None,
     ) -> None:
         command_list = tuple(commands)
         self.history_path = Path(history_path)
         self.status_provider = status_provider
+        self.selection_session = selection_session
+        self.supports_interactive_selection = selection_session is not None or (
+            sys.stdin.isatty() and sys.stdout.isatty()
+        )
         self.history_path.parent.mkdir(parents=True, exist_ok=True)
         self.history_path.touch(mode=0o600, exist_ok=True)
         self._secure_history()
@@ -112,6 +159,38 @@ class LineEditor:
         finally:
             self._secure_history()
 
+    def select(
+        self,
+        prompt: str,
+        options: Iterable[SelectionOption],
+        *,
+        current_value: str | None = None,
+    ) -> str | None:
+        option_list = tuple(options)
+        if not option_list or not self.supports_interactive_selection:
+            return None
+        session = self.selection_session or PromptSession(output=_interactive_output())
+        try:
+            return session.prompt(
+                prompt,
+                completer=SelectionCompleter(
+                    option_list,
+                    current_value=current_value,
+                ),
+                complete_while_typing=True,
+                complete_style=CompleteStyle.COLUMN,
+                reserve_space_for_menu=max(4, len(option_list) + 1),
+                key_bindings=_selection_key_bindings(
+                    option.value for option in option_list
+                ),
+                style=TERMINAL_STYLE,
+                pre_run=lambda: get_app().current_buffer.start_completion(
+                    select_first=True
+                ),
+            )
+        except (EOFError, KeyboardInterrupt):
+            return None
+
     def close(self) -> None:
         self._secure_history()
 
@@ -127,23 +206,39 @@ class LineEditor:
 def format_context_status(
     snapshot: ContextSnapshot,
     *,
+    provider_id: str | None = None,
+    model_id: str | None = None,
     pending: bool = False,
 ) -> list[tuple[str, str]]:
     percent = _format_percent(snapshot.estimated_tokens, snapshot.context_window_tokens)
-    fragments = [
-        ("class:bottom-toolbar", " "),
+    fragments: list[tuple[str, str]] = [("class:bottom-toolbar", " ")]
+    if model_id:
+        model_label = f"{provider_id}/{model_id}" if provider_id else model_id
+        fragments.extend(
+            [
+                ("class:bottom-toolbar.label", "model "),
+                ("class:bottom-toolbar.model", model_label),
+                ("class:bottom-toolbar.hint", "  |  "),
+            ]
+        )
+    fragments.extend(
+        [
         ("class:bottom-toolbar.label", "context "),
         (
             "class:bottom-toolbar",
             f"{percent}  ~{_format_tokens(snapshot.estimated_tokens)}/"
             f"{_format_tokens(snapshot.context_window_tokens)}",
         ),
-    ]
+        ]
+    )
     if pending:
         fragments.append(("class:bottom-toolbar.pending", "  pending turn"))
     fragments.extend(
         [
-            ("class:bottom-toolbar.hint", "  |  / commands  |  Tab accept/run "),
+            (
+                "class:bottom-toolbar.hint",
+                "  |  / commands  |  Up/Down select  |  Enter run ",
+            ),
         ]
     )
     return fragments
@@ -287,6 +382,43 @@ def _completion_key_bindings(commands: Iterable[SlashCommand]) -> KeyBindings:
     bindings = KeyBindings()
     command_names = {command.name for command in commands}
 
+    def slash_menu_active() -> bool:
+        buffer = get_app().current_buffer
+        state = buffer.complete_state
+        return bool(
+            buffer.document.text_before_cursor.startswith("/")
+            and state
+            and state.completions
+        )
+
+    slash_menu = Condition(slash_menu_active)
+
+    @bindings.add("up", filter=slash_menu)
+    def select_previous_command(event: Any) -> None:
+        buffer = event.app.current_buffer
+        state = buffer.complete_state
+        if state.current_completion is None:
+            buffer.go_to_completion(len(state.completions) - 1)
+        else:
+            buffer.complete_previous()
+
+    @bindings.add("down", filter=slash_menu)
+    def select_next_command(event: Any) -> None:
+        buffer = event.app.current_buffer
+        state = buffer.complete_state
+        if state.current_completion is None:
+            buffer.go_to_completion(0)
+        else:
+            buffer.complete_next()
+
+    @bindings.add("enter", filter=slash_menu)
+    def run_selected_command(event: Any) -> None:
+        buffer = event.app.current_buffer
+        state = buffer.complete_state
+        completion = state.current_completion or state.completions[0]
+        buffer.apply_completion(completion)
+        buffer.validate_and_handle()
+
     @bindings.add("tab")
     def accept_completion_or_command(event: Any) -> None:
         buffer = event.app.current_buffer
@@ -312,6 +444,49 @@ def _completion_key_bindings(commands: Iterable[SlashCommand]) -> KeyBindings:
             buffer.complete_previous()
         else:
             buffer.start_completion(select_first=True)
+
+    return bindings
+
+
+def _selection_key_bindings(values: Iterable[str]) -> KeyBindings:
+    bindings = KeyBindings()
+    allowed_values = set(values)
+
+    @bindings.add("up")
+    def select_previous(event: Any) -> None:
+        buffer = event.app.current_buffer
+        if buffer.complete_state:
+            buffer.complete_previous()
+        else:
+            buffer.start_completion(select_first=True)
+
+    @bindings.add("down")
+    def select_next(event: Any) -> None:
+        buffer = event.app.current_buffer
+        if buffer.complete_state:
+            buffer.complete_next()
+        else:
+            buffer.start_completion(select_first=True)
+
+    @bindings.add("enter")
+    def confirm_selection(event: Any) -> None:
+        buffer = event.app.current_buffer
+        completion_state = buffer.complete_state
+        if completion_state and completion_state.completions:
+            completion = (
+                completion_state.current_completion
+                or completion_state.completions[0]
+            )
+            event.app.exit(result=completion.text)
+            return
+        if buffer.text in allowed_values:
+            event.app.exit(result=buffer.text)
+            return
+        buffer.start_completion(select_first=True)
+
+    @bindings.add("escape")
+    def cancel_selection(event: Any) -> None:
+        event.app.exit(result=None)
 
     return bindings
 

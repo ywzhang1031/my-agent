@@ -185,6 +185,47 @@ CLI 与 agent loop 之间从同步函数调用升级为双向 runtime protocol�
 - `chat/resume` 使用交互审批；非交互 `ask` 保持自动批准静态 policy 已允许的操作，避免脚本
   因等待 stdin 卡住。该模式适用于受信任调用，不是 unattended sandbox。
 
+## Milestone 13: Provider Protocol and Harness-side Invocation
+
+早期 `Provider` 接口能运行 DeepSeek，但把厂商协议、字符串 stream event 和 retry policy 放在
+同一个类中。这个里程碑直接替换旧接口，不保留兼容别名。
+
+- `provider.py` 定义 `ModelRequest`、typed `ModelEvent`、ordered `ModelOutputItem`、
+  `ModelUsage`、`ModelMetadata`、`ProviderCapabilities` 和 classified `ModelError`。
+- `ProviderAdapter.stream_once()` 的契约是“一次厂商 API attempt”；adapter 只负责把 canonical
+  message/tool 降低为 wire payload，再把 response/error 提升回统一类型。
+- `ModelInvoker` 属于 harness，集中负责 retry/backoff/cancellation。只有 retryable error 且尚未
+  出现 text、reasoning 或 tool-call delta 时才会自动重试，避免流式输出被重复播放。
+- invoker 强制每个成功 stream 恰好产生一个 terminal `ModelCompleted`，并拒绝 completed 后继续
+  发事件的 adapter，避免 string event 约定产生非法状态。
+- `DeepSeekAdapter` 删除内部 retry loop；HTTP、connection、stream、protocol 和 context overflow
+  被分类为统一错误，并保留 status、provider code、request ID 和 Retry-After 等可用信息。
+- DeepSeek `reasoning_content` 继续保存在 canonical assistant message 中，tool-use 后续请求仍会
+  回传；这属于 DeepSeek wire mapping，不进入 agent loop 的厂商分支。
+- CLI 通过显式 `ProviderConfig -> create_provider_adapter()` 绑定 adapter；当前只有 DeepSeek 实现，
+  factory 不虚构 OpenAI、Anthropic 或 Gemini 已可用，也不引入全局动态插件系统。
+- provider contract tests 覆盖 canonical payload、typed deltas、fragmented tool call、usage、
+  自动重试边界、无 completed stream 和非法 tool arguments。
+
+## Milestone 14: Runtime Model Selection
+
+模型身份从启动参数升级为可发现、可切换并随 session 恢复的交互状态。
+
+- 底部 toolbar 同时显示当前 `provider/model` 和 context 使用量，不需要执行额外命令确认模型。
+- `/model` 打开独立模型选择器，当前模型优先高亮；上下方向键移动、`Enter` 确认、`Esc` 取消，
+  不要求用户输入 model ID。catalog 外的自定义 ID 只通过启动配置传入。
+- slash completer 负责一级命令发现；菜单激活时，上下方向键切换高亮项，`Enter` 直接执行，
+  `Tab`/`Shift-Tab` 继续作为快捷补全。模型候选由 terminal 选择器渲染，不把二级交互编码进
+  slash command 字符串；普通输入状态下，上下方向键仍由 history 导航处理。
+- `AgentRuntime.switch_model()` 只允许在 worker idle 且没有 pending turn 时调用，保留当前
+  conversation 和 session approval。
+- `AgentLoop.switch_model()` 同步替换 `ModelInvoker`，并根据新 `ModelProfile` 重建 context
+  limit，同时保留 compaction threshold、target 和 summary budget。
+- `SessionState` 保存 `provider_id` 和 `model_id`；`resume` 在没有显式 `--model` override 时
+  恢复上次选择。
+- 当前 catalog 只包含已接入 provider 的 DeepSeek V4 Flash/Pro；该功能切换 model，不切换
+  provider，也不代表其他厂商 adapter 已实现。
+
 ## Current Boundaries
 
 - `apply_patch` 可以自动修改 workspace 内的单个普通 UTF-8/LF 文件。
@@ -203,7 +244,8 @@ CLI 与 agent loop 之间从同步函数调用升级为双向 runtime protocol�
 - model cancellation 是协作式检查；底层网络 read 期间可能要等待 I/O 返回或 timeout。
 - `/abort` 只清理 conversation state，不回滚已经执行的文件修改或进程副作用。
 - 本地 `.my-agent/`、`trace.jsonl` 和 `trajectory.json` 默认不提交到 Git。
-- 当前只有 DeepSeek adapter，provider abstraction 已为其他模型保留边界。
+- 当前只有 DeepSeek adapter；统一协议和 harness 边界已经可以承接其他模型，但每个厂商仍需实现
+  并测试自己的 wire adapter。
 
 ## Next Candidates
 

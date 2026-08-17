@@ -3,22 +3,47 @@ from __future__ import annotations
 import json
 import os
 import threading
-import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Iterator
 
-from ..messages import AssistantMessage, Message, ToolCall, ToolResultMessage, UserMessage
 from ..control import raise_if_cancelled
-from ..provider import ProviderError, ProviderEvent, ProviderResponse, TokenUsage
+from ..messages import AssistantMessage, Message, ToolCall, ToolResultMessage, UserMessage
+from ..provider import (
+    ModelCompleted,
+    ModelError,
+    ModelErrorKind,
+    ModelErrorPhase,
+    ModelEvent,
+    ModelMetadata,
+    ModelProfile,
+    ModelRequest,
+    ModelResponse,
+    ModelUsage,
+    ProviderCapabilities,
+    ReasoningDelta,
+    ReasoningOutput,
+    StopReason,
+    TextDelta,
+    TextOutput,
+    ToolCallDelta,
+    ToolCallOutput,
+)
 from ..tools import ToolSpec
 
 
-RETRYABLE_STATUS_CODES = {429, 500, 503}
+RETRYABLE_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504}
+CONTEXT_ERROR_MARKERS = (
+    "context length",
+    "context window",
+    "too many tokens",
+    "maximum prompt length",
+    "prompt is too long",
+)
 
 
-class DeepSeekProvider:
+class DeepSeekAdapter:
     def __init__(
         self,
         api_key: str | None = None,
@@ -27,78 +52,50 @@ class DeepSeekProvider:
         thinking: str | None = None,
         context_window_tokens: int | None = None,
         max_output_tokens: int | None = None,
-        max_retries: int = 2,
-        retry_base_seconds: float = 0.75,
     ) -> None:
         self.api_key = api_key or os.environ.get("DEEPSEEK_API_KEY")
-        self.model = model or os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
+        model_id = model or os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
         self.base_url = (
             base_url or os.environ.get("DEEPSEEK_BASE_URL") or "https://api.deepseek.com"
         ).rstrip("/")
         self.thinking = thinking or os.environ.get("DEEPSEEK_THINKING", "enabled")
-        self.context_window_tokens = context_window_tokens or int(
-            os.environ.get("DEEPSEEK_CONTEXT_WINDOW_TOKENS", "1000000")
+        if self.thinking not in {"enabled", "disabled"}:
+            raise ValueError("DeepSeek thinking must be 'enabled' or 'disabled'")
+        self.profile = ModelProfile(
+            provider_id="deepseek",
+            model_id=model_id,
+            context_window_tokens=context_window_tokens
+            or int(os.environ.get("DEEPSEEK_CONTEXT_WINDOW_TOKENS", "1000000")),
+            max_output_tokens=max_output_tokens
+            or int(os.environ.get("DEEPSEEK_MAX_OUTPUT_TOKENS", "64000")),
+            capabilities=ProviderCapabilities(reasoning=True),
         )
-        self.max_output_tokens = max_output_tokens or int(
-            os.environ.get("DEEPSEEK_MAX_OUTPUT_TOKENS", "64000")
-        )
-        self.max_retries = max_retries
-        self.retry_base_seconds = retry_base_seconds
-        if self.context_window_tokens <= 0 or self.max_output_tokens <= 0:
-            raise ValueError("DeepSeek token limits must be positive")
-        if self.max_output_tokens >= self.context_window_tokens:
-            raise ValueError("max output tokens must be smaller than the context window")
 
-    def stream(
+    def stream_once(
         self,
-        messages: list[Message],
-        tools: list[ToolSpec],
-        system_prompt: str,
+        request: ModelRequest,
         cancel_event: threading.Event | None = None,
-    ) -> Iterator[ProviderEvent]:
+    ) -> Iterator[ModelEvent]:
         raise_if_cancelled(cancel_event)
         if not self.api_key:
-            raise ProviderError("DEEPSEEK_API_KEY is required for the DeepSeek provider")
+            raise ModelError(
+                "DEEPSEEK_API_KEY is required for the DeepSeek provider",
+                kind=ModelErrorKind.CONFIGURATION,
+                phase=ModelErrorPhase.CONFIGURATION,
+                provider_id=self.profile.provider_id,
+                model_id=self.profile.model_id,
+            )
 
-        payload = self.build_payload(messages, tools, system_prompt)
-        for attempt in range(1, self.max_retries + 2):
-            raise_if_cancelled(cancel_event)
-            accumulator = _StreamAccumulator()
-            emitted_delta = False
-            try:
-                for chunk in self._stream_once(payload, cancel_event):
-                    for event in accumulator.consume(chunk):
-                        raise_if_cancelled(cancel_event)
-                        emitted_delta = True
-                        yield event
-                response = accumulator.finish()
-                yield ProviderEvent(kind="completed", response=response)
-                return
-            except ProviderError as exc:
-                can_retry = (
-                    exc.retryable
-                    and not emitted_delta
-                    and attempt <= self.max_retries
-                )
-                if not can_retry:
-                    raise
-                delay = self.retry_base_seconds * (2 ** (attempt - 1))
-                yield ProviderEvent(
-                    kind="retry",
-                    text=str(exc),
-                    data={
-                        "attempt": attempt + 1,
-                        "delay_seconds": delay,
-                        "status_code": exc.status_code,
-                    },
-                )
-                if delay > 0 and cancel_event is not None:
-                    if cancel_event.wait(delay):
-                        raise_if_cancelled(cancel_event)
-                elif delay > 0:
-                    time.sleep(delay)
-
-        raise ProviderError("DeepSeek stream exhausted retries")
+        payload = self.build_payload(request)
+        accumulator = _StreamAccumulator(
+            provider_id=self.profile.provider_id,
+            requested_model_id=self.profile.model_id,
+        )
+        for chunk in self._stream_once(payload, cancel_event):
+            for event in accumulator.consume(chunk):
+                raise_if_cancelled(cancel_event)
+                yield event
+        yield ModelCompleted(accumulator.finish())
 
     def _stream_once(
         self,
@@ -132,55 +129,67 @@ class DeepSeekProvider:
                     try:
                         chunk = json.loads(data)
                     except json.JSONDecodeError as exc:
-                        raise ProviderError(
-                            f"DeepSeek stream returned invalid JSON: {exc}"
+                        raise self._error(
+                            f"DeepSeek stream returned invalid JSON: {exc}",
+                            kind=ModelErrorKind.PROTOCOL,
+                            phase=ModelErrorPhase.DECODING,
                         ) from exc
                     if not isinstance(chunk, dict):
-                        raise ProviderError("DeepSeek stream chunk is not a JSON object")
+                        raise self._error(
+                            "DeepSeek stream chunk is not a JSON object",
+                            kind=ModelErrorKind.PROTOCOL,
+                            phase=ModelErrorPhase.DECODING,
+                        )
                     yield chunk
                 if not saw_done:
-                    raise ProviderError(
+                    raise self._error(
                         "DeepSeek stream closed before [DONE]",
+                        kind=ModelErrorKind.STREAM,
+                        phase=ModelErrorPhase.STREAM,
                         retryable=True,
                     )
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
-            raise ProviderError(
-                f"DeepSeek API error {exc.code}: {body}",
+            message, provider_code = _parse_error_body(body)
+            request_id = _header(exc.headers, "x-request-id")
+            raise self._error(
+                f"DeepSeek API error {exc.code}: {message}",
+                kind=_http_error_kind(exc.code, message),
+                phase=ModelErrorPhase.REQUEST,
                 retryable=exc.code in RETRYABLE_STATUS_CODES,
                 status_code=exc.code,
+                provider_code=provider_code,
+                request_id=request_id,
+                retry_after_seconds=_retry_after_seconds(exc.headers),
             ) from exc
         except (urllib.error.URLError, TimeoutError) as exc:
-            raise ProviderError(
+            raise self._error(
                 f"DeepSeek connection error: {exc}",
+                kind=ModelErrorKind.CONNECTION,
+                phase=ModelErrorPhase.REQUEST,
                 retryable=True,
             ) from exc
 
-    def build_payload(
-        self,
-        messages: list[Message],
-        tools: list[ToolSpec],
-        system_prompt: str,
-    ) -> dict[str, Any]:
+    def build_payload(self, request: ModelRequest) -> dict[str, Any]:
         api_messages: list[dict[str, Any]] = []
-        if system_prompt:
-            api_messages.append({"role": "system", "content": system_prompt})
-        api_messages.extend(self._convert_messages(messages))
+        if request.system_prompt:
+            api_messages.append({"role": "system", "content": request.system_prompt})
+        api_messages.extend(self._convert_messages(request.messages))
 
         payload: dict[str, Any] = {
-            "model": self.model,
+            "model": self.profile.model_id,
             "messages": api_messages,
             "stream": True,
             "stream_options": {"include_usage": True},
             "thinking": {"type": self.thinking},
-            "max_tokens": self.max_output_tokens,
+            "max_tokens": self.profile.max_output_tokens,
         }
-        if tools:
-            payload["tools"] = [self._convert_tool(tool) for tool in tools]
+        if request.tools:
+            payload["tools"] = [self._convert_tool(tool) for tool in request.tools]
             payload["tool_choice"] = "auto"
         return payload
 
-    def _convert_messages(self, messages: list[Message]) -> list[dict[str, Any]]:
+    def _convert_messages(self, messages: tuple[Message, ...]) -> list[dict[str, Any]]:
         api_messages: list[dict[str, Any]] = []
         for message in messages:
             if isinstance(message, UserMessage):
@@ -225,6 +234,14 @@ class DeepSeekProvider:
             function["strict"] = True
         return {"type": "function", "function": function}
 
+    def _error(self, message: str, **kwargs: Any) -> ModelError:
+        return ModelError(
+            message,
+            provider_id=self.profile.provider_id,
+            model_id=self.profile.model_id,
+            **kwargs,
+        )
+
 
 @dataclass
 class _ToolCallParts:
@@ -235,90 +252,241 @@ class _ToolCallParts:
 
 @dataclass
 class _StreamAccumulator:
+    provider_id: str
+    requested_model_id: str
     content_parts: list[str] = field(default_factory=list)
     reasoning_parts: list[str] = field(default_factory=list)
     tool_calls: dict[int, _ToolCallParts] = field(default_factory=dict)
-    finish_reason: str = "unknown"
-    usage: TokenUsage = field(default_factory=TokenUsage)
+    stop_reason: str = "unknown"
+    usage: ModelUsage | None = None
+    response_id: str | None = None
+    response_model_id: str | None = None
     chunks: int = 0
     choices_seen: int = 0
 
-    def consume(self, chunk: dict[str, Any]) -> list[ProviderEvent]:
+    def consume(self, chunk: dict[str, Any]) -> list[ModelEvent]:
         self.chunks += 1
+        self.response_id = _non_empty_string(chunk.get("id")) or self.response_id
+        self.response_model_id = _non_empty_string(chunk.get("model")) or self.response_model_id
         self._consume_usage(chunk.get("usage"))
         choices = chunk.get("choices") or []
         if not choices:
             return []
+        if not isinstance(choices, list) or not isinstance(choices[0], dict):
+            raise self._protocol_error("DeepSeek choices must be a list of objects")
 
         self.choices_seen += 1
         choice = choices[0]
-        finish_reason = choice.get("finish_reason")
-        if finish_reason:
-            self.finish_reason = finish_reason
+        stop_reason = choice.get("finish_reason")
+        if isinstance(stop_reason, str) and stop_reason:
+            self.stop_reason = stop_reason
         delta = choice.get("delta") or {}
-        events: list[ProviderEvent] = []
+        if not isinstance(delta, dict):
+            raise self._protocol_error("DeepSeek delta must be a JSON object")
+        events: list[ModelEvent] = []
 
         reasoning = delta.get("reasoning_content") or ""
         if reasoning:
+            if not isinstance(reasoning, str):
+                raise self._protocol_error("DeepSeek reasoning_content must be a string")
             self.reasoning_parts.append(reasoning)
-            events.append(ProviderEvent(kind="reasoning_delta", text=reasoning))
+            events.append(ReasoningDelta(reasoning))
 
         content = delta.get("content") or ""
         if content:
+            if not isinstance(content, str):
+                raise self._protocol_error("DeepSeek content must be a string")
             self.content_parts.append(content)
-            events.append(ProviderEvent(kind="content_delta", text=content))
+            events.append(TextDelta(content))
 
-        for raw_call in delta.get("tool_calls") or []:
-            index = int(raw_call.get("index") or 0)
-            parts = self.tool_calls.setdefault(index, _ToolCallParts())
-            if raw_call.get("id"):
-                parts.call_id += raw_call["id"]
-            function = raw_call.get("function") or {}
-            if function.get("name"):
-                parts.name += function["name"]
-            if function.get("arguments"):
-                parts.arguments += function["arguments"]
-        return events
-
-    def finish(self) -> ProviderResponse:
-        if self.choices_seen == 0 or self.finish_reason == "unknown":
-            raise ProviderError(
-                "DeepSeek stream ended without a completed choice",
-                retryable=True,
-            )
-        if self.finish_reason == "insufficient_system_resource":
-            raise ProviderError(
-                "DeepSeek stopped because inference resources were insufficient",
-                retryable=True,
-            )
-        calls: list[ToolCall] = []
-        for index in sorted(self.tool_calls):
-            parts = self.tool_calls[index]
+        raw_calls = delta.get("tool_calls") or []
+        if not isinstance(raw_calls, list):
+            raise self._protocol_error("DeepSeek tool_calls must be a list")
+        for raw_call in raw_calls:
+            if not isinstance(raw_call, dict):
+                raise self._protocol_error("DeepSeek tool call delta must be an object")
             try:
-                arguments = json.loads(parts.arguments or "{}")
-            except json.JSONDecodeError:
-                arguments = {"_raw_arguments": parts.arguments}
-            calls.append(
-                ToolCall(
-                    call_id=parts.call_id,
-                    name=parts.name,
-                    arguments=arguments,
+                index = int(raw_call.get("index") or 0)
+            except (TypeError, ValueError) as exc:
+                raise self._protocol_error("DeepSeek tool call index must be an integer") from exc
+            parts = self.tool_calls.setdefault(index, _ToolCallParts())
+            call_id_delta = _non_empty_string(raw_call.get("id")) or ""
+            parts.call_id += call_id_delta
+            function = raw_call.get("function") or {}
+            if not isinstance(function, dict):
+                raise self._protocol_error("DeepSeek tool call function must be an object")
+            name_delta = _non_empty_string(function.get("name")) or ""
+            arguments_delta = _non_empty_string(function.get("arguments")) or ""
+            parts.name += name_delta
+            parts.arguments += arguments_delta
+            events.append(
+                ToolCallDelta(
+                    index=index,
+                    call_id_delta=call_id_delta,
+                    name_delta=name_delta,
+                    arguments_delta=arguments_delta,
                 )
             )
-        return ProviderResponse(
-            content="".join(self.content_parts),
-            reasoning_content="".join(self.reasoning_parts),
-            tool_calls=calls,
-            finish_reason=self.finish_reason,
+        return events
+
+    def finish(self) -> ModelResponse:
+        if self.choices_seen == 0 or self.stop_reason == "unknown":
+            raise ModelError(
+                "DeepSeek stream ended without a completed choice",
+                kind=ModelErrorKind.STREAM,
+                phase=ModelErrorPhase.STREAM,
+                retryable=True,
+                provider_id=self.provider_id,
+                model_id=self.requested_model_id,
+            )
+        if self.stop_reason == "insufficient_system_resource":
+            raise ModelError(
+                "DeepSeek stopped because inference resources were insufficient",
+                kind=ModelErrorKind.SERVER,
+                phase=ModelErrorPhase.STREAM,
+                retryable=True,
+                provider_id=self.provider_id,
+                model_id=self.requested_model_id,
+            )
+
+        output: list[TextOutput | ReasoningOutput | ToolCallOutput] = []
+        reasoning = "".join(self.reasoning_parts)
+        if reasoning:
+            output.append(ReasoningOutput(reasoning))
+        content = "".join(self.content_parts)
+        if content:
+            output.append(TextOutput(content))
+        for index in sorted(self.tool_calls):
+            parts = self.tool_calls[index]
+            if not parts.call_id or not parts.name:
+                raise self._protocol_error(
+                    f"DeepSeek tool call {index} is missing an id or function name"
+                )
+            try:
+                arguments = json.loads(parts.arguments or "{}")
+            except json.JSONDecodeError as exc:
+                raise self._protocol_error(
+                    f"DeepSeek tool call {parts.name} returned invalid JSON arguments"
+                ) from exc
+            if not isinstance(arguments, dict):
+                raise self._protocol_error(
+                    f"DeepSeek tool call {parts.name} arguments must be a JSON object"
+                )
+            output.append(
+                ToolCallOutput(
+                    ToolCall(
+                        call_id=parts.call_id,
+                        name=parts.name,
+                        arguments=arguments,
+                    )
+                )
+            )
+        return ModelResponse(
+            output=tuple(output),
+            stop_reason=_normalize_stop_reason(self.stop_reason),
             usage=self.usage,
-            raw_response={"stream": True, "chunks": self.chunks},
+            metadata=ModelMetadata(
+                provider_id=self.provider_id,
+                model_id=self.requested_model_id,
+                response_model_id=self.response_model_id,
+                response_id=self.response_id,
+                native={
+                    "stream": True,
+                    "chunks": self.chunks,
+                    "finish_reason": self.stop_reason,
+                },
+            ),
         )
 
     def _consume_usage(self, raw_usage: Any) -> None:
         if not isinstance(raw_usage, dict):
             return
-        self.usage = TokenUsage(
-            input_tokens=int(raw_usage.get("prompt_tokens") or 0),
-            output_tokens=int(raw_usage.get("completion_tokens") or 0),
-            cache_read_tokens=int(raw_usage.get("prompt_cache_hit_tokens") or 0),
+        details = raw_usage.get("completion_tokens_details") or {}
+        if not isinstance(details, dict):
+            details = {}
+        self.usage = ModelUsage(
+            input_tokens=_optional_int(raw_usage.get("prompt_tokens")),
+            output_tokens=_optional_int(raw_usage.get("completion_tokens")),
+            total_tokens=_optional_int(raw_usage.get("total_tokens")),
+            reasoning_tokens=_optional_int(details.get("reasoning_tokens")),
+            cache_read_tokens=_optional_int(raw_usage.get("prompt_cache_hit_tokens")),
         )
+
+    def _protocol_error(self, message: str) -> ModelError:
+        return ModelError(
+            message,
+            kind=ModelErrorKind.PROTOCOL,
+            phase=ModelErrorPhase.DECODING,
+            provider_id=self.provider_id,
+            model_id=self.requested_model_id,
+        )
+
+
+def _parse_error_body(body: str) -> tuple[str, str | None]:
+    body = body.strip()
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return (body[:4000] or "empty response body"), None
+    if not isinstance(payload, dict):
+        return str(payload)[:4000], None
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return json.dumps(payload, ensure_ascii=False)[:4000], None
+    message = str(error.get("message") or body or "unknown provider error")
+    code = error.get("code")
+    return message[:4000], str(code) if code is not None else None
+
+
+def _normalize_stop_reason(value: str) -> StopReason:
+    try:
+        return StopReason(value)
+    except ValueError:
+        return StopReason.UNKNOWN
+
+
+def _http_error_kind(status_code: int, message: str) -> ModelErrorKind:
+    lowered = message.lower()
+    if status_code in {400, 413} and any(marker in lowered for marker in CONTEXT_ERROR_MARKERS):
+        return ModelErrorKind.CONTEXT_OVERFLOW
+    if status_code in {401, 403}:
+        return ModelErrorKind.AUTHENTICATION
+    if status_code == 408:
+        return ModelErrorKind.CONNECTION
+    if status_code == 429:
+        return ModelErrorKind.RATE_LIMIT
+    if status_code == 409 or status_code >= 500:
+        return ModelErrorKind.SERVER
+    if 400 <= status_code < 500:
+        return ModelErrorKind.INVALID_REQUEST
+    return ModelErrorKind.UNKNOWN
+
+
+def _retry_after_seconds(headers: Any) -> float | None:
+    value = _header(headers, "retry-after")
+    if value is None:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        return None
+
+
+def _header(headers: Any, name: str) -> str | None:
+    if headers is None:
+        return None
+    value = headers.get(name)
+    return str(value) if value is not None else None
+
+
+def _non_empty_string(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
