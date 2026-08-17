@@ -258,6 +258,7 @@ def _message_payload(message: Message) -> str:
             "content": message.content,
             "reasoning_content": message.reasoning_content,
             "tool_calls": [call.to_dict() for call in message.tool_calls],
+            "provider_data": message.provider_data,
         }
     else:
         payload = {

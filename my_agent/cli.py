@@ -6,6 +6,7 @@ from pathlib import Path
 from queue import Empty
 
 from .agent_loop import AgentEvent, AgentLoop
+from .config import RuntimeConfig, load_runtime_config
 from .control import ApprovalDecision
 from .model_invoker import ModelInvoker
 from .permissions import PermissionPolicy
@@ -13,7 +14,6 @@ from .providers.factory import (
     SUPPORTED_PROVIDER_IDS,
     ProviderConfig,
     create_provider_adapter,
-    model_catalog,
 )
 from .runtime import (
     AgentRuntime,
@@ -51,6 +51,7 @@ SLASH_COMMANDS = (
     SlashCommand("/summary", "Show current session state"),
     SlashCommand("/context", "Show detailed context usage"),
     SlashCommand("/model", "Choose the model"),
+    SlashCommand("/config", "Show provider configuration"),
     SlashCommand("/retry", "Resume the pending model step"),
     SlashCommand("/abort", "Discard the pending turn"),
     SlashCommand("/trace", "Show the raw trace path"),
@@ -80,6 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        args.runtime_config = load_runtime_config(args.config, args.credentials)
         if args.command == "ask":
             return _run_ask(args)
         if args.command == "chat":
@@ -129,9 +131,8 @@ def _add_runtime_options(parser: argparse.ArgumentParser) -> None:
 def _add_provider_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--provider",
-        default="deepseek",
-        choices=SUPPORTED_PROVIDER_IDS,
-        help="LLM provider adapter.",
+        default=None,
+        help="Provider ID. Uses config default when omitted.",
     )
     parser.add_argument(
         "--model",
@@ -147,7 +148,23 @@ def _add_provider_options(parser: argparse.ArgumentParser) -> None:
         "--thinking",
         choices=["enabled", "disabled"],
         default=None,
-        help="DeepSeek thinking mode. Defaults to DEEPSEEK_THINKING or enabled.",
+        help="DeepSeek thinking mode. Uses provider config when omitted.",
+    )
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=["none", "low", "medium", "high", "xhigh", "max"],
+        default=None,
+        help="OpenAI reasoning effort. Uses provider config when omitted.",
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="Provider config path. Defaults to ~/.config/my-agent/config.json.",
+    )
+    parser.add_argument(
+        "--credentials",
+        default=None,
+        help="Credentials path. Defaults beside the provider config.",
     )
 
 
@@ -267,40 +284,53 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                         print("pending turn exists; use /retry or /abort before switching model")
                         continue
                     current_profile = loop.model.profile
-                    entries = model_catalog(current_profile.provider_id)
+                    entries = tuple(
+                        model
+                        for model in args.runtime_config.models()
+                        if model.provider_id in SUPPORTED_PROVIDER_IDS
+                    )
                     if not entries:
                         print(f"no selectable models for {current_profile.provider_id}")
                         continue
                     if not editor.supports_interactive_selection:
                         _print_model_catalog(
-                            current_profile.provider_id,
-                            current_profile.model_id,
+                            args.runtime_config,
+                            f"{current_profile.provider_id}/{current_profile.model_id}",
                         )
                         print("interactive model selection requires a TTY")
                         continue
                     requested_model = editor.select(
                         "model> ",
                         (
-                            SelectionOption(entry.model_id, entry.description)
+                            SelectionOption(entry.ref, entry.description)
                             for entry in entries
                         ),
-                        current_value=current_profile.model_id,
+                        current_value=(
+                            f"{current_profile.provider_id}/{current_profile.model_id}"
+                        ),
                     )
                     if requested_model is None:
                         print("model selection cancelled")
                         continue
-                    if requested_model == current_profile.model_id:
+                    current_model_ref = (
+                        f"{current_profile.provider_id}/{current_profile.model_id}"
+                    )
+                    if requested_model == current_model_ref:
                         print(
                             f"already using {current_profile.provider_id}/"
                             f"{current_profile.model_id}"
                         )
                         continue
-                    model = _build_model(args, model_id=requested_model)
+                    model = _build_model(args, model_ref=requested_model)
                     runtime.switch_model(model)
+                    args.provider = model.profile.provider_id
                     args.model = model.profile.model_id
                     _sync_session_model(state, loop)
                     _save_session_artifacts(store, state)
                     print(f"model: {model.profile.provider_id}/{model.profile.model_id}")
+                    continue
+                if user_input == "/config":
+                    _print_runtime_config(args.runtime_config)
                     continue
                 if user_input == "/context":
                     snapshot = loop.inspect_context(state)
@@ -492,22 +522,48 @@ def _build_runtime(
 def _build_model(
     args: argparse.Namespace,
     *,
+    provider_id: str | None = None,
     model_id: str | None = None,
+    model_ref: str | None = None,
 ) -> ModelInvoker:
+    resolved = args.runtime_config.resolve_model(
+        provider_id=provider_id if provider_id is not None else args.provider,
+        model_id=model_id if model_id is not None else args.model,
+        model_ref=model_ref,
+    )
+    selected_provider = resolved.model.provider_id
+    options = dict(resolved.options)
+    if selected_provider == "deepseek" and args.thinking is not None:
+        options["thinking"] = args.thinking
+    if selected_provider == "openai" and args.reasoning_effort is not None:
+        options["reasoning_effort"] = args.reasoning_effort
     adapter = create_provider_adapter(
         ProviderConfig(
-            provider_id=args.provider,
-            model_id=model_id if model_id is not None else args.model,
-            base_url=args.base_url,
-            context_window_tokens=args.context_window_tokens,
-            max_output_tokens=args.max_output_tokens,
-            options={"thinking": args.thinking} if args.thinking is not None else {},
+            provider_id=selected_provider,
+            api_key=resolved.api_key,
+            model_id=resolved.model.model_id,
+            base_url=args.base_url or resolved.base_url,
+            context_window_tokens=(
+                args.context_window_tokens
+                if args.context_window_tokens is not None
+                else resolved.model.context_window_tokens
+            ),
+            max_output_tokens=(
+                args.max_output_tokens
+                if args.max_output_tokens is not None
+                else resolved.model.max_output_tokens
+            ),
+            options=options,
         )
     )
     return ModelInvoker(adapter)
 
 
 def _restore_session_model(args: argparse.Namespace, state: SessionState) -> None:
+    if args.model is not None and "/" in args.model:
+        return
+    if args.provider is None and state.provider_id:
+        args.provider = state.provider_id
     if args.model is None and state.model_id and state.provider_id == args.provider:
         args.model = state.model_id
 
@@ -517,12 +573,24 @@ def _sync_session_model(state: SessionState, loop: AgentLoop) -> None:
     state.model_id = loop.model.profile.model_id
 
 
-def _print_model_catalog(provider_id: str, current_model_id: str) -> None:
-    print(f"Current model: {provider_id}/{current_model_id}")
+def _print_model_catalog(config: RuntimeConfig, current_model_ref: str) -> None:
+    print(f"Current model: {current_model_ref}")
     print("Available models")
-    for entry in model_catalog(provider_id):
-        marker = "*" if entry.model_id == current_model_id else " "
-        print(f"  {marker} {entry.model_id:<24}{entry.description}")
+    for model in config.models():
+        if model.provider_id not in SUPPORTED_PROVIDER_IDS:
+            continue
+        marker = "*" if model.ref == current_model_ref else " "
+        print(f"  {marker} {model.ref:<32}{model.description}")
+
+
+def _print_runtime_config(config: RuntimeConfig) -> None:
+    config_status = "loaded" if config.config_path.exists() else "built-in defaults"
+    credentials_status = "loaded" if config.credentials_path.exists() else "not found"
+    print("Provider Configuration")
+    print(f"  config:      {config.config_path} ({config_status})")
+    print(f"  credentials: {config.credentials_path} ({credentials_status})")
+    print(f"  default:     {config.default_model}")
+    print(f"  providers:   {', '.join(config.providers)}")
 
 
 def build_tool_registry() -> ToolRegistry:

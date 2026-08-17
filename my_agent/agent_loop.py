@@ -320,6 +320,7 @@ class AgentLoop:
                     AssistantMessage(
                         content=answer,
                         reasoning_content=reply.reasoning,
+                        provider_data=reply.provider_data,
                     )
                 )
                 self.trace.write(
@@ -348,6 +349,7 @@ class AgentLoop:
                     content=reply.text,
                     reasoning_content=reply.reasoning,
                     tool_calls=reply.tool_calls,
+                    provider_data=reply.provider_data,
                 )
             )
 

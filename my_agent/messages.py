@@ -28,6 +28,7 @@ class AssistantMessage:
     content: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
     reasoning_content: str = ""
+    provider_data: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

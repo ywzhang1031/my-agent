@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import threading
 import urllib.error
 import urllib.request
@@ -53,21 +52,17 @@ class DeepSeekAdapter:
         context_window_tokens: int | None = None,
         max_output_tokens: int | None = None,
     ) -> None:
-        self.api_key = api_key or os.environ.get("DEEPSEEK_API_KEY")
-        model_id = model or os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
-        self.base_url = (
-            base_url or os.environ.get("DEEPSEEK_BASE_URL") or "https://api.deepseek.com"
-        ).rstrip("/")
-        self.thinking = thinking or os.environ.get("DEEPSEEK_THINKING", "enabled")
+        self.api_key = api_key
+        model_id = model or "deepseek-v4-flash"
+        self.base_url = (base_url or "https://api.deepseek.com").rstrip("/")
+        self.thinking = thinking or "enabled"
         if self.thinking not in {"enabled", "disabled"}:
             raise ValueError("DeepSeek thinking must be 'enabled' or 'disabled'")
         self.profile = ModelProfile(
             provider_id="deepseek",
             model_id=model_id,
-            context_window_tokens=context_window_tokens
-            or int(os.environ.get("DEEPSEEK_CONTEXT_WINDOW_TOKENS", "1000000")),
-            max_output_tokens=max_output_tokens
-            or int(os.environ.get("DEEPSEEK_MAX_OUTPUT_TOKENS", "64000")),
+            context_window_tokens=context_window_tokens or 1_000_000,
+            max_output_tokens=max_output_tokens or 64_000,
             capabilities=ProviderCapabilities(reasoning=True),
         )
 
@@ -79,7 +74,7 @@ class DeepSeekAdapter:
         raise_if_cancelled(cancel_event)
         if not self.api_key:
             raise ModelError(
-                "DEEPSEEK_API_KEY is required for the DeepSeek provider",
+                "DeepSeek API key is required (DEEPSEEK_API_KEY or credentials.json)",
                 kind=ModelErrorKind.CONFIGURATION,
                 phase=ModelErrorPhase.CONFIGURATION,
                 provider_id=self.profile.provider_id,

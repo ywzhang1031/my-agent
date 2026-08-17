@@ -196,6 +196,7 @@ def message_to_dict(message: Message) -> dict[str, Any]:
             "content": message.content,
             "reasoning_content": message.reasoning_content,
             "tool_calls": [call.to_dict() for call in message.tool_calls],
+            "provider_data": message.provider_data,
         }
     if isinstance(message, ToolResultMessage):
         return {
@@ -215,6 +216,7 @@ def message_from_dict(data: dict[str, Any]) -> Message:
         return AssistantMessage(
             content=data.get("content", ""),
             reasoning_content=data.get("reasoning_content", ""),
+            provider_data=data.get("provider_data", {}),
             tool_calls=[
                 ToolCall(
                     call_id=call.get("call_id", ""),

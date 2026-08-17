@@ -64,6 +64,38 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ```
 
+## Provider Configuration
+
+程序默认从同一个用户级目录读取 provider 配置和凭据：
+
+```text
+~/.config/my-agent/
+  config.json
+  credentials.json
+```
+
+`config.json` 保存默认 `provider/model`、base URL、模型目录、context/output 上限和 provider
+options；`credentials.json` 只保存 API key。完整格式见
+[`docs/config.example.json`](docs/config.example.json) 和
+[`docs/credentials.example.json`](docs/credentials.example.json)。credentials 使用与 OpenCode
+`auth.json` 类似的 provider-keyed 结构：
+
+```json
+{
+  "deepseek": {"type": "api", "key": "..."},
+  "openai": {"type": "api", "key": "..."}
+}
+```
+
+`credentials.json` 必须是 `0600`；权限更宽时程序会拒绝读取。`DEEPSEEK_API_KEY` 和
+`OPENAI_API_KEY` 优先于文件中的对应 key。`MY_AGENT_CONFIG`、`MY_AGENT_CREDENTIALS` 或 CLI
+的 `--config`、`--credentials` 可以覆盖默认路径。配置文件不存在时使用内置的 DeepSeek 和
+OpenAI 模型目录；凭据文件不存在时仍可使用环境变量。
+
+要增加同一 provider 的模型，只需在该 provider 的 `models` 对象中加入模型 ID、说明和 token
+上限，模型便会出现在 `/model` 选择器中。只有已经实现 adapter 的 provider 才会显示为可选项；
+当前实现为 `deepseek` 和 `openai`。
+
 CLI 只提供 `ask`、`chat` 和 `resume` 三个 session-aware 入口。
 执行一个可恢复的单轮任务：
 
@@ -109,6 +141,7 @@ REPL 支持这些本地命令：
 - `/tools`：列出可用工具
 - `/context`：查看估算的 context 使用量和 compaction 状态
 - `/model`：打开模型选择器，用上下方向键选择、`Enter` 切换、`Esc` 取消
+- `/config`：显示实际配置/凭据路径、默认模型和已解析 provider，不显示 API key
 - `/retry`：从失败的 model step 恢复，不重复用户消息或已完成 tool
 - `/abort`：丢弃 pending turn 的消息；已经产生的文件或进程副作用不会回滚
 - `/help`：显示命令帮助
@@ -155,18 +188,21 @@ DeepSeek，但 CLI 只显示 `thinking...` 状态；使用 `--show-thinking` 才
 可以用 `--sessions-dir` 把 session 放到 workspace 之外。`list_files` 默认会忽略
 `.my-agent`，避免 agent 把自己的运行记录当成待诊断源码。
 
-如果没有设置 `DEEPSEEK_API_KEY`，CLI 会直接报错，不会假装完成诊断。
+如果所选 provider 没有可用 API key，CLI 会直接报错，不会假装完成诊断。
 `trace.jsonl` 还会记录 provider retry、context compaction、pending turn 恢复和错误，后续
 可以用来做失败分析、eval 或训练数据整理。
 
-默认 provider 是 `deepseek`，使用 DeepSeek 的 OpenAI-format Chat Completions API。
-默认模型是 `deepseek-v4-flash`；也可以通过 `DEEPSEEK_MODEL` 或 `--model` 覆盖。
-交互选择器当前包含 `deepseek-v4-flash` 和 `deepseek-v4-pro`；自定义 model ID 仍可通过
-`DEEPSEEK_MODEL` 或启动参数 `--model` 设置。交互切换只允许发生在没有 running/pending turn
-时；选择会保存到 `session.json`，后续 `resume` 在没有显式传入 `--model` 时继续使用该模型。
-默认开启 DeepSeek thinking mode；可以通过 `DEEPSEEK_THINKING=disabled` 或
-`--thinking disabled` 关闭。开启 thinking 且发生 tool calls 时，agent 会把
+内置默认模型是 `deepseek/deepseek-v4-flash`。DeepSeek adapter 使用 Chat Completions API；
+OpenAI adapter 使用 Responses API。`/model` 会显示配置中所有已有 adapter 的 `provider/model`
+并支持跨 provider 切换。交互切换只允许发生在没有 running/pending turn 时；选择会保存到
+`session.json`，后续 `resume` 在没有显式 provider/model override 时继续使用该模型。
+默认通过 DeepSeek provider config 开启 thinking mode；可以在 `config.json` 的
+`providers.deepseek.options.thinking` 中配置，或通过 `--thinking disabled` 关闭。
+开启 thinking 且发生 tool calls 时，agent 会把
 `reasoning_content` 保存在内部 `AssistantMessage` 中，并在后续 API 请求里回传。
+OpenAI reasoning 默认使用配置中的 `medium` effort 和 `auto` summary，也可以用
+`--reasoning-effort` 覆盖。Responses API 返回的原生 output items 会作为 opaque
+`provider_data` 保存，以便 reasoning model 在 tool result 后继续调用；harness 不解析这些字段。
 
 ## Runtime Layers
 
@@ -177,6 +213,7 @@ DeepSeek，但 CLI 只显示 `thinking...` 状态；使用 `--show-thinking` 才
 - `runtime.py`：接收 `RuntimeCommand`、在 worker 中驱动 turn，并发布 `RuntimeEvent`
 - `control.py`：定义 cancellation、permission request 和 approval decision 契约
 - `session.py`：序列化统一 `Message`、context 状态和可重试的 `PendingTurn`
+- `config.py`：合并内置模型目录、用户 provider 配置和独立凭据，并解析 `provider/model`
 - `context.py`：估算 token、保留 active turn，并摘要压缩较老的 completed turns
 - `agent_loop.py`：维护 model -> tool -> observation -> model 循环，并发出统一 `AgentEvent`
 - `provider.py`：定义厂商无关的 request、typed event、ordered output、usage、metadata、
@@ -185,6 +222,8 @@ DeepSeek，但 CLI 只显示 `thinking...` 状态；使用 `--show-thinking` 才
   contract 检查
 - `providers/deepseek.py`：只执行一次 DeepSeek API attempt，转换 Chat Completions payload、
   解析 SSE，并把原生响应或错误提升为统一协议
+- `providers/openai.py`：只执行一次 OpenAI Responses API attempt，解析语义化 SSE、function call、
+  reasoning summary、usage 和 continuation items
 - `providers/factory.py`：把 CLI provider 配置绑定为一个具体 adapter；它不是运行时全局插件注册表
 - `tools.py`：定义 tool schema、registry、执行入口和统一 `ToolResult`
 - `execution.py`：在清理后的环境中管理子进程、输出捕获、timeout 和 process group
@@ -204,7 +243,7 @@ CLI loads SessionState
      -> if needed, summarize old completed turns and keep recent raw messages
   -> AgentLoop creates one provider-neutral ModelRequest
   -> ModelInvoker applies harness retry/cancellation policy
-  -> DeepSeekAdapter performs one API attempt and maps the wire protocol
+  -> selected ProviderAdapter performs one API attempt and maps its wire protocol
   -> typed ModelEvent deltas become AgentEvent and terminal output
   -> ModelCompleted contains ordered text/reasoning/tool-call output plus usage/metadata
   -> AgentLoop either accepts a final answer
@@ -234,7 +273,7 @@ Context token 数量是保守估算，不是 provider tokenizer 的精确计数�
 `ContextSnapshot` 一起生成，类别之和必须等于 `estimated_tokens`，终端不会另算一套数字。
 
 `ModelInvoker` 只会在尚未向终端输出任何 text、reasoning 或 tool-call delta 时自动重试
-adapter 标记为 retryable 的错误。DeepSeek adapter 本身从不循环重试，只分类并返回错误。
+adapter 标记为 retryable 的错误。provider adapter 本身从不循环重试，只分类并返回错误。
 流中途失败时自动重放可能造成重复输出，所以 harness 保留 `PendingTurn`，由用户
 执行 `/retry` 从同一个 model step 恢复。已经成功执行的 tool call ID 会被记住，不会在恢复时
 再次执行。中断检查发生在 request、SSE chunk、重试等待和工具执行边界；Python `urllib`
@@ -250,9 +289,9 @@ adapter 标记为 retryable 的错误。DeepSeek adapter 本身从不循环重�
 
 ## Adding a Provider
 
-当前真正实现并测试的 adapter 只有 DeepSeek。统一协议已经把接入新厂商所需的改动限制在
-provider 边界内，但不能把这一点表述为“已经兼容所有模型 API”。新增 OpenAI、Anthropic、
-Gemini 或 OpenAI-compatible endpoint 时，按下面顺序扩展：
+当前真正实现并测试的 adapter 是 DeepSeek Chat Completions 和 OpenAI Responses。统一协议已经
+把接入新厂商所需的改动限制在 provider 边界内，但不能把这一点表述为“已经兼容所有模型 API”。
+新增 Anthropic、Gemini 或 OpenAI-compatible endpoint 时，按下面顺序扩展：
 
 1. 实现一个 `ProviderAdapter`，提供不可变的 `ModelProfile` 和 `stream_once()`；每次调用只发起
    一次厂商请求，不在 adapter 内做 retry、tool execution、context compaction 或权限判断。

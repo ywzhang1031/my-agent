@@ -153,6 +153,7 @@ class ModelResponse:
     stop_reason: StopReason
     usage: ModelUsage | None
     metadata: ModelMetadata
+    provider_data: dict[str, Any] = field(default_factory=dict)
 
     @property
     def text(self) -> str:
@@ -176,6 +177,7 @@ class ModelResponse:
         stop_reason: StopReason = StopReason.STOP,
         usage: ModelUsage | None = None,
         metadata: ModelMetadata,
+        provider_data: dict[str, Any] | None = None,
     ) -> ModelResponse:
         output: list[ModelOutputItem] = []
         if reasoning:
@@ -188,6 +190,7 @@ class ModelResponse:
             stop_reason=stop_reason,
             usage=usage,
             metadata=metadata,
+            provider_data=provider_data or {},
         )
 
 

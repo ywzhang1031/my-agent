@@ -19,7 +19,14 @@ from prompt_toolkit.keys import Keys
 from prompt_toolkit.output import DummyOutput
 
 from my_agent.agent_loop import AgentEvent, AgentLoop
-from my_agent.cli import build_parser, build_tool_registry, main
+from my_agent.cli import (
+    _build_model,
+    _restore_session_model,
+    build_parser,
+    build_tool_registry,
+    main,
+)
+from my_agent.config import load_runtime_config
 from my_agent.context import ContextManager, estimate_text_tokens
 from my_agent.control import ApprovalDecision, raise_if_cancelled
 from my_agent.messages import AssistantMessage, ToolCall, ToolResultMessage, UserMessage
@@ -42,6 +49,7 @@ from my_agent.provider import (
 )
 from my_agent.providers.deepseek import DeepSeekAdapter
 from my_agent.providers.factory import ProviderConfig, create_provider_adapter
+from my_agent.providers.openai import OpenAIAdapter
 from my_agent.runtime import (
     AgentRuntime,
     InterruptTurn,
@@ -132,6 +140,134 @@ def _model(adapter, *, max_attempts: int = 1) -> ModelInvoker:
 
 
 class MyAgentTests(unittest.TestCase):
+    def test_runtime_config_loads_builtin_provider_catalog(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = load_runtime_config(
+                Path(tmpdir, "config.json"),
+                Path(tmpdir, "credentials.json"),
+            )
+
+        self.assertEqual(config.default_model, "deepseek/deepseek-v4-flash")
+        self.assertEqual(
+            [model.ref for model in config.models()],
+            [
+                "deepseek/deepseek-v4-flash",
+                "deepseek/deepseek-v4-pro",
+                "openai/gpt-5.6",
+            ],
+        )
+        openai = config.resolve_model(model_ref="openai/gpt-5.6")
+        self.assertEqual(openai.base_url, "https://api.openai.com/v1")
+        self.assertEqual(openai.model.context_window_tokens, 1_050_000)
+        self.assertEqual(
+            config.resolve_model(model_id="openai/gpt-5.6").model.ref,
+            "openai/gpt-5.6",
+        )
+        with self.assertRaisesRegex(ValueError, "conflicts with model reference"):
+            config.resolve_model(
+                provider_id="deepseek",
+                model_id="openai/gpt-5.6",
+            )
+
+    def test_runtime_config_merges_models_and_reads_secure_credentials(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir, "config.json")
+            credentials_path = Path(tmpdir, "credentials.json")
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "default_model": "openai/gpt-test",
+                        "providers": {
+                            "openai": {
+                                "default_model": "gpt-test",
+                                "options": {"reasoning_effort": "low"},
+                                "models": {
+                                    "gpt-test": {
+                                        "description": "Test model",
+                                        "context_window_tokens": 10_000,
+                                        "max_output_tokens": 1_000,
+                                    }
+                                },
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            credentials_path.write_text(
+                json.dumps(
+                    {
+                        "deepseek": {"type": "api", "key": "deepseek-file-key"},
+                        "openai": {"type": "api", "key": "openai-file-key"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            os.chmod(credentials_path, 0o600)
+
+            with patch.dict(
+                os.environ,
+                {"DEEPSEEK_API_KEY": "", "OPENAI_API_KEY": ""},
+            ):
+                config = load_runtime_config(config_path, credentials_path)
+                resolved = config.resolve_model()
+                deepseek = config.resolve_model(
+                    model_ref="deepseek/deepseek-v4-flash"
+                )
+
+            self.assertEqual(resolved.model.ref, "openai/gpt-test")
+            self.assertEqual(resolved.api_key, "openai-file-key")
+            self.assertEqual(resolved.options["reasoning_effort"], "low")
+            self.assertEqual(deepseek.api_key, "deepseek-file-key")
+            self.assertEqual(deepseek.options["thinking"], "enabled")
+            self.assertIn("openai/gpt-5.6", [model.ref for model in config.models()])
+
+            with patch.dict(os.environ, {"OPENAI_API_KEY": "environment-key"}):
+                overridden = load_runtime_config(
+                    config_path,
+                    credentials_path,
+                ).resolve_model()
+
+            self.assertEqual(overridden.api_key, "environment-key")
+
+    def test_provider_adapters_do_not_bypass_resolved_credentials(self):
+        with patch.dict(
+            os.environ,
+            {
+                "DEEPSEEK_API_KEY": "unresolved-deepseek-key",
+                "OPENAI_API_KEY": "unresolved-openai-key",
+            },
+        ):
+            deepseek = create_provider_adapter(
+                ProviderConfig(
+                    provider_id="deepseek",
+                    model_id="deepseek-v4-flash",
+                    options={"thinking": "enabled"},
+                )
+            )
+            openai = create_provider_adapter(
+                ProviderConfig(
+                    provider_id="openai",
+                    model_id="gpt-5.6",
+                    options={"reasoning_effort": "medium"},
+                )
+            )
+
+        self.assertIsNone(deepseek.api_key)
+        self.assertIsNone(openai.api_key)
+
+    def test_runtime_config_rejects_readable_credentials_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            credentials_path = Path(tmpdir, "credentials.json")
+            credentials_path.write_text(
+                json.dumps({"openai": {"type": "api", "key": "secret"}}),
+                encoding="utf-8",
+            )
+            os.chmod(credentials_path, 0o644)
+
+            with self.assertRaisesRegex(ValueError, "mode 0600"):
+                load_runtime_config(Path(tmpdir, "config.json"), credentials_path)
+
     def test_list_files_ignores_session_state_directory(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             Path(tmpdir, "app.py").write_text("print('hello')\n", encoding="utf-8")
@@ -155,6 +291,16 @@ class MyAgentTests(unittest.TestCase):
                     AssistantMessage(
                         content="I will inspect first.",
                         reasoning_content="Need repository evidence.",
+                        provider_data={
+                            "openai": {
+                                "input_items": [
+                                    {
+                                        "type": "reasoning",
+                                        "encrypted_content": "opaque",
+                                    }
+                                ]
+                            }
+                        },
                         tool_calls=[
                             ToolCall(
                                 call_id="call_1",
@@ -1336,6 +1482,10 @@ class MyAgentTests(unittest.TestCase):
                     tmpdir,
                     "--sessions-dir",
                     str(Path(tmpdir, "sessions")),
+                    "--config",
+                    str(Path(tmpdir, "config.json")),
+                    "--credentials",
+                    str(Path(tmpdir, "credentials.json")),
                 ],
                 input="/help\n/exit\n",
                 text=True,
@@ -1347,6 +1497,43 @@ class MyAgentTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("/help       Show slash commands", completed.stdout)
         self.assertIn("use Up/Down and Enter to run", completed.stdout)
+
+    def test_chat_config_shows_paths_without_credentials(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            credentials_path = Path(tmpdir, "credentials.json")
+            credentials_path.write_text(
+                json.dumps(
+                    {"openai": {"type": "api", "key": "must-not-be-printed"}}
+                ),
+                encoding="utf-8",
+            )
+            os.chmod(credentials_path, 0o600)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "cli.py",
+                    "chat",
+                    "--workspace",
+                    tmpdir,
+                    "--sessions-dir",
+                    str(Path(tmpdir, "sessions")),
+                    "--config",
+                    str(Path(tmpdir, "config.json")),
+                    "--credentials",
+                    str(credentials_path),
+                ],
+                input="/config\n/exit\n",
+                text=True,
+                capture_output=True,
+                cwd=Path(__file__).resolve().parents[1],
+                check=False,
+            )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("Provider Configuration", completed.stdout)
+        self.assertIn(str(credentials_path), completed.stdout)
+        self.assertIn("deepseek, openai", completed.stdout)
+        self.assertNotIn("must-not-be-printed", completed.stdout)
 
     def test_chat_switches_model_and_persists_it_in_session(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1369,7 +1556,7 @@ class MyAgentTests(unittest.TestCase):
 
                 def select(self, prompt, options, *, current_value=None):
                     self.selections.append((prompt, tuple(options), current_value))
-                    return "deepseek-v4-pro"
+                    return "openai/gpt-5.6"
 
             editor = FakeLineEditor()
             output = io.StringIO()
@@ -1381,22 +1568,33 @@ class MyAgentTests(unittest.TestCase):
                         tmpdir,
                         "--sessions-dir",
                         str(sessions_dir),
+                        "--config",
+                        str(Path(tmpdir, "config.json")),
+                        "--credentials",
+                        str(Path(tmpdir, "credentials.json")),
                     ]
                 )
 
             self.assertEqual(return_code, 0)
-            self.assertIn("model: deepseek/deepseek-v4-pro", output.getvalue())
-            self.assertIn("model=deepseek/deepseek-v4-pro", output.getvalue())
+            self.assertIn("model: openai/gpt-5.6", output.getvalue())
+            self.assertIn("model=openai/gpt-5.6", output.getvalue())
             self.assertEqual(editor.selections[0][0], "model> ")
-            self.assertEqual(editor.selections[0][2], "deepseek-v4-flash")
+            self.assertEqual(
+                editor.selections[0][2],
+                "deepseek/deepseek-v4-flash",
+            )
             self.assertEqual(
                 [option.value for option in editor.selections[0][1]],
-                ["deepseek-v4-flash", "deepseek-v4-pro"],
+                [
+                    "deepseek/deepseek-v4-flash",
+                    "deepseek/deepseek-v4-pro",
+                    "openai/gpt-5.6",
+                ],
             )
             session_id = next(path.name for path in sessions_dir.iterdir() if path.is_dir())
             state = SessionStore(sessions_dir).load(session_id)
-            self.assertEqual(state.provider_id, "deepseek")
-            self.assertEqual(state.model_id, "deepseek-v4-pro")
+            self.assertEqual(state.provider_id, "openai")
+            self.assertEqual(state.model_id, "gpt-5.6")
 
             resumed = subprocess.run(
                 [
@@ -1408,6 +1606,10 @@ class MyAgentTests(unittest.TestCase):
                     tmpdir,
                     "--sessions-dir",
                     str(sessions_dir),
+                    "--config",
+                    str(Path(tmpdir, "config.json")),
+                    "--credentials",
+                    str(Path(tmpdir, "credentials.json")),
                 ],
                 input="/summary\n/exit\n",
                 text=True,
@@ -1417,7 +1619,27 @@ class MyAgentTests(unittest.TestCase):
             )
 
             self.assertEqual(resumed.returncode, 0, resumed.stderr)
-            self.assertIn("model=deepseek/deepseek-v4-pro", resumed.stdout)
+            self.assertIn("model=openai/gpt-5.6", resumed.stdout)
+
+    def test_resume_full_model_reference_overrides_session_provider(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = build_parser().parse_args(
+                ["resume", "session-id", "--model", "openai/gpt-5.6"]
+            )
+            args.runtime_config = load_runtime_config(
+                Path(tmpdir, "config.json"),
+                Path(tmpdir, "credentials.json"),
+            )
+            state = SessionStore(Path(tmpdir, "sessions")).create(tmpdir)
+            state.provider_id = "deepseek"
+            state.model_id = "deepseek-v4-flash"
+
+            _restore_session_model(args, state)
+            model = _build_model(args)
+
+        self.assertEqual(args.provider, None)
+        self.assertEqual(model.profile.provider_id, "openai")
+        self.assertEqual(model.profile.model_id, "gpt-5.6")
 
     def test_stream_renderer_displays_reasoning_content_and_tool_progress(self):
         output = io.StringIO()
@@ -1573,12 +1795,19 @@ class MyAgentTests(unittest.TestCase):
                 "import unittest\n\n"
                 "class EnvironmentTest(unittest.TestCase):\n"
                 "    def test_provider_key_is_absent(self):\n"
-                "        self.assertNotIn('DEEPSEEK_API_KEY', os.environ)\n",
+                "        self.assertNotIn('DEEPSEEK_API_KEY', os.environ)\n"
+                "        self.assertNotIn('OPENAI_API_KEY', os.environ)\n",
                 encoding="utf-8",
             )
             ctx = ToolContext(workspace=Workspace(tmpdir), permissions=PermissionPolicy())
 
-            with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "should-not-leak"}):
+            with patch.dict(
+                os.environ,
+                {
+                    "DEEPSEEK_API_KEY": "should-not-leak",
+                    "OPENAI_API_KEY": "should-not-leak",
+                },
+            ):
                 result = ExecCommandTool().run(
                     {"argv": ["python3", "-m", "unittest", "discover", "-s", "."]},
                     ctx,
@@ -1586,6 +1815,7 @@ class MyAgentTests(unittest.TestCase):
 
             self.assertTrue(result.ok, result.stderr)
             self.assertNotIn("DEEPSEEK_API_KEY", result.metadata["environment_keys"])
+            self.assertNotIn("OPENAI_API_KEY", result.metadata["environment_keys"])
 
     def test_exec_command_reports_nonzero_exit_and_truncates_output(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2334,6 +2564,168 @@ class MyAgentTests(unittest.TestCase):
             "I need to inspect files first.",
         )
 
+    def test_openai_provider_translates_responses_input_and_tools(self):
+        provider = OpenAIAdapter(
+            api_key="test-key",
+            model="gpt-5.6",
+            max_output_tokens=16_000,
+        )
+        native_items = [
+            {
+                "id": "rs_1",
+                "type": "reasoning",
+                "encrypted_content": "opaque",
+                "summary": [],
+            },
+            {
+                "id": "fc_1",
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "list_files",
+                "arguments": "{\"path\":\".\"}",
+            },
+        ]
+        payload = provider.build_payload(
+            ModelRequest(
+                messages=(
+                    UserMessage(content="Inspect files"),
+                    AssistantMessage(
+                        tool_calls=[
+                            ToolCall(
+                                call_id="call_1",
+                                name="list_files",
+                                arguments={"path": "."},
+                            )
+                        ],
+                        provider_data={"openai": {"input_items": native_items}},
+                    ),
+                    ToolResultMessage(
+                        tool_call_id="call_1",
+                        tool_name="list_files",
+                        content="app.py",
+                    ),
+                ),
+                tools=(ListFilesTool().spec(),),
+                system_prompt="system prompt",
+            )
+        )
+
+        self.assertEqual(payload["model"], "gpt-5.6")
+        self.assertEqual(payload["instructions"], "system prompt")
+        self.assertEqual(payload["reasoning"], {"effort": "medium", "summary": "auto"})
+        self.assertEqual(payload["include"], ["reasoning.encrypted_content"])
+        self.assertEqual(payload["max_output_tokens"], 16_000)
+        self.assertEqual(payload["input"][0], {"role": "user", "content": "Inspect files"})
+        self.assertEqual(payload["input"][1:3], native_items)
+        self.assertEqual(
+            payload["input"][3],
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "app.py",
+            },
+        )
+        self.assertEqual(payload["tools"][0]["name"], "list_files")
+        self.assertNotIn("function", payload["tools"][0])
+
+    def test_openai_provider_streams_and_preserves_continuation_items(self):
+        provider = OpenAIAdapter(api_key="test-key", model="gpt-5.6")
+        raw_output = [
+            {
+                "id": "rs_1",
+                "type": "reasoning",
+                "encrypted_content": "opaque",
+                "summary": [{"type": "summary_text", "text": "Inspect first."}],
+            },
+            {
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": "I will inspect the files."}
+                ],
+            },
+            {
+                "id": "fc_1",
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "list_files",
+                "arguments": "{\"path\":\".\"}",
+            },
+        ]
+        stream_events = [
+            {"type": "response.created", "response": {"id": "resp_1"}},
+            {
+                "type": "response.reasoning_summary_text.delta",
+                "delta": "Inspect first.",
+            },
+            {
+                "type": "response.output_text.delta",
+                "delta": "I will inspect the files.",
+            },
+            {
+                "type": "response.output_item.added",
+                "output_index": 2,
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "list_files",
+                    "arguments": "",
+                },
+            },
+            {
+                "type": "response.function_call_arguments.delta",
+                "output_index": 2,
+                "delta": "{\"path\":\".\"}",
+            },
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "model": "gpt-5.6-sol",
+                    "status": "completed",
+                    "output": raw_output,
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 7,
+                        "total_tokens": 17,
+                        "input_tokens_details": {"cached_tokens": 3},
+                        "output_tokens_details": {"reasoning_tokens": 2},
+                    },
+                },
+            },
+        ]
+
+        with patch.object(provider, "_stream_once", return_value=iter(stream_events)):
+            events = list(
+                provider.stream_once(
+                    ModelRequest(
+                        messages=(UserMessage(content="Inspect files"),),
+                        tools=(ListFilesTool().spec(),),
+                    )
+                )
+            )
+
+        response = events[-1].response
+        self.assertIsInstance(events[-1], ModelCompleted)
+        self.assertEqual(
+            [event.text for event in events if isinstance(event, ReasoningDelta)],
+            ["Inspect first."],
+        )
+        self.assertEqual(
+            [event.text for event in events if isinstance(event, TextDelta)],
+            ["I will inspect the files."],
+        )
+        self.assertEqual(response.reasoning, "Inspect first.")
+        self.assertEqual(response.text, "I will inspect the files.")
+        self.assertEqual(response.tool_calls[0].arguments, {"path": "."})
+        self.assertEqual(response.stop_reason, StopReason.TOOL_CALLS)
+        self.assertEqual(response.usage.reasoning_tokens, 2)
+        self.assertEqual(response.usage.cache_read_tokens, 3)
+        self.assertEqual(response.metadata.response_id, "resp_1")
+        self.assertEqual(response.metadata.response_model_id, "gpt-5.6-sol")
+        self.assertEqual(response.provider_data["openai"]["input_items"], raw_output)
+
     def test_model_invoker_retries_transient_error_before_first_delta(self):
         provider = DeepSeekAdapter(
             api_key="test-key",
@@ -2485,6 +2877,17 @@ class MyAgentTests(unittest.TestCase):
         self.assertIsInstance(adapter, DeepSeekAdapter)
         self.assertEqual(adapter.profile.provider_id, "deepseek")
         self.assertEqual(adapter.profile.model_id, "deepseek-v4-flash")
+        openai = create_provider_adapter(
+            ProviderConfig(
+                provider_id="openai",
+                api_key="test-key",
+                model_id="gpt-5.6",
+                options={"reasoning_effort": "low"},
+            )
+        )
+        self.assertIsInstance(openai, OpenAIAdapter)
+        self.assertEqual(openai.profile.provider_id, "openai")
+        self.assertEqual(openai.reasoning_effort, "low")
         with self.assertRaisesRegex(ValueError, "unsupported provider"):
             create_provider_adapter(ProviderConfig(provider_id="unknown"))
 
@@ -2512,6 +2915,34 @@ class MyAgentTests(unittest.TestCase):
             chunks = list(provider._stream_once({"stream": True}, None))
 
         self.assertEqual(chunks[0]["choices"][0]["delta"]["content"], "Hi")
+
+    def test_openai_sse_parser_requires_terminal_event(self):
+        completed = {
+            "type": "response.completed",
+            "response": {"id": "resp_1", "status": "completed", "output": []},
+        }
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return None
+
+            def __iter__(self):
+                return iter(
+                    [
+                        b": keep-alive\n",
+                        b"event: response.completed\n",
+                        f"data: {json.dumps(completed)}\n".encode(),
+                    ]
+                )
+
+        provider = OpenAIAdapter(api_key="test-key")
+        with patch("urllib.request.urlopen", return_value=FakeResponse()):
+            events = list(provider._stream_once({"stream": True}, None))
+
+        self.assertEqual(events, [completed])
 
     def test_make_trajectory_groups_actions_and_observations(self):
         events = [

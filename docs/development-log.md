@@ -226,6 +226,26 @@ CLI 与 agent loop 之间从同步函数调用升级为双向 runtime protocol�
 - 当前 catalog 只包含已接入 provider 的 DeepSeek V4 Flash/Pro；该功能切换 model，不切换
   provider，也不代表其他厂商 adapter 已实现。
 
+## Milestone 15: OpenAI Responses and User Provider Config
+
+provider 选择从编译期常量升级为用户级配置，同时增加第二个真实 wire adapter。
+
+- `config.py` 内置可运行的 DeepSeek/OpenAI provider metadata，并从
+  `~/.config/my-agent/config.json` 合并用户模型；每个模型显式记录 context window 和最大输出。
+- API key 单独从 `credentials.json` 读取，结构为 provider-keyed `type=api` credential，文件权限
+  必须是 `0600`。provider 对应环境变量优先，CLI 不打印 key，也不写入 session/trace。
+- DeepSeek 和 OpenAI 都只接收 config/factory 已解析的 key、模型元数据、base URL 和 options；
+  adapter 不再自行读取环境变量，避免第二套优先级。
+- `OpenAIAdapter` 使用 Responses API，映射 `response.output_text.delta`、reasoning summary、
+  function call arguments、usage、terminal status 和统一错误；adapter 仍只执行一次 HTTP attempt。
+- OpenAI reasoning/tool loop 需要回传原生 response output。canonical `AssistantMessage` 新增 opaque
+  `provider_data`，harness 只持久化；OpenAI adapter 保存并恢复 continuation items，DeepSeek
+  adapter 不读取该字段。
+- `/model` 现在展示配置中的完整 `provider/model`，可以在 idle session 中跨 provider 切换；
+  `/config` 只展示路径、默认模型和 provider IDs。
+- factory 仍是显式 adapter registry。向 config 添加未知 provider 不等于该 provider 已可调用；
+  只有实现并注册 adapter 后才会进入 CLI 可选目录。
+
 ## Current Boundaries
 
 - `apply_patch` 可以自动修改 workspace 内的单个普通 UTF-8/LF 文件。
@@ -236,7 +256,7 @@ CLI 与 agent loop 之间从同步函数调用升级为双向 runtime protocol�
   被允许的项目代码仍可能写文件、读取用户文件或访问网络。
 - `exec_command` 不支持 shell command string、pipe/redirection、stdin、TTY、后台 session、
   package install。
-- context token 是字符启发式估算，不是 DeepSeek tokenizer 的精确结果；compaction 使用
+- context token 是字符启发式估算，不是 provider tokenizer 的精确结果；compaction 使用
   确定性 extractive summary，不是模型生成的语义摘要。
 - context breakdown 同样是估算值；provider usage 只能给出精确总 input，不能反推每类的精确
   tokenizer 计数。
@@ -244,8 +264,8 @@ CLI 与 agent loop 之间从同步函数调用升级为双向 runtime protocol�
 - model cancellation 是协作式检查；底层网络 read 期间可能要等待 I/O 返回或 timeout。
 - `/abort` 只清理 conversation state，不回滚已经执行的文件修改或进程副作用。
 - 本地 `.my-agent/`、`trace.jsonl` 和 `trajectory.json` 默认不提交到 Git。
-- 当前只有 DeepSeek adapter；统一协议和 harness 边界已经可以承接其他模型，但每个厂商仍需实现
-  并测试自己的 wire adapter。
+- 当前实现 DeepSeek Chat Completions 和 OpenAI Responses adapter；其他厂商仍需实现并测试自己的
+  wire adapter。
 
 ## Next Candidates
 
