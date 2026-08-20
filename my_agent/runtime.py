@@ -16,7 +16,9 @@ from .control import (
     raise_if_cancelled,
 )
 from .model_invoker import ModelInvoker
+from .modes import CollaborationMode
 from .session import SessionState
+from .tools import ToolRegistry
 
 
 class RuntimeState(str, Enum):
@@ -33,6 +35,7 @@ class RuntimeState(str, Enum):
 class StartTurn:
     user_input: str = ""
     retry: bool = False
+    approved_plan_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -171,6 +174,14 @@ class AgentRuntime:
             raise RuntimeError("cannot switch model while a turn is pending")
         self.loop.switch_model(model)
 
+    def switch_mode(self, mode: CollaborationMode, tools: ToolRegistry) -> None:
+        with self._lock:
+            if self._worker is not None and self._worker.is_alive():
+                raise RuntimeError("cannot switch mode while a turn is running")
+        if self.session.pending_turn is not None:
+            raise RuntimeError("cannot switch mode while a turn is pending")
+        self.loop.switch_mode(mode, tools)
+
     def wait(self, timeout: float = 5.0) -> None:
         with self._lock:
             worker = self._worker
@@ -231,6 +242,7 @@ class AgentRuntime:
                     event_handler=self._forward_agent_event,
                     cancel_event=cancel_event,
                     approvals=self._approvals,
+                    approved_plan_id=command.approved_plan_id,
                 )
         except TurnInterrupted as exc:
             terminal_kind = "turn_interrupted"
@@ -244,7 +256,12 @@ class AgentRuntime:
             terminal_kind = "turn_completed"
             terminal_state = RuntimeState.COMPLETED
             terminal_text = result.answer
-            terminal_data = {"steps": result.steps, "stopped_by": result.stopped_by}
+            terminal_data = {
+                "steps": result.steps,
+                "stopped_by": result.stopped_by,
+                "mode_id": result.mode_id,
+                "plan_id": result.plan_id,
+            }
             terminal_result = result
         finally:
             with self._lock:

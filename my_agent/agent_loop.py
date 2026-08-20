@@ -16,6 +16,7 @@ from .control import (
 )
 from .messages import AssistantMessage, Message, ToolCall, ToolResultMessage, UserMessage
 from .model_invoker import ModelInvoker, RetryScheduled
+from .modes import BUILD_MODE, CollaborationMode, extract_proposed_plan
 from .permissions import PermissionPolicy
 from .provider import (
     ModelCompleted,
@@ -26,22 +27,10 @@ from .provider import (
     StopReason,
     TextDelta,
 )
-from .session import PendingTurn, SessionState
+from .session import PendingTurn, ProposedPlan, SessionState
 from .tools import ToolContext, ToolRegistry, ToolResult
 from .trace import TraceRecorder
 from .workspace import Workspace
-
-
-DEFAULT_INSTRUCTIONS = """You are a coding agent operating inside one workspace.
-You may inspect files, search the repository, edit files with apply_patch, and run allowlisted
-test, check, or build processes with exec_command.
-Each apply_patch call must change exactly one workspace-relative file.
-Do not modify .git, .my-agent, or paths outside the workspace.
-Pass exec_command one structured argv array; shell operators and command strings are unsupported.
-After editing, inspect the actual changes with git_diff and run the narrowest relevant validation.
-Use read_file when you need the contents of an untracked file reported by git_diff.
-Return a concise result only after checking the changes and test evidence.
-"""
 
 
 @dataclass
@@ -50,6 +39,8 @@ class TurnResult:
     messages: list[Message]
     steps: int
     stopped_by: str
+    mode_id: str = BUILD_MODE.mode_id
+    plan_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -71,7 +62,7 @@ class AgentLoop:
         permissions: PermissionPolicy,
         trace: TraceRecorder,
         max_steps: int = 12,
-        instructions: str = DEFAULT_INSTRUCTIONS,
+        mode: CollaborationMode = BUILD_MODE,
         context_manager: ContextManager | None = None,
     ) -> None:
         self.workspace = workspace
@@ -80,11 +71,15 @@ class AgentLoop:
         self.permissions = permissions
         self.trace = trace
         self.max_steps = max_steps
-        self.instructions = instructions
+        self.mode = mode
         self.context_manager = context_manager or ContextManager(
             context_window_tokens=model.profile.context_window_tokens,
             reserve_output_tokens=model.profile.max_output_tokens,
         )
+
+    @property
+    def instructions(self) -> str:
+        return self.mode.instructions
 
     def run_turn(
         self,
@@ -93,6 +88,7 @@ class AgentLoop:
         event_handler: EventHandler | None = None,
         cancel_event: threading.Event | None = None,
         approvals: ApprovalBroker | None = None,
+        approved_plan_id: str | None = None,
     ) -> TurnResult:
         if state.workspace != str(self.workspace.root):
             raise ValueError(
@@ -101,6 +97,12 @@ class AgentLoop:
             )
         if state.pending_turn is not None:
             raise ValueError("session has a pending turn; use retry_turn() or abandon it")
+        if approved_plan_id is not None:
+            plan = state.proposed_plan
+            if self.mode.mode_id != BUILD_MODE.mode_id:
+                raise ValueError("approved plans can only execute in build mode")
+            if plan is None or plan.plan_id != approved_plan_id or plan.status != "approved":
+                raise ValueError(f"approved plan is not ready to execute: {approved_plan_id}")
         turn_number = sum(isinstance(message, UserMessage) for message in state.messages) + 1
         message_start = len(state.messages)
         state.messages.append(UserMessage(content=user_input))
@@ -108,6 +110,8 @@ class AgentLoop:
             turn_id=f"{state.session_id}:{turn_number}",
             task=user_input,
             message_start=message_start,
+            mode_id=self.mode.mode_id,
+            approved_plan_id=approved_plan_id,
         )
         event_context = {
             "session_id": state.session_id,
@@ -122,6 +126,8 @@ class AgentLoop:
                 "workspace": str(self.workspace.root),
                 "max_steps": self.max_steps,
                 "messages_before_request": len(state.messages),
+                "mode_id": self.mode.mode_id,
+                "approved_plan_id": approved_plan_id,
             },
         )
         self._emit(
@@ -141,6 +147,10 @@ class AgentLoop:
         pending = state.pending_turn
         if pending is None:
             raise ValueError("session has no pending turn to retry")
+        if pending.mode_id != self.mode.mode_id:
+            raise ValueError(
+                f"pending turn requires mode {pending.mode_id}; current mode is {self.mode.mode_id}"
+            )
         self.trace.write(
             "turn_resumed",
             {
@@ -148,6 +158,8 @@ class AgentLoop:
                 "turn_id": pending.turn_id,
                 "step": pending.step,
                 "task": pending.task,
+                "mode_id": pending.mode_id,
+                "approved_plan_id": pending.approved_plan_id,
             },
         )
         self._emit(
@@ -174,8 +186,54 @@ class AgentLoop:
             summary_tokens=current.summary_tokens,
         )
 
+    def switch_mode(self, mode: CollaborationMode, tools: ToolRegistry) -> None:
+        self.mode = mode
+        self.tools = tools
+
+    def approve_plan(self, state: SessionState) -> ProposedPlan:
+        if state.pending_turn is not None:
+            raise ValueError("cannot approve a plan while a turn is pending")
+        plan = state.proposed_plan
+        if plan is None or plan.status != "proposed":
+            raise ValueError("session has no proposed plan to approve")
+        plan.status = "approved"
+        self.trace.write(
+            "plan_approved",
+            {
+                "session_id": state.session_id,
+                "turn_id": plan.source_turn_id,
+                "plan_id": plan.plan_id,
+            },
+        )
+        return plan
+
+    def request_plan_revision(self, state: SessionState) -> ProposedPlan:
+        if state.pending_turn is not None:
+            raise ValueError("cannot revise a plan while a turn is pending")
+        plan = state.proposed_plan
+        if plan is None or plan.status != "proposed":
+            raise ValueError("session has no proposed plan to revise")
+        plan.status = "revising"
+        self.trace.write(
+            "plan_revision_requested",
+            {
+                "session_id": state.session_id,
+                "turn_id": plan.source_turn_id,
+                "plan_id": plan.plan_id,
+            },
+        )
+        return plan
+
     def abort_turn(self, state: SessionState) -> PendingTurn:
         pending = state.abandon_pending_turn()
+        self._finish_plan_execution(
+            state,
+            pending,
+            {"session_id": state.session_id, "turn_id": pending.turn_id},
+            step=pending.step,
+            successful=False,
+            reason="aborted",
+        )
         self.trace.write(
             "turn_aborted",
             {
@@ -236,6 +294,7 @@ class AgentLoop:
                         "model_id": self.model.profile.model_id,
                         "messages": len(snapshot.messages),
                         "tools": self.tools.names(),
+                        "mode_id": self.mode.mode_id,
                         "context": snapshot.to_dict(),
                     },
                 )
@@ -316,6 +375,32 @@ class AgentLoop:
 
             if not reply.tool_calls:
                 answer = reply.text.strip() or "(model returned no final content)"
+                stopped_by = (
+                    "model_length"
+                    if reply.stop_reason is StopReason.LENGTH
+                    else "final_answer"
+                )
+                plan_id = None
+                if self.mode.produces_plan and reply.stop_reason is not StopReason.LENGTH:
+                    plan_content = extract_proposed_plan(answer)
+                    if plan_content is not None:
+                        plan_id = f"{pending.turn_id}:plan"
+                        state.proposed_plan = ProposedPlan(
+                            plan_id=plan_id,
+                            source_turn_id=pending.turn_id,
+                            content=plan_content,
+                        )
+                        answer = plan_content
+                        stopped_by = "proposed_plan"
+                        self.trace.write(
+                            "plan_proposed",
+                            {
+                                **event_context,
+                                "step": step,
+                                "plan_id": plan_id,
+                                "content": plan_content,
+                            },
+                        )
                 messages.append(
                     AssistantMessage(
                         content=answer,
@@ -330,18 +415,28 @@ class AgentLoop:
                         "step": step,
                         "answer": answer,
                         "finish_reason": reply.stop_reason.value,
+                        "mode_id": self.mode.mode_id,
+                        "stopped_by": stopped_by,
+                        "plan_id": plan_id,
                     },
                 )
+                if pending.approved_plan_id is not None:
+                    self._finish_plan_execution(
+                        state,
+                        pending,
+                        event_context,
+                        step=step,
+                        successful=stopped_by == "final_answer",
+                        reason=stopped_by,
+                    )
                 state.pending_turn = None
                 return TurnResult(
                     answer=answer,
                     messages=list(messages),
                     steps=step,
-                    stopped_by=(
-                        "model_length"
-                        if reply.stop_reason is StopReason.LENGTH
-                        else "final_answer"
-                    ),
+                    stopped_by=stopped_by,
+                    mode_id=self.mode.mode_id,
+                    plan_id=plan_id,
                 )
 
             messages.append(
@@ -462,12 +557,49 @@ class AgentLoop:
             "final_answer",
             {**event_context, "step": self.max_steps, "answer": answer},
         )
+        self._finish_plan_execution(
+            state,
+            pending,
+            event_context,
+            step=self.max_steps,
+            successful=False,
+            reason="max_steps",
+        )
         state.pending_turn = None
         return TurnResult(
             answer=answer,
             messages=list(messages),
             steps=self.max_steps,
             stopped_by="max_steps",
+            mode_id=self.mode.mode_id,
+        )
+
+    def _finish_plan_execution(
+        self,
+        state: SessionState,
+        pending: PendingTurn,
+        event_context: dict[str, str],
+        *,
+        step: int,
+        successful: bool,
+        reason: str,
+    ) -> None:
+        plan = state.proposed_plan
+        if (
+            pending.approved_plan_id is None
+            or plan is None
+            or plan.plan_id != pending.approved_plan_id
+        ):
+            return
+        plan.status = "completed" if successful else "proposed"
+        self.trace.write(
+            "plan_completed" if successful else "plan_execution_incomplete",
+            {
+                **event_context,
+                "step": step,
+                "plan_id": plan.plan_id,
+                "reason": reason,
+            },
         )
 
     def _authorize_tool_call(

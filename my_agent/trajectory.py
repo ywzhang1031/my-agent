@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = "my-agent.trajectory.v4"
+SCHEMA_VERSION = "my-agent.trajectory.v5"
 
 
 def read_jsonl_trace(path: str | Path) -> list[dict[str, Any]]:
@@ -50,6 +50,8 @@ def _make_session_trajectory(
             {
                 "turn_id": turn_id,
                 "task": started.get("task", ""),
+                "mode_id": started.get("mode_id", "build"),
+                "approved_plan_id": started.get("approved_plan_id"),
                 "started_at": _first_ts(turn_events),
                 "ended_at": _last_ts(turn_events),
                 "max_steps": started.get("max_steps"),
@@ -67,6 +69,7 @@ def _make_session_trajectory(
                     for error in errors
                 ],
                 "final_answer": final.get("answer", "") if final else "",
+                "plan_events": _make_plan_events(turn_events),
                 "outcome": {
                     "status": (
                         "completed"
@@ -80,6 +83,8 @@ def _make_session_trajectory(
                         else "incomplete"
                     ),
                     "final_step": final.get("step") if final else None,
+                    "stopped_by": final.get("stopped_by") if final else None,
+                    "plan_id": final.get("plan_id") if final else None,
                 },
                 "metrics": _make_metrics(
                     turn_events,
@@ -142,6 +147,7 @@ def _make_step(step: int, events: list[dict[str, Any]]) -> dict[str, Any]:
         "model_request": {
             "messages": model_request.get("messages"),
             "tools": model_request.get("tools", []),
+            "mode_id": model_request.get("mode_id"),
             "context": model_request.get("context", {}),
             "ts": model_request.get("ts"),
         },
@@ -159,6 +165,28 @@ def _make_step(step: int, events: list[dict[str, Any]]) -> dict[str, Any]:
         ],
         "final_answer": final.get("answer") if final else None,
     }
+
+
+def _make_plan_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    lifecycle = {
+        "plan_proposed",
+        "plan_revision_requested",
+        "plan_approved",
+        "plan_completed",
+        "plan_execution_incomplete",
+    }
+    return [
+        {
+            "event": event.get("event"),
+            "plan_id": event.get("plan_id"),
+            "content": event.get("content"),
+            "reason": event.get("reason"),
+            "step": event.get("step"),
+            "ts": event.get("ts"),
+        }
+        for event in events
+        if event.get("event") in lifecycle
+    ]
 
 
 def _make_approvals(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -260,6 +288,21 @@ def _make_metrics(events: list[dict[str, Any]], started_at: float | None, ended_
         ),
         "context_compactions": sum(
             1 for event in events if event.get("event") == "context_compacted"
+        ),
+        "plan_proposals": sum(
+            1 for event in events if event.get("event") == "plan_proposed"
+        ),
+        "plan_approvals": sum(
+            1 for event in events if event.get("event") == "plan_approved"
+        ),
+        "plan_revision_requests": sum(
+            1 for event in events if event.get("event") == "plan_revision_requested"
+        ),
+        "plan_completions": sum(
+            1 for event in events if event.get("event") == "plan_completed"
+        ),
+        "incomplete_plan_executions": sum(
+            1 for event in events if event.get("event") == "plan_execution_incomplete"
         ),
         "tool_calls": sum(1 for event in events if event.get("event") == "tool_call"),
         "failed_tool_calls": sum(

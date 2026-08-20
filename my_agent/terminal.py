@@ -98,6 +98,7 @@ TERMINAL_STYLE = Style.from_dict(
         "bottom-toolbar": "bg:#262626 #bcbcbc",
         "bottom-toolbar.label": "bg:#262626 #87afff bold",
         "bottom-toolbar.model": "bg:#262626 #afff87 bold",
+        "bottom-toolbar.mode": "bg:#262626 #87d7ff bold",
         "bottom-toolbar.pending": "bg:#262626 #ffaf5f bold",
         "bottom-toolbar.hint": "bg:#262626 #8a8a8a",
         "completion-menu.completion": "bg:#303030 #eeeeee",
@@ -208,6 +209,7 @@ def format_context_status(
     *,
     provider_id: str | None = None,
     model_id: str | None = None,
+    mode_id: str | None = None,
     pending: bool = False,
 ) -> list[tuple[str, str]]:
     percent = _format_percent(snapshot.estimated_tokens, snapshot.context_window_tokens)
@@ -218,6 +220,14 @@ def format_context_status(
             [
                 ("class:bottom-toolbar.label", "model "),
                 ("class:bottom-toolbar.model", model_label),
+                ("class:bottom-toolbar.hint", "  |  "),
+            ]
+        )
+    if mode_id:
+        fragments.extend(
+            [
+                ("class:bottom-toolbar.label", "mode "),
+                ("class:bottom-toolbar.mode", mode_id),
                 ("class:bottom-toolbar.hint", "  |  "),
             ]
         )
@@ -296,15 +306,18 @@ class StreamRenderer:
         status_output: TextIO = sys.stderr,
         answer_prefix: str = "assistant> ",
         show_thinking: bool = False,
+        hide_plan_protocol: bool = False,
     ) -> None:
         self.output = output
         self.status_output = status_output
         self.answer_prefix = answer_prefix
         self.show_thinking = show_thinking
+        self.hide_plan_protocol = hide_plan_protocol
         self._line_open = False
         self._mode: str | None = None
         self._model_content_seen = False
         self._reasoning_status_seen = False
+        self._plan_filter = _PlanProtocolFilter() if hide_plan_protocol else None
 
     def handle(self, event: AgentEvent) -> None:
         if event.kind == "model_started":
@@ -312,6 +325,8 @@ class StreamRenderer:
             self._mode = None
             self._model_content_seen = False
             self._reasoning_status_seen = False
+            if self.hide_plan_protocol:
+                self._plan_filter = _PlanProtocolFilter()
         elif event.kind == "reasoning_delta":
             if self.show_thinking:
                 self._write_delta("reasoning", "thinking> ", event.text)
@@ -319,8 +334,14 @@ class StreamRenderer:
                 self._status("thinking...")
                 self._reasoning_status_seen = True
         elif event.kind == "content_delta":
-            self._model_content_seen = True
-            self._write_delta("content", self.answer_prefix, event.text)
+            text = (
+                self._plan_filter.feed(event.text)
+                if self._plan_filter is not None
+                else event.text
+            )
+            if text:
+                self._model_content_seen = True
+                self._write_delta("content", self.answer_prefix, text)
         elif event.kind == "tool_started":
             self._close_line()
             arguments = _short_json(event.data.get("arguments", {}))
@@ -353,6 +374,11 @@ class StreamRenderer:
             self._status(f"error> {event.text}")
 
     def finish(self, fallback_answer: str) -> None:
+        if self._plan_filter is not None:
+            remaining = self._plan_filter.finish()
+            if remaining:
+                self._model_content_seen = True
+                self._write_delta("content", self.answer_prefix, remaining)
         if not self._model_content_seen and fallback_answer:
             self._write_delta("content", self.answer_prefix, fallback_answer)
         self._close_line()
@@ -376,6 +402,83 @@ class StreamRenderer:
     def _status(self, text: str) -> None:
         self.status_output.write(text + "\n")
         self.status_output.flush()
+
+
+class _PlanProtocolFilter:
+    start_tag = "<proposed_plan>"
+    end_tag = "</proposed_plan>"
+
+    def __init__(self) -> None:
+        self._state = "searching"
+        self._buffer = ""
+        self._content_started = False
+
+    def feed(self, text: str) -> str:
+        if not text or self._state == "ended":
+            return ""
+        if self._state == "tagged":
+            return self._feed_tagged(text)
+
+        self._buffer += text
+        start_index = self._buffer.find(self.start_tag)
+        if start_index >= 0:
+            output = self._buffer[:start_index]
+            remainder = self._buffer[start_index + len(self.start_tag) :]
+            self._state = "tagged"
+            self._buffer = ""
+            return output + self._feed_tagged(remainder)
+
+        retained = _partial_tag_suffix_length(self._buffer, self.start_tag)
+        if retained == 0:
+            output = self._buffer
+            self._buffer = ""
+            return output
+        output = self._buffer[:-retained]
+        self._buffer = self._buffer[-retained:]
+        return output
+
+    def finish(self) -> str:
+        if self._state == "searching":
+            output = self._buffer
+            self._buffer = ""
+            return output
+        if self._state == "tagged":
+            output = self._buffer
+            self._buffer = ""
+            return output
+        return ""
+
+    def _feed_tagged(self, text: str) -> str:
+        if not self._content_started:
+            text = text.lstrip()
+            if not text:
+                return ""
+            self._content_started = True
+
+        self._buffer += text
+        end_index = self._buffer.find(self.end_tag)
+        if end_index >= 0:
+            output = self._buffer[:end_index].rstrip()
+            self._buffer = ""
+            self._state = "ended"
+            return output
+
+        retained = _partial_tag_suffix_length(self._buffer, self.end_tag)
+        if retained == 0:
+            output = self._buffer
+            self._buffer = ""
+            return output
+        output = self._buffer[:-retained]
+        self._buffer = self._buffer[-retained:]
+        return output
+
+
+def _partial_tag_suffix_length(text: str, tag: str) -> int:
+    maximum = min(len(text), len(tag) - 1)
+    for length in range(maximum, 0, -1):
+        if text.endswith(tag[:length]):
+            return length
+    return 0
 
 
 def _completion_key_bindings(commands: Iterable[SlashCommand]) -> KeyBindings:

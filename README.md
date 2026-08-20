@@ -1,13 +1,14 @@
 # My Agent
 
-一个从只读诊断 loop 逐步生长出来的最小 coding agent。它现在具备流式模型输出、
-tool 进度、交互审批、可中断/恢复 turn、命令行历史和自动 context compaction。当前主循环是：
+一个从只读诊断 loop 逐步生长出来的最小 coding agent。它现在具备 Plan/Build collaboration
+mode、流式模型输出、tool 进度、交互审批、可中断/恢复 turn、命令行历史和自动 context
+compaction。Build 主循环是：
 
 ```text
 user task -> model -> tool proposal -> approval -> tool result -> model -> final answer
 ```
 
-当前暴露这些工具：
+Build mode 暴露这些工具：
 
 - `list_files`
 - `read_file`
@@ -120,6 +121,41 @@ stdout。之后可以用同一个 ID 继续对话：
 .venv/bin/python cli.py chat --workspace .
 ```
 
+## Collaboration Modes
+
+当前 collaboration mode 是两个显式的 harness 策略，不是让模型在一个无限 ReAct loop 中自行决定
+是否写代码：
+
+- `build`：默认模式，暴露全部读写和受控命令工具，继续执行 model -> tool -> observation loop。
+- `plan`：只暴露 `list_files`、`read_file`、`search`、`git_diff`，不向模型提供 `apply_patch` 或
+  `exec_command`。模型可以多轮探索和澄清，但不能执行实现。
+
+可以启动时指定，也可以在 idle session 中用 `/mode` 的上下方向键选择：
+
+```bash
+.venv/bin/python cli.py chat --workspace . --mode plan
+```
+
+当 Plan mode 给出完整方案时，它必须输出一个完整的 `<proposed_plan>...</proposed_plan>` block。
+这个 block 是 model 和 harness 之间的 completion protocol：provider adapter 只返回普通文本；
+terminal 使用增量过滤器隐藏可能跨多个 chunk 的协议标签，同时实时显示计划正文；`AgentLoop`
+在完整响应结束后提取第一对完整标签中的 block，并把 `ProposedPlan(status=proposed)` 保存到
+`session.json`。模型偶尔添加的标签前引导语或标签后确认话术不会阻止 gate；结束标签后的冗余
+话术不会渲染。普通回答不会生成可审批计划，但仍会正常流式显示，session 会继续停留在 Plan mode。
+
+交互终端会在计划正文之后立即打开 action selector：`Execute plan` 默认高亮，确认后 harness
+将计划标记为 `approved`、切换到 Build mode，并启动一个带 `approved_plan_id` 的新 turn；选择
+`Revise plan` 会把旧计划标记为 `revising`，保持 Plan mode，等待用户输入修改意见。模型必须重新
+输出完整计划后才会再次进入 `proposed`，旧计划不能直接执行。按 `Esc` 会保留 proposed plan，
+稍后仍可执行 `/approve`。非交互终端不会阻塞等待 selector，也会提示使用 `/approve` 或继续修改。
+
+只有关联的 Build turn 返回真正的 final answer，计划才变为 `completed`；model error 保留 pending
+turn 供 `/retry`，`/abort`、输出截断或 `max_steps` 会把计划恢复为 `proposed`，允许再次审批。
+
+collaboration mode 与 permission mode 是两个不同维度。本版 `/mode` 只选择任务协作方式；
+`allow_once`、`allow_session` 和 `deny` 仍由独立 approval policy 控制。类似 `acceptEdits`、
+`dontAsk`、`bypassPermissions` 的权限模式，以及 Explore/Review/subagent，都没有混入这两个 mode。
+
 `chat` 和 `resume` 中，`apply_patch` 与 `exec_command` 在执行前会暂停当前 turn 并要求审批：
 
 - `y` / `once`：只允许本次调用
@@ -141,6 +177,8 @@ REPL 支持这些本地命令：
 - `/tools`：列出可用工具
 - `/context`：查看估算的 context 使用量和 compaction 状态
 - `/model`：打开模型选择器，用上下方向键选择、`Enter` 切换、`Esc` 取消
+- `/mode`：用同样的选择器切换 Build/Plan；running 或 pending turn 存在时拒绝切换
+- `/approve`：执行保留的 proposed plan，主要用于取消 selector、恢复 session 或非 TTY 场景
 - `/config`：显示实际配置/凭据路径、默认模型和已解析 provider，不显示 API key
 - `/retry`：从失败的 model step 恢复，不重复用户消息或已完成 tool
 - `/abort`：丢弃 pending turn 的消息；已经产生的文件或进程副作用不会回滚
@@ -149,9 +187,9 @@ REPL 支持这些本地命令：
 REPL 使用 `prompt_toolkit`，支持左右移动光标、行内插入和上下方向键历史。输入 `/` 会显示
 全部 slash commands 及说明；菜单打开时用上下方向键移动，按 `Enter` 直接执行选中的命令。
 `Tab`/`Shift-Tab` 仍可用于正向或反向补全。执行 `/model` 后会直接打开模型选择器，当前模型
-默认高亮；用上下方向键移动并按 `Enter` 确认，不需要手动输入 model ID。底部状态栏持续显示当前
-`provider/model`、context 百分比、估算用量和 pending 状态。历史保存在 `.my-agent/history`，
-权限设为 `0600`。
+默认高亮；用上下方向键移动并按 `Enter` 确认，不需要手动输入 model ID。`/mode` 使用相同交互。
+底部状态栏持续显示当前 `provider/model`、collaboration mode、context 百分比、估算用量和 pending
+状态。历史保存在 `.my-agent/history`，权限设为 `0600`。
 输入过程中按 `Ctrl-C` 只清空当前行；turn 运行或等待审批时按 `Ctrl-C` 会发送
 `InterruptTurn`。中断后的 pending turn 可以执行 `/retry` 继续，或用 `/abort` 丢弃。
 模型调用失败后同样可以执行 `/retry` 或 `/abort`。
@@ -215,6 +253,7 @@ OpenAI reasoning 默认使用配置中的 `medium` effort 和 `auto` summary，�
 - `session.py`：序列化统一 `Message`、context 状态和可重试的 `PendingTurn`
 - `config.py`：合并内置模型目录、用户 provider 配置和独立凭据，并解析 `provider/model`
 - `context.py`：估算 token、保留 active turn，并摘要压缩较老的 completed turns
+- `modes.py`：定义 collaboration mode 的 system instructions、tool allowlist 和 plan completion protocol
 - `agent_loop.py`：维护 model -> tool -> observation -> model 循环，并发出统一 `AgentEvent`
 - `provider.py`：定义厂商无关的 request、typed event、ordered output、usage、metadata、
   capability 和 classified error
@@ -235,6 +274,8 @@ OpenAI reasoning 默认使用配置中的 `medium` effort 和 `auto` summary，�
 
 ```text
 CLI loads SessionState
+  -> resolves the persisted collaboration mode
+     -> builds a mode-specific ToolRegistry and system prompt
   -> CLI sends StartTurn to AgentRuntime
   -> AgentRuntime starts one worker and publishes lifecycle events
   -> AgentLoop appends UserMessage
@@ -247,6 +288,7 @@ CLI loads SessionState
   -> typed ModelEvent deltas become AgentEvent and terminal output
   -> ModelCompleted contains ordered text/reasoning/tool-call output plus usage/metadata
   -> AgentLoop either accepts a final answer
+     -> in Plan mode, a complete proposed_plan block becomes persisted ProposedPlan state
      or asks ToolRegistry to validate and describe every tool call
   -> write/exec action becomes PermissionRequest
      -> CLI receives approval_requested
@@ -258,6 +300,14 @@ CLI loads SessionState
   -> after edits, git_diff exposes the actual working-tree delta
   -> exec_command runs the narrowest allowlisted validation
   -> CLI saves messages, trace, and trajectory
+
+Plan approval is a separate transition:
+
+proposed plan -> action selector -> Execute -> Build -> StartTurn(approved_plan_id)
+                              \-> Revise -> revising -> new proposed plan
+                              \-> Esc -> keep proposed for /approve
+Build execution -> final answer: completed
+                -> abort/length/max_steps: proposed again
 ```
 
 `AgentRuntime` 是 CLI 和 harness 的双向边界。输入命令目前是 `StartTurn`、
@@ -284,8 +334,10 @@ adapter 标记为 retryable 的错误。provider adapter 本身从不循环重�
 命令仍会执行仓库中的代码，因此仍可能写文件、访问用户可读路径或尝试网络访问。
 交互 approval 表达用户意图，也不改变这一安全边界。
 
-`final_answer` 仍然是 harness 的判断：当规范化后的 `ModelResponse.tool_calls`
-为空时，这次 turn 完成。它不代表整个 session 结束；是否继续下一轮由 CLI REPL 决定。
+`final_answer` 仍然是 harness 的判断：当规范化后的 `ModelResponse.tool_calls` 为空时，这次 turn
+完成。Plan mode 在这个分支上进一步检查 completion protocol，区分普通回答与 `proposed_plan`；
+provider API 层不判断任务或计划是否完成。turn 完成不代表整个 session 结束，是否继续下一轮由
+CLI REPL 决定。
 
 ## Adding a Provider
 
@@ -329,8 +381,8 @@ PYTHONPATH=. python3 scripts/export_trajectory.py \
   --output "$WORKSPACE/.my-agent/sessions/$SESSION_ID/trajectory.json"
 ```
 
-`trace.jsonl` 是原始事件流；导出的 `trajectory.json` 使用
-`my-agent.trajectory.v4`，先按 turn 分组，再按 step 分组，避免不同
-turn 中相同 step 编号发生碰撞。每轮结束后会自动刷新 `trajectory.json`，手动导出主要
-用于重新生成或校验现有 session trajectory。v4 在 context snapshot、provider retry 和
-turn error/abort 基础上，增加 approvals、interrupted outcome 及对应 metrics。
+`trace.jsonl` 是原始事件流；导出的 `trajectory.json` 使用 `my-agent.trajectory.v5`，先按 turn
+分组，再按 step 分组，避免不同 turn 中相同 step 编号发生碰撞。每轮结束后会自动刷新
+`trajectory.json`，手动导出主要用于重新生成或校验现有 session trajectory。v5 为每个 turn
+增加 `mode_id`、`approved_plan_id`、`stopped_by`、`plan_events` 和 plan lifecycle metrics；
+approval、interruption 和 context 字段继续保留。

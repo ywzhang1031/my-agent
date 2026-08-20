@@ -21,6 +21,7 @@ from prompt_toolkit.output import DummyOutput
 from my_agent.agent_loop import AgentEvent, AgentLoop
 from my_agent.cli import (
     _build_model,
+    _restore_session_mode,
     _restore_session_model,
     build_parser,
     build_tool_registry,
@@ -31,6 +32,7 @@ from my_agent.context import ContextManager, estimate_text_tokens
 from my_agent.control import ApprovalDecision, raise_if_cancelled
 from my_agent.messages import AssistantMessage, ToolCall, ToolResultMessage, UserMessage
 from my_agent.model_invoker import ModelInvoker, RetryPolicy, RetryScheduled
+from my_agent.modes import BUILD_MODE, PLAN_MODE, extract_proposed_plan, get_mode
 from my_agent.permissions import PermissionPolicy
 from my_agent.provider import (
     ModelCompleted,
@@ -57,7 +59,7 @@ from my_agent.runtime import (
     RuntimeState,
     StartTurn,
 )
-from my_agent.session import PendingTurn, SessionStore
+from my_agent.session import PendingTurn, ProposedPlan, SessionStore
 from my_agent.terminal import (
     LineEditor,
     SelectionCompleter,
@@ -322,6 +324,13 @@ class MyAgentTests(unittest.TestCase):
             state.last_output_tokens = 45
             state.provider_id = "deepseek"
             state.model_id = "deepseek-v4-pro"
+            state.mode_id = "build"
+            state.proposed_plan = ProposedPlan(
+                plan_id=f"{state.session_id}:1:plan",
+                source_turn_id=f"{state.session_id}:1",
+                content="# Plan\n\nUpdate app.py.",
+                status="approved",
+            )
             state.messages.append(UserMessage(content="Retry this request"))
             state.pending_turn = PendingTurn(
                 turn_id=f"{state.session_id}:2",
@@ -330,6 +339,8 @@ class MyAgentTests(unittest.TestCase):
                 step=2,
                 tool_calls_executed=1,
                 seen_calls={"call-key": 1},
+                mode_id="build",
+                approved_plan_id=state.proposed_plan.plan_id,
             )
 
             store.save(state)
@@ -344,6 +355,8 @@ class MyAgentTests(unittest.TestCase):
             self.assertEqual(loaded.last_output_tokens, 45)
             self.assertEqual(loaded.provider_id, "deepseek")
             self.assertEqual(loaded.model_id, "deepseek-v4-pro")
+            self.assertEqual(loaded.mode_id, "build")
+            self.assertEqual(loaded.proposed_plan, state.proposed_plan)
             self.assertEqual(loaded.pending_turn, state.pending_turn)
             self.assertTrue(loaded.metadata_path.exists())
             self.assertTrue(loaded.messages_path.exists())
@@ -466,7 +479,7 @@ class MyAgentTests(unittest.TestCase):
                 {state.session_id + ":1"},
             )
             trajectory = make_trajectory(trace_events, source_path=state.trace_path)
-            self.assertEqual(trajectory["schema_version"], "my-agent.trajectory.v4")
+            self.assertEqual(trajectory["schema_version"], "my-agent.trajectory.v5")
             self.assertEqual(trajectory["turns"][0]["outcome"]["status"], "completed")
             self.assertEqual(len(trajectory["turns"][0]["errors"]), 1)
             self.assertEqual(trajectory["metrics"]["turn_errors"], 1)
@@ -587,6 +600,209 @@ class MyAgentTests(unittest.TestCase):
             self.assertEqual(state.messages, [])
             self.assertEqual(trajectory["turns"][0]["outcome"]["status"], "aborted")
             self.assertEqual(trajectory["metrics"]["turn_aborts"], 1)
+
+    def test_plan_mode_proposes_approved_plan_then_build_completes_it(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace_path = Path(tmpdir, "workspace")
+            workspace_path.mkdir()
+            state = SessionStore(Path(tmpdir, "sessions")).create(workspace_path)
+            plan_provider = ScriptedProviderAdapter(
+                [
+                    _model_response(
+                        content=(
+                            "<proposed_plan>\n"
+                            "# Plan\n\n"
+                            "1. Update `app.py`.\n"
+                            "2. Run the focused test.\n"
+                            "</proposed_plan>"
+                        )
+                    )
+                ]
+            )
+            plan_loop = AgentLoop(
+                workspace=Workspace(workspace_path),
+                model=_model(plan_provider),
+                tools=build_tool_registry(PLAN_MODE),
+                permissions=PermissionPolicy(),
+                trace=TraceRecorder(state.trace_path),
+                mode=PLAN_MODE,
+            )
+
+            planned = plan_loop.run_turn(state, "Plan the change")
+            approved = plan_loop.approve_plan(state)
+
+            build_provider = ScriptedProviderAdapter(
+                [_model_response(content="Implemented and validated the change.")]
+            )
+            build_loop = AgentLoop(
+                workspace=Workspace(workspace_path),
+                model=_model(build_provider),
+                tools=build_tool_registry(BUILD_MODE),
+                permissions=PermissionPolicy(),
+                trace=TraceRecorder(state.trace_path),
+                mode=BUILD_MODE,
+            )
+            built = build_loop.run_turn(
+                state,
+                "Execute the approved plan.",
+                approved_plan_id=approved.plan_id,
+            )
+            events = read_jsonl_trace(state.trace_path)
+
+            self.assertEqual(planned.stopped_by, "proposed_plan")
+            self.assertEqual(planned.answer, approved.content)
+            self.assertNotIn("<proposed_plan>", state.messages[1].content)
+            self.assertEqual(plan_provider.requests[0].system_prompt, PLAN_MODE.instructions)
+            self.assertEqual(
+                sorted(tool.name for tool in plan_provider.requests[0].tools),
+                ["git_diff", "list_files", "read_file", "search"],
+            )
+            self.assertEqual(built.stopped_by, "final_answer")
+            self.assertEqual(state.proposed_plan.status, "completed")
+            trajectory = make_trajectory(events, state.trace_path)
+            self.assertEqual(trajectory["schema_version"], "my-agent.trajectory.v5")
+            self.assertEqual(trajectory["turns"][0]["mode_id"], "plan")
+            self.assertEqual(
+                trajectory["turns"][0]["outcome"]["stopped_by"],
+                "proposed_plan",
+            )
+            self.assertEqual(trajectory["turns"][1]["mode_id"], "build")
+            self.assertEqual(
+                trajectory["turns"][1]["approved_plan_id"],
+                approved.plan_id,
+            )
+            self.assertEqual(trajectory["metrics"]["plan_proposals"], 1)
+            self.assertEqual(trajectory["metrics"]["plan_approvals"], 1)
+            self.assertEqual(trajectory["metrics"]["plan_completions"], 1)
+            self.assertEqual(
+                [
+                    event["event"]
+                    for event in events
+                    if event["event"]
+                    in {"plan_proposed", "plan_approved", "plan_completed"}
+                ],
+                ["plan_proposed", "plan_approved", "plan_completed"],
+            )
+
+    def test_aborted_plan_execution_returns_plan_to_proposed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace_path = Path(tmpdir, "workspace")
+            workspace_path.mkdir()
+            state = SessionStore(Path(tmpdir, "sessions")).create(workspace_path)
+            state.proposed_plan = ProposedPlan(
+                plan_id=f"{state.session_id}:1:plan",
+                source_turn_id=f"{state.session_id}:1",
+                content="# Plan\n\nUpdate app.py.",
+                status="approved",
+            )
+            loop = AgentLoop(
+                workspace=Workspace(workspace_path),
+                model=_model(ScriptedProviderAdapter([ModelError("failed")])),
+                tools=build_tool_registry(BUILD_MODE),
+                permissions=PermissionPolicy(),
+                trace=TraceRecorder(state.trace_path),
+                mode=BUILD_MODE,
+            )
+
+            with self.assertRaises(ModelError):
+                loop.run_turn(
+                    state,
+                    "Execute the approved plan.",
+                    approved_plan_id=state.proposed_plan.plan_id,
+                )
+            loop.abort_turn(state)
+
+            self.assertEqual(state.proposed_plan.status, "proposed")
+            events = read_jsonl_trace(state.trace_path)
+            incomplete = next(
+                event for event in events if event["event"] == "plan_execution_incomplete"
+            )
+            self.assertEqual(incomplete["reason"], "aborted")
+
+    def test_truncated_plan_execution_does_not_mark_plan_completed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace_path = Path(tmpdir, "workspace")
+            workspace_path.mkdir()
+            state = SessionStore(Path(tmpdir, "sessions")).create(workspace_path)
+            state.proposed_plan = ProposedPlan(
+                plan_id=f"{state.session_id}:1:plan",
+                source_turn_id=f"{state.session_id}:1",
+                content="# Plan\n\nUpdate app.py.",
+                status="approved",
+            )
+            loop = AgentLoop(
+                workspace=Workspace(workspace_path),
+                model=_model(
+                    ScriptedProviderAdapter(
+                        [_model_response(content="Partial result", finish_reason="length")]
+                    )
+                ),
+                tools=build_tool_registry(BUILD_MODE),
+                permissions=PermissionPolicy(),
+                trace=TraceRecorder(state.trace_path),
+                mode=BUILD_MODE,
+            )
+
+            result = loop.run_turn(
+                state,
+                "Execute the approved plan.",
+                approved_plan_id=state.proposed_plan.plan_id,
+            )
+
+            self.assertEqual(result.stopped_by, "model_length")
+            self.assertEqual(state.proposed_plan.status, "proposed")
+            incomplete = next(
+                event
+                for event in read_jsonl_trace(state.trace_path)
+                if event["event"] == "plan_execution_incomplete"
+            )
+            self.assertEqual(incomplete["reason"], "model_length")
+
+    def test_plan_revision_requires_a_new_proposal_before_approval(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace_path = Path(tmpdir, "workspace")
+            workspace_path.mkdir()
+            store = SessionStore(Path(tmpdir, "sessions"))
+            state = store.create(workspace_path)
+            loop = AgentLoop(
+                workspace=Workspace(workspace_path),
+                model=_model(
+                    ScriptedProviderAdapter(
+                        [
+                            _model_response(
+                                content=(
+                                    "<proposed_plan>\n# Plan\n\nUpdate app.py.\n"
+                                    "</proposed_plan>"
+                                )
+                            )
+                        ]
+                    )
+                ),
+                tools=build_tool_registry(PLAN_MODE),
+                permissions=PermissionPolicy(),
+                trace=TraceRecorder(state.trace_path),
+                mode=PLAN_MODE,
+            )
+
+            loop.run_turn(state, "Plan the change")
+            loop.request_plan_revision(state)
+            store.save(state)
+
+            self.assertEqual(state.proposed_plan.status, "revising")
+            with self.assertRaisesRegex(ValueError, "no proposed plan to approve"):
+                loop.approve_plan(state)
+            self.assertEqual(
+                store.load(state.session_id).proposed_plan.status,
+                "revising",
+            )
+            trajectory = make_trajectory(
+                read_jsonl_trace(state.trace_path), state.trace_path
+            )
+            self.assertEqual(trajectory["metrics"]["plan_revision_requests"], 1)
+            self.assertEqual(
+                trajectory["turns"][0]["plan_events"][-1]["event"],
+                "plan_revision_requested",
+            )
 
     def test_agent_runtime_waits_for_patch_approval_then_resumes_same_turn(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1455,6 +1671,7 @@ class MyAgentTests(unittest.TestCase):
                     snapshot,
                     provider_id="deepseek",
                     model_id="deepseek-v4-flash",
+                    mode_id="plan",
                 )
             )
 
@@ -1466,6 +1683,7 @@ class MyAgentTests(unittest.TestCase):
             self.assertIn("Protocol overhead", panel)
             self.assertIn("Last provider input", panel)
             self.assertIn("model deepseek/deepseek-v4-flash", toolbar)
+            self.assertIn("mode plan", toolbar)
             self.assertIn("context", toolbar)
             self.assertIn("/ commands", toolbar)
             self.assertIn("Up/Down select", toolbar)
@@ -1621,6 +1839,188 @@ class MyAgentTests(unittest.TestCase):
             self.assertEqual(resumed.returncode, 0, resumed.stderr)
             self.assertIn("model=openai/gpt-5.6", resumed.stdout)
 
+    def test_chat_switches_mode_and_persists_plan_tool_boundary(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sessions_dir = Path(tmpdir, "sessions")
+
+            class FakeLineEditor:
+                supports_interactive_selection = True
+
+                def __init__(self):
+                    self.inputs = iter(["/mode", "/summary", "/tools", "/exit"])
+                    self.selections = []
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, traceback):
+                    return None
+
+                def read(self, prompt):
+                    return next(self.inputs)
+
+                def select(self, prompt, options, *, current_value=None):
+                    self.selections.append((prompt, tuple(options), current_value))
+                    return "plan"
+
+            editor = FakeLineEditor()
+            output = io.StringIO()
+            with patch("my_agent.cli.LineEditor", return_value=editor), redirect_stdout(output):
+                return_code = main(
+                    [
+                        "chat",
+                        "--workspace",
+                        tmpdir,
+                        "--sessions-dir",
+                        str(sessions_dir),
+                        "--config",
+                        str(Path(tmpdir, "config.json")),
+                        "--credentials",
+                        str(Path(tmpdir, "credentials.json")),
+                    ]
+                )
+
+            self.assertEqual(return_code, 0)
+            self.assertIn("mode: plan", output.getvalue())
+            self.assertIn("mode=plan", output.getvalue())
+            self.assertEqual(editor.selections[0][0], "mode> ")
+            self.assertEqual(editor.selections[0][2], "build")
+            self.assertEqual(
+                [option.value for option in editor.selections[0][1]],
+                ["build", "plan"],
+            )
+            session_id = next(path.name for path in sessions_dir.iterdir() if path.is_dir())
+            state = SessionStore(sessions_dir).load(session_id)
+            self.assertEqual(state.mode_id, "plan")
+            tool_lines = {
+                line
+                for line in output.getvalue().splitlines()
+                if line in build_tool_registry(BUILD_MODE).names()
+            }
+            self.assertEqual(
+                tool_lines,
+                {"git_diff", "list_files", "read_file", "search"},
+            )
+
+    def test_chat_offers_plan_action_and_executes_selected_plan(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sessions_dir = Path(tmpdir, "sessions")
+            provider = ScriptedProviderAdapter(
+                [
+                    _model_response(
+                        content=(
+                            "I prepared the implementation plan.\n"
+                            "<proposed_plan>\n"
+                            "# Plan\n\n"
+                            "1. Inspect the target.\n"
+                            "2. Implement and validate.\n"
+                            "</proposed_plan>\n\n"
+                            "Tell me if you want changes; otherwise I can execute it."
+                        )
+                    ),
+                    _model_response(content="Implemented and validated."),
+                ]
+            )
+
+            def fake_build_runtime(args, workspace, trace_path):
+                mode = get_mode(args.mode)
+                registry = build_tool_registry(mode)
+                return (
+                    AgentLoop(
+                        workspace=workspace,
+                        model=_model(provider),
+                        tools=registry,
+                        permissions=PermissionPolicy(),
+                        trace=TraceRecorder(trace_path),
+                        max_steps=args.max_steps,
+                        mode=mode,
+                    ),
+                    registry,
+                )
+
+            class FakeLineEditor:
+                supports_interactive_selection = True
+
+                def __init__(self):
+                    self.inputs = iter(["Plan this change", "/exit"])
+                    self.selections = []
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, traceback):
+                    return None
+
+                def read(self, prompt):
+                    return next(self.inputs)
+
+                def select(self, prompt, options, *, current_value=None):
+                    self.selections.append((prompt, tuple(options), current_value))
+                    return "Execute plan"
+
+            editor = FakeLineEditor()
+            output = io.StringIO()
+            status_output = io.StringIO()
+            with patch("my_agent.cli.LineEditor", return_value=editor), patch(
+                "my_agent.cli._build_runtime", side_effect=fake_build_runtime
+            ), patch(
+                "my_agent.cli.StreamRenderer",
+                side_effect=lambda **kwargs: StreamRenderer(
+                    output=output,
+                    status_output=status_output,
+                    **kwargs,
+                ),
+            ), redirect_stdout(output):
+                return_code = main(
+                    [
+                        "chat",
+                        "--mode",
+                        "plan",
+                        "--workspace",
+                        tmpdir,
+                        "--sessions-dir",
+                        str(sessions_dir),
+                        "--config",
+                        str(Path(tmpdir, "config.json")),
+                        "--credentials",
+                        str(Path(tmpdir, "credentials.json")),
+                    ]
+                )
+
+            self.assertEqual(return_code, 0)
+            self.assertIn("# Plan", output.getvalue())
+            self.assertIn("plan approved:", output.getvalue())
+            self.assertIn("assistant> Implemented and validated.", output.getvalue())
+            self.assertNotIn("Tell me if you want changes", output.getvalue())
+            self.assertEqual(editor.selections[0][0], "plan> ")
+            self.assertEqual(editor.selections[0][2], "Execute plan")
+            self.assertEqual(
+                [option.value for option in editor.selections[0][1]],
+                ["Execute plan", "Revise plan"],
+            )
+            self.assertEqual(len(provider.requests), 2)
+            session_id = next(path.name for path in sessions_dir.iterdir() if path.is_dir())
+            state = SessionStore(sessions_dir).load(session_id)
+            self.assertEqual(state.mode_id, "build")
+            self.assertEqual(state.proposed_plan.status, "completed")
+
+    def test_pending_turn_requires_its_persisted_mode(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = build_parser().parse_args(
+                ["resume", "session-id", "--mode", "build"]
+            )
+            state = SessionStore(Path(tmpdir, "sessions")).create(tmpdir)
+            state.mode_id = "plan"
+            state.pending_turn = PendingTurn(
+                turn_id=f"{state.session_id}:1",
+                task="Plan this change",
+                message_start=0,
+                mode_id="plan",
+            )
+
+            with self.assertRaisesRegex(ValueError, "pending turn requires mode plan"):
+                _restore_session_mode(args, state)
+
     def test_resume_full_model_reference_overrides_session_provider(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             args = build_parser().parse_args(
@@ -1674,11 +2074,78 @@ class MyAgentTests(unittest.TestCase):
         self.assertIn("tool> read_file", status.getvalue())
         self.assertIn("tool< read_file success", status.getvalue())
 
+    def test_stream_renderer_streams_plan_content_and_hides_fragmented_protocol(self):
+        output = io.StringIO()
+        renderer = StreamRenderer(
+            output=output,
+            status_output=io.StringIO(),
+            answer_prefix="assistant> ",
+            hide_plan_protocol=True,
+        )
+        plan = "# Plan\n\nUpdate app.py and run focused tests."
+
+        renderer.handle(AgentEvent(kind="model_started"))
+        renderer.handle(
+            AgentEvent(kind="content_delta", text="Here is the plan.\n<pro")
+        )
+        self.assertEqual(output.getvalue(), "assistant> Here is the plan.\n")
+        renderer.handle(
+            AgentEvent(
+                kind="content_delta",
+                text="posed_plan>\n# Plan\n\nUpdate app.py and run focused tests.",
+            )
+        )
+        self.assertIn("# Plan", output.getvalue())
+        self.assertNotIn("proposed_plan", output.getvalue())
+        renderer.handle(AgentEvent(kind="content_delta", text="</proposed"))
+        renderer.handle(
+            AgentEvent(kind="content_delta", text="_plan>\nConfirm and I will execute it.")
+        )
+        renderer.finish(plan)
+
+        self.assertEqual(output.getvalue(), f"assistant> Here is the plan.\n{plan}\n")
+
+    def test_stream_renderer_streams_ordinary_plan_reply_without_waiting(self):
+        output = io.StringIO()
+        renderer = StreamRenderer(
+            output=output,
+            status_output=io.StringIO(),
+            answer_prefix="assistant> ",
+            hide_plan_protocol=True,
+        )
+
+        renderer.handle(AgentEvent(kind="model_started"))
+        renderer.handle(AgentEvent(kind="content_delta", text="Which file should change?"))
+
+        self.assertEqual(output.getvalue(), "assistant> Which file should change?")
+        renderer.finish("Which file should change?")
+        self.assertEqual(output.getvalue(), "assistant> Which file should change?\n")
+
     def test_default_tool_registry_exposes_current_tools(self):
         self.assertEqual(
             build_tool_registry().names(),
             ["apply_patch", "exec_command", "git_diff", "list_files", "read_file", "search"],
         )
+
+    def test_plan_mode_exposes_only_read_only_tools_and_extracts_wrapped_protocol(self):
+        self.assertEqual(
+            build_tool_registry(PLAN_MODE).names(),
+            ["git_diff", "list_files", "read_file", "search"],
+        )
+        self.assertEqual(get_mode("plan"), PLAN_MODE)
+        self.assertEqual(
+            extract_proposed_plan("<proposed_plan>\n# Plan\n</proposed_plan>"),
+            "# Plan",
+        )
+        self.assertEqual(
+            extract_proposed_plan(
+                "Here is the plan:\n<proposed_plan>a plan</proposed_plan>\nConfirm?"
+            ),
+            "a plan",
+        )
+        self.assertIsNone(extract_proposed_plan("<proposed_plan>missing end tag"))
+        with self.assertRaisesRegex(ValueError, "unknown collaboration mode"):
+            get_mode("review")
 
     def test_agent_loop_exposes_only_session_turn_entrypoint(self):
         self.assertFalse(hasattr(AgentLoop, "run"))
@@ -3050,7 +3517,7 @@ class MyAgentTests(unittest.TestCase):
 
         self.assertEqual(
             trajectory["schema_version"],
-            "my-agent.trajectory.v4",
+            "my-agent.trajectory.v5",
         )
         self.assertEqual(trajectory["workspace"], "/tmp/repo")
         turn = trajectory["turns"][0]
@@ -3160,7 +3627,7 @@ class MyAgentTests(unittest.TestCase):
 
         self.assertEqual(
             trajectory["schema_version"],
-            "my-agent.trajectory.v4",
+            "my-agent.trajectory.v5",
         )
         self.assertEqual(trajectory["session_id"], "session-1")
         self.assertEqual(len(trajectory["turns"]), 2)

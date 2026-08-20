@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .messages import AssistantMessage, Message, ToolCall, ToolResultMessage, UserMessage
+from .modes import BUILD_MODE
 
 
 @dataclass
@@ -19,6 +20,16 @@ class PendingTurn:
     step: int = 1
     tool_calls_executed: int = 0
     seen_calls: dict[str, int] = field(default_factory=dict)
+    mode_id: str = BUILD_MODE.mode_id
+    approved_plan_id: str | None = None
+
+
+@dataclass
+class ProposedPlan:
+    plan_id: str
+    source_turn_id: str
+    content: str
+    status: str = "proposed"
 
 
 @dataclass
@@ -35,6 +46,8 @@ class SessionState:
     last_output_tokens: int = 0
     provider_id: str | None = None
     model_id: str | None = None
+    mode_id: str = BUILD_MODE.mode_id
+    proposed_plan: ProposedPlan | None = None
     pending_turn: PendingTurn | None = None
 
     @property
@@ -133,6 +146,8 @@ class SessionStore:
             last_output_tokens=int(metadata.get("last_output_tokens", 0)),
             provider_id=metadata.get("provider_id"),
             model_id=metadata.get("model_id"),
+            mode_id=str(metadata.get("mode_id", BUILD_MODE.mode_id)),
+            proposed_plan=_proposed_plan_from_dict(metadata.get("proposed_plan")),
             pending_turn=_pending_turn_from_dict(metadata.get("pending_turn")),
         )
 
@@ -151,6 +166,8 @@ class SessionStore:
             "last_output_tokens": state.last_output_tokens,
             "provider_id": state.provider_id,
             "model_id": state.model_id,
+            "mode_id": state.mode_id,
+            "proposed_plan": _proposed_plan_to_dict(state.proposed_plan),
             "pending_turn": _pending_turn_to_dict(state.pending_turn),
         }
         state.metadata_path.write_text(
@@ -249,6 +266,8 @@ def _pending_turn_to_dict(pending: PendingTurn | None) -> dict[str, Any] | None:
         "step": pending.step,
         "tool_calls_executed": pending.tool_calls_executed,
         "seen_calls": pending.seen_calls,
+        "mode_id": pending.mode_id,
+        "approved_plan_id": pending.approved_plan_id,
     }
 
 
@@ -264,4 +283,33 @@ def _pending_turn_from_dict(data: Any) -> PendingTurn | None:
         step=int(data.get("step", 1)),
         tool_calls_executed=int(data.get("tool_calls_executed", 0)),
         seen_calls={str(key): int(value) for key, value in data.get("seen_calls", {}).items()},
+        mode_id=str(data.get("mode_id", BUILD_MODE.mode_id)),
+        approved_plan_id=data.get("approved_plan_id"),
+    )
+
+
+def _proposed_plan_to_dict(plan: ProposedPlan | None) -> dict[str, str] | None:
+    if plan is None:
+        return None
+    return {
+        "plan_id": plan.plan_id,
+        "source_turn_id": plan.source_turn_id,
+        "content": plan.content,
+        "status": plan.status,
+    }
+
+
+def _proposed_plan_from_dict(data: Any) -> ProposedPlan | None:
+    if data is None:
+        return None
+    if not isinstance(data, dict):
+        raise ValueError("proposed_plan must be an object")
+    status = str(data.get("status", "proposed"))
+    if status not in {"proposed", "revising", "approved", "completed"}:
+        raise ValueError(f"invalid proposed_plan status: {status}")
+    return ProposedPlan(
+        plan_id=str(data["plan_id"]),
+        source_turn_id=str(data["source_turn_id"]),
+        content=str(data["content"]),
+        status=status,
     )

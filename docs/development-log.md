@@ -246,6 +246,31 @@ provider 选择从编译期常量升级为用户级配置，同时增加第二�
 - factory 仍是显式 adapter registry。向 config 添加未知 provider 不等于该 provider 已可调用；
   只有实现并注册 adapter 后才会进入 CLI 可选目录。
 
+## Milestone 16: Plan/Build Collaboration Modes
+
+agent 从单一 Build/ReAct 执行路径升级为显式的 Plan -> Approve -> Build 状态转换。
+
+- `modes.py` 集中定义 mode instructions、tool allowlist 和 completion protocol。Build 保持全部工具；
+  Plan 只注入 `git_diff`、`list_files`、`read_file`、`search`，安全边界由 tool registry 保证，
+  不依赖 prompt 要求模型自律。
+- Plan mode 可继续使用只读 tool loop 探索仓库；响应中第一对完整的 `<proposed_plan>` block 由
+  harness 提升为 `ProposedPlan`。标签前引导语或标签后确认话术不会破坏 gate；provider adapter
+  不理解 mode、计划或任务完成语义。
+- `SessionState` 持久化 `mode_id`、plan lifecycle 和 pending turn 的 mode/approved plan ID。
+  pending turn 只能在原 mode 下 retry，避免恢复时悄悄更换 system prompt 和工具集合。
+- `/mode` 使用现有上下方向键选择器；toolbar、`/summary` 和 `/tools` 立即反映当前 mode。
+- proposed plan 展示后立即打开 `Execute plan / Revise plan` selector。Execute 将计划标记为
+  approved、切到 Build 并启动关联的新执行 turn；Revise 标记为 revising，旧计划必须由新 proposal
+  替换后才能执行。`/approve` 保留给 Esc、resume 和非 TTY 场景。
+- Build final answer 将计划标为 completed；abort、length 或 max-steps 会恢复为 proposed。
+  model/tool 错误仍保留 pending turn，沿用 `/retry` 和 `/abort` 语义。
+- terminal 使用增量 protocol filter 隐藏跨 chunk 的 `<proposed_plan>` 标签、丢弃结束标签后的
+  冗余确认话术并实时输出正文；普通 Plan 回复、reasoning 和 tool progress 也保持流式。
+- trajectory schema 直接升级为 `my-agent.trajectory.v5`，记录 turn mode、approved plan、停止原因、
+  plan lifecycle events 和 metrics，包括 `plan_revision_requested`，不保留 v4 输出开关。
+- collaboration modes 与 permission modes 保持正交。本里程碑没有加入 `acceptEdits`、auto、
+  bypass 或 subagent；这些需要独立 policy/state 设计，不能通过增加 system prompt 冒充。
+
 ## Current Boundaries
 
 - `apply_patch` 可以自动修改 workspace 内的单个普通 UTF-8/LF 文件。
@@ -263,6 +288,8 @@ provider 选择从编译期常量升级为用户级配置，同时增加第二�
 - stream 在已经显示部分 delta 后不会自动重放；用户必须使用 `/retry` 或 `/abort`。
 - model cancellation 是协作式检查；底层网络 read 期间可能要等待 I/O 返回或 timeout。
 - `/abort` 只清理 conversation state，不回滚已经执行的文件修改或进程副作用。
+- Plan mode 不暴露 `exec_command`，因此也不运行可能写 cache/build artifact 的测试命令；审批后由
+  Build mode 执行验证。
 - 本地 `.my-agent/`、`trace.jsonl` 和 `trajectory.json` 默认不提交到 Git。
 - 当前实现 DeepSeek Chat Completions 和 OpenAI Responses adapter；其他厂商仍需实现并测试自己的
   wire adapter。
@@ -272,4 +299,6 @@ provider 选择从编译期常量升级为用户级配置，同时增加第二�
 - 使用 macOS Seatbelt、Linux bubblewrap 或 container 将允许的进程放入 OS sandbox。
 - 在确定性 compactor 之上增加可选的 provider semantic summary 和 summary 质量验证。
 - 增加更多 provider adapter，并对 streaming/tool-call edge cases 建立 contract tests。
+- 把 permission mode 独立建模为 manual/accept-edits/auto 等策略，不与 collaboration mode 枚举耦合。
+- 在有真实并发需求后增加 Explore/Review subagent 和父子 trajectory，而不是把它们当主 mode。
 - 为真实任务建立 eval cases，并使用 trajectory 分析失败类型。

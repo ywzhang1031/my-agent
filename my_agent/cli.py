@@ -9,6 +9,7 @@ from .agent_loop import AgentEvent, AgentLoop
 from .config import RuntimeConfig, load_runtime_config
 from .control import ApprovalDecision
 from .model_invoker import ModelInvoker
+from .modes import BUILD_MODE, COLLABORATION_MODES, CollaborationMode, get_mode
 from .permissions import PermissionPolicy
 from .providers.factory import (
     SUPPORTED_PROVIDER_IDS,
@@ -51,6 +52,8 @@ SLASH_COMMANDS = (
     SlashCommand("/summary", "Show current session state"),
     SlashCommand("/context", "Show detailed context usage"),
     SlashCommand("/model", "Choose the model"),
+    SlashCommand("/mode", "Choose Build or Plan mode"),
+    SlashCommand("/approve", "Approve the proposed plan and execute it"),
     SlashCommand("/config", "Show provider configuration"),
     SlashCommand("/retry", "Resume the pending model step"),
     SlashCommand("/abort", "Discard the pending turn"),
@@ -58,6 +61,11 @@ SLASH_COMMANDS = (
     SlashCommand("/tools", "List available tools"),
     SlashCommand("/help", "Show slash commands"),
     SlashCommand("/exit", "Save and exit"),
+)
+
+PLAN_ACTIONS = (
+    SelectionOption("Execute plan", "Approve, switch to Build, and execute now"),
+    SelectionOption("Revise plan", "Stay in Plan mode and describe changes"),
 )
 
 
@@ -103,6 +111,12 @@ def _add_runtime_options(parser: argparse.ArgumentParser) -> None:
         help="Session storage root. Defaults to <workspace>/.my-agent/sessions.",
     )
     parser.add_argument("--max-steps", type=int, default=12, help="Maximum model/tool loop steps per turn.")
+    parser.add_argument(
+        "--mode",
+        choices=[mode.mode_id for mode in COLLABORATION_MODES],
+        default=None,
+        help="Collaboration mode. New sessions default to build.",
+    )
     parser.add_argument(
         "--stream",
         action=argparse.BooleanOptionalAction,
@@ -173,11 +187,17 @@ def _run_ask(args: argparse.Namespace) -> int:
     workspace = Workspace(args.workspace)
     store = _session_store(args, workspace)
     state = store.create(workspace.root)
+    _restore_session_mode(args, state)
     print(f"session: {state.session_id}", file=sys.stderr)
     loop, _ = _build_runtime(args, workspace, state.trace_path)
     _sync_session_model(state, loop)
+    _sync_session_mode(state, loop)
     runtime = AgentRuntime(loop, state, interactive_approvals=False)
-    renderer = StreamRenderer(answer_prefix="", show_thinking=args.show_thinking)
+    renderer = StreamRenderer(
+        answer_prefix="",
+        show_thinking=args.show_thinking,
+        hide_plan_protocol=loop.mode.produces_plan,
+    )
     try:
         runtime.send(StartTurn(user_input=prompt))
         terminal_event = _consume_runtime_events(args, runtime, renderer)
@@ -210,9 +230,11 @@ def _run_resume(args: argparse.Namespace) -> int:
 
 def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) -> int:
     _restore_session_model(args, state)
+    _restore_session_mode(args, state)
     workspace = Workspace(state.workspace)
-    loop, registry = _build_runtime(args, workspace, state.trace_path)
+    loop, _ = _build_runtime(args, workspace, state.trace_path)
     _sync_session_model(state, loop)
+    _sync_session_mode(state, loop)
     _save_session_artifacts(store, state)
     runtime = AgentRuntime(loop, state, interactive_approvals=True)
     print(f"session: {state.session_id}")
@@ -235,6 +257,7 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                     snapshot,
                     provider_id=loop.model.profile.provider_id,
                     model_id=loop.model.profile.model_id,
+                    mode_id=loop.mode.mode_id,
                     pending=state.pending_turn is not None,
                 )
                 try:
@@ -256,9 +279,10 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                     runtime.close()
                     state = store.create(state.workspace)
                     workspace = Workspace(state.workspace)
-                    loop, registry = _build_runtime(args, workspace, state.trace_path)
+                    loop, _ = _build_runtime(args, workspace, state.trace_path)
                     runtime = AgentRuntime(loop, state, interactive_approvals=True)
                     _sync_session_model(state, loop)
+                    _sync_session_mode(state, loop)
                     _save_session_artifacts(store, state)
                     print(f"session: {state.session_id}")
                     continue
@@ -271,12 +295,18 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                     continue
                 if user_input == "/summary":
                     pending = state.pending_turn.turn_id if state.pending_turn else "none"
+                    plan = (
+                        f"{state.proposed_plan.status}:{state.proposed_plan.plan_id}"
+                        if state.proposed_plan is not None
+                        else "none"
+                    )
                     print(
                         f"session={state.session_id} workspace={state.workspace} "
                         f"model={loop.model.profile.provider_id}/"
                         f"{loop.model.profile.model_id} "
+                        f"mode={loop.mode.mode_id} "
                         f"messages={len(state.messages)} summarized="
-                        f"{state.summarized_message_count} pending={pending}"
+                        f"{state.summarized_message_count} pending={pending} plan={plan}"
                     )
                     continue
                 if user_input == "/model":
@@ -329,6 +359,51 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                     _save_session_artifacts(store, state)
                     print(f"model: {model.profile.provider_id}/{model.profile.model_id}")
                     continue
+                if user_input == "/mode":
+                    if state.pending_turn is not None:
+                        print("pending turn exists; use /retry or /abort before switching mode")
+                        continue
+                    if not editor.supports_interactive_selection:
+                        _print_mode_catalog(loop.mode.mode_id)
+                        print("interactive mode selection requires a TTY")
+                        continue
+                    requested_mode = editor.select(
+                        "mode> ",
+                        (
+                            SelectionOption(mode.mode_id, mode.description)
+                            for mode in COLLABORATION_MODES
+                        ),
+                        current_value=loop.mode.mode_id,
+                    )
+                    if requested_mode is None:
+                        print("mode selection cancelled")
+                        continue
+                    if requested_mode == loop.mode.mode_id:
+                        print(f"already using mode: {requested_mode}")
+                        continue
+                    mode = get_mode(requested_mode)
+                    mode_registry = build_tool_registry(mode)
+                    runtime.switch_mode(mode, mode_registry)
+                    args.mode = mode.mode_id
+                    _sync_session_mode(state, loop)
+                    _save_session_artifacts(store, state)
+                    print(f"mode: {mode.mode_id}")
+                    continue
+                if user_input == "/approve":
+                    if state.pending_turn is not None:
+                        print("pending turn exists; use /retry or /abort before approving a plan")
+                        continue
+                    try:
+                        _approve_and_execute_plan(
+                            args,
+                            store,
+                            state,
+                            runtime,
+                            editor,
+                        )
+                    except ValueError as exc:
+                        print(str(exc))
+                    continue
                 if user_input == "/config":
                     _print_runtime_config(args.runtime_config)
                     continue
@@ -346,7 +421,12 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                     if state.pending_turn is None:
                         print("no pending turn to retry")
                         continue
-                    _run_chat_turn(args, store, state, runtime, editor, retry=True)
+                    terminal_event = _run_chat_turn(
+                        args, store, state, runtime, editor, retry=True
+                    )
+                    _offer_plan_action(
+                        args, store, state, runtime, editor, terminal_event
+                    )
                     continue
                 if user_input == "/abort":
                     if state.pending_turn is None:
@@ -365,7 +445,7 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                     print(state.trace_path)
                     continue
                 if user_input == "/tools":
-                    print("\n".join(registry.names()))
+                    print("\n".join(loop.tools.names()))
                     continue
                 if user_input == "/help":
                     print("Commands")
@@ -374,6 +454,8 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                     print("\nType / to open the menu; use Up/Down and Enter to run.")
                     print("Tab remains available for completion and quick execution.")
                     print("/model uses Up/Down to choose, Enter to switch, and Esc to cancel.")
+                    print("/mode uses the same selector.")
+                    print("Completed plans open Execute/Revise; /approve runs a saved proposal.")
                     continue
                 if user_input.startswith("/"):
                     print(f"unknown command: {user_input}")
@@ -382,9 +464,84 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                 if state.pending_turn is not None:
                     print("pending turn exists; use /retry or /abort before sending a new message")
                     continue
-                _run_chat_turn(args, store, state, runtime, editor, user_input=user_input)
+                terminal_event = _run_chat_turn(
+                    args, store, state, runtime, editor, user_input=user_input
+                )
+                _offer_plan_action(
+                    args, store, state, runtime, editor, terminal_event
+                )
     finally:
         runtime.close()
+
+
+def _approve_and_execute_plan(
+    args: argparse.Namespace,
+    store: SessionStore,
+    state: SessionState,
+    runtime: AgentRuntime,
+    editor: LineEditor,
+) -> RuntimeEvent:
+    plan = runtime.loop.approve_plan(state)
+    mode_registry = build_tool_registry(BUILD_MODE)
+    runtime.switch_mode(BUILD_MODE, mode_registry)
+    args.mode = BUILD_MODE.mode_id
+    _sync_session_mode(state, runtime.loop)
+    _save_session_artifacts(store, state)
+    print(f"plan approved: {plan.plan_id}; mode: build")
+    return _run_chat_turn(
+        args,
+        store,
+        state,
+        runtime,
+        editor,
+        user_input=(
+            "Execute the approved plan from the previous assistant message. "
+            "Re-check the current workspace state, implement it, and validate the result."
+        ),
+        approved_plan_id=plan.plan_id,
+    )
+
+
+def _offer_plan_action(
+    args: argparse.Namespace,
+    store: SessionStore,
+    state: SessionState,
+    runtime: AgentRuntime,
+    editor: LineEditor,
+    terminal_event: RuntimeEvent,
+) -> None:
+    result = terminal_event.result
+    if (
+        terminal_event.kind != "turn_completed"
+        or result is None
+        or result.stopped_by != "proposed_plan"
+    ):
+        return
+    if not editor.supports_interactive_selection:
+        print("plan ready; use /approve to execute or continue in Plan mode to revise it")
+        return
+
+    action = editor.select(
+        "plan> ",
+        PLAN_ACTIONS,
+        current_value="Execute plan",
+    )
+    if action == "Execute plan":
+        try:
+            _approve_and_execute_plan(args, store, state, runtime, editor)
+        except ValueError as exc:
+            print(str(exc))
+        return
+    if action == "Revise plan":
+        try:
+            runtime.loop.request_plan_revision(state)
+        except ValueError as exc:
+            print(str(exc))
+            return
+        _save_session_artifacts(store, state)
+        print("plan marked for revision; describe the changes you want")
+        return
+    print("plan kept as proposed; use /approve to execute it later")
 
 
 def _run_chat_turn(
@@ -396,10 +553,20 @@ def _run_chat_turn(
     *,
     user_input: str | None = None,
     retry: bool = False,
-) -> None:
-    renderer = StreamRenderer(show_thinking=args.show_thinking)
+    approved_plan_id: str | None = None,
+) -> RuntimeEvent:
+    renderer = StreamRenderer(
+        show_thinking=args.show_thinking,
+        hide_plan_protocol=runtime.loop.mode.produces_plan,
+    )
     try:
-        runtime.send(StartTurn(user_input=user_input or "", retry=retry))
+        runtime.send(
+            StartTurn(
+                user_input=user_input or "",
+                retry=retry,
+                approved_plan_id=approved_plan_id,
+            )
+        )
         terminal_event = _consume_runtime_events(args, runtime, renderer, editor)
     finally:
         _save_session_artifacts(store, state)
@@ -409,7 +576,7 @@ def _run_chat_turn(
             renderer.finish(terminal_event.result.answer)
         else:
             print(f"assistant> {terminal_event.result.answer}")
-        return
+        return terminal_event
     renderer.finish("")
     if terminal_event.kind == "turn_interrupted":
         print("generation interrupted; use /retry to continue or /abort to discard the turn")
@@ -417,6 +584,7 @@ def _run_chat_turn(
         if not args.stream:
             print(f"error: {terminal_event.text}")
         print("use /retry to continue or /abort to discard the pending turn")
+    return terminal_event
 
 
 def _consume_runtime_events(
@@ -506,7 +674,8 @@ def _build_runtime(
     workspace: Workspace,
     trace_path: str | Path,
 ) -> tuple[AgentLoop, ToolRegistry]:
-    registry = build_tool_registry()
+    mode = get_mode(args.mode)
+    registry = build_tool_registry(mode)
     model = _build_model(args)
     loop = AgentLoop(
         workspace=workspace,
@@ -515,6 +684,7 @@ def _build_runtime(
         permissions=PermissionPolicy(),
         trace=TraceRecorder(trace_path),
         max_steps=args.max_steps,
+        mode=mode,
     )
     return loop, registry
 
@@ -568,9 +738,25 @@ def _restore_session_model(args: argparse.Namespace, state: SessionState) -> Non
         args.model = state.model_id
 
 
+def _restore_session_mode(args: argparse.Namespace, state: SessionState) -> None:
+    required_mode = (
+        state.pending_turn.mode_id if state.pending_turn is not None else state.mode_id
+    )
+    if state.pending_turn is not None and args.mode not in {None, required_mode}:
+        raise ValueError(
+            f"pending turn requires mode {required_mode}; requested mode is {args.mode}"
+        )
+    args.mode = args.mode or required_mode
+    get_mode(args.mode)
+
+
 def _sync_session_model(state: SessionState, loop: AgentLoop) -> None:
     state.provider_id = loop.model.profile.provider_id
     state.model_id = loop.model.profile.model_id
+
+
+def _sync_session_mode(state: SessionState, loop: AgentLoop) -> None:
+    state.mode_id = loop.mode.mode_id
 
 
 def _print_model_catalog(config: RuntimeConfig, current_model_ref: str) -> None:
@@ -583,6 +769,14 @@ def _print_model_catalog(config: RuntimeConfig, current_model_ref: str) -> None:
         print(f"  {marker} {model.ref:<32}{model.description}")
 
 
+def _print_mode_catalog(current_mode_id: str) -> None:
+    print(f"Current mode: {current_mode_id}")
+    print("Available modes")
+    for mode in COLLABORATION_MODES:
+        marker = "*" if mode.mode_id == current_mode_id else " "
+        print(f"  {marker} {mode.mode_id:<12}{mode.description}")
+
+
 def _print_runtime_config(config: RuntimeConfig) -> None:
     config_status = "loaded" if config.config_path.exists() else "built-in defaults"
     credentials_status = "loaded" if config.credentials_path.exists() else "not found"
@@ -593,17 +787,19 @@ def _print_runtime_config(config: RuntimeConfig) -> None:
     print(f"  providers:   {', '.join(config.providers)}")
 
 
-def build_tool_registry() -> ToolRegistry:
-    return ToolRegistry(
-        [
+def build_tool_registry(mode: CollaborationMode = BUILD_MODE) -> ToolRegistry:
+    tools = {
+        tool.name: tool
+        for tool in (
             ApplyPatchTool(),
             GitDiffTool(),
             ListFilesTool(),
             ReadFileTool(),
             SearchTool(),
             ExecCommandTool(),
-        ]
-    )
+        )
+    }
+    return ToolRegistry([tools[name] for name in mode.tool_names])
 
 
 def _session_store(args: argparse.Namespace, workspace: Workspace) -> SessionStore:
