@@ -246,9 +246,12 @@ OpenAI reasoning 默认使用配置中的 `medium` effort 和 `auto` summary，�
 
 代码按这几个边界拆分：
 
-- `cli.py`：解析 `ask/chat/resume`，控制 REPL，并在每轮后保存 session
-- `terminal.py`：封装 command completion、context UI、history 和流式渲染，不参与 agent 决策
-- `runtime.py`：接收 `RuntimeCommand`、在 worker 中驱动 turn，并发布 `RuntimeEvent`
+- `cli.py`：解析 `ask/chat/resume`，控制 REPL，只发送 typed command 和渲染 typed event
+- `terminal.py`：封装 command completion、context UI、history 和 typed event 流式渲染，不参与 agent 决策
+- `protocol.py`：定义 transport-neutral command/event 类型、协议版本、序号和 JSON 编解码
+- `service.py`：按 session 路由命令，编排 model/mode/plan/abort 状态转换，保存 session，并把内部
+  runtime event 提升为客户端协议事件
+- `runtime.py`：单 session 执行器；在 worker 中驱动一个 turn，并发布内部 `RuntimeEvent`
 - `control.py`：定义 cancellation、permission request 和 approval decision 契约
 - `session.py`：序列化统一 `Message`、context 状态和可重试的 `PendingTurn`
 - `config.py`：合并内置模型目录、用户 provider 配置和独立凭据，并解析 `provider/model`
@@ -276,7 +279,9 @@ OpenAI reasoning 默认使用配置中的 `medium` effort 和 `auto` summary，�
 CLI loads SessionState
   -> resolves the persisted collaboration mode
      -> builds a mode-specific ToolRegistry and system prompt
-  -> CLI sends StartTurn to AgentRuntime
+  -> CLI sends StartTurnCommand(session_id, ...) to AgentService
+  -> AgentService routes the command to the registered session
+     -> translates it into the internal StartTurn command
   -> AgentRuntime starts one worker and publishes lifecycle events
   -> AgentLoop appends UserMessage
   -> PendingTurn records the stable turn_id, step, and completed tool calls
@@ -285,36 +290,46 @@ CLI loads SessionState
   -> AgentLoop creates one provider-neutral ModelRequest
   -> ModelInvoker applies harness retry/cancellation policy
   -> selected ProviderAdapter performs one API attempt and maps its wire protocol
-  -> typed ModelEvent deltas become AgentEvent and terminal output
+  -> typed ModelEvent deltas become internal AgentEvent / RuntimeEvent
+  -> AgentService converts them to versioned, sequenced protocol events
+  -> CLI renders concrete types such as ContentDeltaEvent and ToolStartedEvent
   -> ModelCompleted contains ordered text/reasoning/tool-call output plus usage/metadata
   -> AgentLoop either accepts a final answer
      -> in Plan mode, a complete proposed_plan block becomes persisted ProposedPlan state
      or asks ToolRegistry to validate and describe every tool call
   -> write/exec action becomes PermissionRequest
-     -> CLI receives approval_requested
-     -> user sends ResolveApproval(allow_once/allow_session/deny)
+     -> CLI receives ApprovalRequestedEvent
+     -> user sends ResolveApprovalCommand(allow_once/allow_session/deny)
      -> the same suspended tool call resumes; the model is not called again first
   -> approved call executes; denied call becomes a failed ToolResult
   -> ToolResult becomes ToolResultMessage
   -> next model request sees the new observation
   -> after edits, git_diff exposes the actual working-tree delta
   -> exec_command runs the narrowest allowlisted validation
-  -> CLI saves messages, trace, and trajectory
+  -> AgentService saves messages, trace, and trajectory after the terminal event
 
 Plan approval is a separate transition:
 
-proposed plan -> action selector -> Execute -> Build -> StartTurn(approved_plan_id)
+proposed plan -> action selector -> ExecutePlanCommand -> AgentService
+                              -> approve -> Build -> StartTurn(approved_plan_id)
                               \-> Revise -> revising -> new proposed plan
                               \-> Esc -> keep proposed for /approve
 Build execution -> final answer: completed
                 -> abort/length/max_steps: proposed again
 ```
 
-`AgentRuntime` 是 CLI 和 harness 的双向边界。输入命令目前是 `StartTurn`、
-`InterruptTurn`、`ResolveApproval`；输出事件覆盖 model delta、tool lifecycle、approval lifecycle
-和 turn terminal state。状态机使用 `idle`、`running_model`、`waiting_approval`、
-`running_tool`、`completed`、`failed`、`interrupted`。`AgentLoop` 不读取 stdin，也不知道
-prompt_toolkit，因此未来替换为 TUI、IDE 或远程客户端时不需要把交互逻辑塞回 loop。
+`AgentService` 现在是客户端和 harness 的应用边界。`StartTurnCommand`、
+`InterruptTurnCommand`、`ResolveApprovalCommand`、`SwitchModelCommand`、`SwitchModeCommand`、
+`ExecutePlanCommand`、`RevisePlanCommand` 和 `AbortTurnCommand` 都只包含可序列化字段。输出不再是
+`kind: str + data: dict`，而是 `ContentDeltaEvent`、`ApprovalRequestedEvent`、
+`TurnCompletedEvent` 等具体 dataclass；每个事件包含协议版本、event ID、session ID、单 session
+递增序号和显式状态，并可转换为 JSON object。
+
+`AgentRuntime` 降为 service 内部的单 session 执行器，状态机仍使用 `idle`、`running_model`、
+`waiting_approval`、`running_tool`、`completed`、`failed`、`interrupted`。首版 service 仍由 CLI
+在进程内调用，尚未启动 HTTP/WebSocket server；下一步 transport 只需解码 command、调用
+`dispatch()` 并编码 event，不需要复制 plan approval 或 mode switching。`AgentLoop` 不读取 stdin，
+也不知道 prompt_toolkit、service 或 transport。
 
 Context token 数量是保守估算，不是 provider tokenizer 的精确计数。达到输入预算的 85% 时，
 `ContextManager` 会按完整 user turn 边界压缩较老历史，目标降到 70%；当前 active turn、最近

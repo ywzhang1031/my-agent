@@ -271,6 +271,23 @@ agent 从单一 Build/ReAct 执行路径升级为显式的 Plan -> Approve -> Bu
 - collaboration modes 与 permission modes 保持正交。本里程碑没有加入 `acceptEdits`、auto、
   bypass 或 subagent；这些需要独立 policy/state 设计，不能通过增加 system prompt 冒充。
 
+## Milestone 17: Agent Service and Typed Client Protocol
+
+CLI 与 agent harness 之间新增 transport-neutral application boundary，避免未来每个 UI 重写业务流程。
+
+- `protocol.py` 定义 versioned command/event dataclass 和 JSON 编解码。command 带 command ID 与
+  session ID；event 带 event ID、session ID、单 session 递增 sequence 和显式 runtime state。
+- 客户端事件按 model、tool、approval、turn、mode/model change 和 plan lifecycle 建立具体类型，
+  不再要求 renderer 解析任意 `kind: str + data: dict`。
+- `AgentService` 注册单 session `AgentRuntime`，路由 turn、interrupt、approval、model/mode、plan 和
+  abort command，并把内部 runtime event 转成外部协议事件。
+- Execute Plan 的 approve -> switch Build tools -> persist -> start approved turn 由 service 编排；
+  CLI 不再复制这个状态转换。model/mode switch、revision 和 abort 同样由 service 持有。
+- `AgentRuntime` 保持单 session worker、cancellation 和 approval suspension；`AgentLoop` 保持
+  model -> tool -> observation 算法，没有加入 transport、UI 或 session catalog 逻辑。
+- CLI 仍在同一 Python 进程内调用 service。当前没有 HTTP/WebSocket/stdio server，也没有远程
+  session create/list protocol；这些是稳定 command/event schema 之上的后续 transport 工作。
+
 ## Current Boundaries
 
 - `apply_patch` 可以自动修改 workspace 内的单个普通 UTF-8/LF 文件。
@@ -293,9 +310,13 @@ agent 从单一 Build/ReAct 执行路径升级为显式的 Plan -> Approve -> Bu
 - 本地 `.my-agent/`、`trace.jsonl` 和 `trajectory.json` 默认不提交到 Git。
 - 当前实现 DeepSeek Chat Completions 和 OpenAI Responses adapter；其他厂商仍需实现并测试自己的
   wire adapter。
+- `AgentService` 当前只管理调用方已注册的 runtime；尚未提供独立 daemon、远程 transport、鉴权、
+  event replay 或跨进程 crash recovery。
 
 ## Next Candidates
 
+- 在 typed protocol 上增加 JSONL stdio 或 HTTP/WebSocket transport，以及 session create/list/resume。
+- 为 event sequence 增加持久化和 replay cursor，让 UI 断线后可以恢复同一 turn 时间线。
 - 使用 macOS Seatbelt、Linux bubblewrap 或 container 将允许的进程放入 OS sandbox。
 - 在确定性 compactor 之上增加可选的 provider semantic summary 和 summary 质量验证。
 - 增加更多 provider adapter，并对 streaming/tool-call edge cases 建立 contract tests。

@@ -283,7 +283,10 @@ class AgentLoop:
                     )
                     self._emit(
                         event_handler,
-                        AgentEvent(kind="context_compacted", data=snapshot.to_dict()),
+                        AgentEvent(
+                            kind="context_compacted",
+                            data={"step": step, **snapshot.to_dict()},
+                        ),
                     )
                 self.trace.write(
                     "model_request",
@@ -457,7 +460,12 @@ class AgentLoop:
                     event_handler,
                     AgentEvent(
                         kind="tool_proposed",
-                        data={"name": call.name, "arguments": call.arguments},
+                        data={
+                            "step": step,
+                            "call_id": call.call_id,
+                            "name": call.name,
+                            "arguments": call.arguments,
+                        },
                     ),
                 )
 
@@ -493,7 +501,12 @@ class AgentLoop:
                                 event_handler,
                                 AgentEvent(
                                     kind="tool_started",
-                                    data={"name": call.name, "arguments": call.arguments},
+                                    data={
+                                        "step": step,
+                                        "call_id": call.call_id,
+                                        "name": call.name,
+                                        "arguments": call.arguments,
+                                    },
                                 ),
                             )
                             tool_result = self.tools.run(call, ctx)
@@ -514,6 +527,8 @@ class AgentLoop:
                         AgentEvent(
                             kind="tool_finished",
                             data={
+                                "step": step,
+                                "call_id": call.call_id,
                                 "name": call.name,
                                 "ok": tool_result.ok,
                                 "status": tool_result.metadata.get("status")
@@ -704,7 +719,13 @@ class AgentLoop:
             event_handler,
             AgentEvent(
                 kind="tool_finished",
-                data={"name": call.name, "ok": False, "status": "interrupted"},
+                data={
+                    "step": step,
+                    "call_id": call.call_id,
+                    "name": call.name,
+                    "ok": False,
+                    "status": "interrupted",
+                },
             ),
         )
         messages.append(
@@ -765,7 +786,7 @@ class AgentLoop:
                     AgentEvent(
                         kind="provider_retry",
                         text=str(event.error),
-                        data=retry_data,
+                        data={"step": step, **retry_data},
                     ),
                 )
             elif isinstance(event, ModelCompleted):

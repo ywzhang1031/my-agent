@@ -34,6 +34,14 @@ from my_agent.messages import AssistantMessage, ToolCall, ToolResultMessage, Use
 from my_agent.model_invoker import ModelInvoker, RetryPolicy, RetryScheduled
 from my_agent.modes import BUILD_MODE, PLAN_MODE, extract_proposed_plan, get_mode
 from my_agent.permissions import PermissionPolicy
+from my_agent.protocol import (
+    AgentState,
+    ContentDeltaEvent,
+    ModelStartedEvent,
+    ReasoningDeltaEvent,
+    ToolFinishedEvent,
+    ToolStartedEvent,
+)
 from my_agent.provider import (
     ModelCompleted,
     ModelError,
@@ -2051,20 +2059,31 @@ class MyAgentTests(unittest.TestCase):
             show_thinking=True,
         )
 
-        renderer.handle(AgentEvent(kind="model_started"))
-        renderer.handle(AgentEvent(kind="reasoning_delta", text="Inspecting."))
-        renderer.handle(AgentEvent(kind="content_delta", text="I found "))
-        renderer.handle(AgentEvent(kind="content_delta", text="app.py."))
+        event = {
+            "session_id": "session-1",
+            "sequence": 1,
+            "state": AgentState.RUNNING_MODEL,
+            "step": 1,
+        }
+        renderer.handle(ModelStartedEvent(**event))
+        renderer.handle(ReasoningDeltaEvent(**event, text="Inspecting."))
+        renderer.handle(ContentDeltaEvent(**event, text="I found "))
+        renderer.handle(ContentDeltaEvent(**event, text="app.py."))
         renderer.handle(
-            AgentEvent(
-                kind="tool_started",
-                data={"name": "read_file", "arguments": {"path": "app.py"}},
+            ToolStartedEvent(
+                **event,
+                call_id="call-1",
+                name="read_file",
+                arguments={"path": "app.py"},
             )
         )
         renderer.handle(
-            AgentEvent(
-                kind="tool_finished",
-                data={"name": "read_file", "ok": True, "status": "success"},
+            ToolFinishedEvent(
+                **event,
+                call_id="call-1",
+                name="read_file",
+                ok=True,
+                status="success",
             )
         )
         renderer.finish("I found app.py.")
@@ -2084,22 +2103,28 @@ class MyAgentTests(unittest.TestCase):
         )
         plan = "# Plan\n\nUpdate app.py and run focused tests."
 
-        renderer.handle(AgentEvent(kind="model_started"))
+        event = {
+            "session_id": "session-1",
+            "sequence": 1,
+            "state": AgentState.RUNNING_MODEL,
+            "step": 1,
+        }
+        renderer.handle(ModelStartedEvent(**event))
         renderer.handle(
-            AgentEvent(kind="content_delta", text="Here is the plan.\n<pro")
+            ContentDeltaEvent(**event, text="Here is the plan.\n<pro")
         )
         self.assertEqual(output.getvalue(), "assistant> Here is the plan.\n")
         renderer.handle(
-            AgentEvent(
-                kind="content_delta",
+            ContentDeltaEvent(
+                **event,
                 text="posed_plan>\n# Plan\n\nUpdate app.py and run focused tests.",
             )
         )
         self.assertIn("# Plan", output.getvalue())
         self.assertNotIn("proposed_plan", output.getvalue())
-        renderer.handle(AgentEvent(kind="content_delta", text="</proposed"))
+        renderer.handle(ContentDeltaEvent(**event, text="</proposed"))
         renderer.handle(
-            AgentEvent(kind="content_delta", text="_plan>\nConfirm and I will execute it.")
+            ContentDeltaEvent(**event, text="_plan>\nConfirm and I will execute it.")
         )
         renderer.finish(plan)
 
@@ -2114,8 +2139,14 @@ class MyAgentTests(unittest.TestCase):
             hide_plan_protocol=True,
         )
 
-        renderer.handle(AgentEvent(kind="model_started"))
-        renderer.handle(AgentEvent(kind="content_delta", text="Which file should change?"))
+        event = {
+            "session_id": "session-1",
+            "sequence": 1,
+            "state": AgentState.RUNNING_MODEL,
+            "step": 1,
+        }
+        renderer.handle(ModelStartedEvent(**event))
+        renderer.handle(ContentDeltaEvent(**event, text="Which file should change?"))
 
         self.assertEqual(output.getvalue(), "assistant> Which file should change?")
         renderer.finish("Which file should change?")

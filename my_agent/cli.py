@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 from queue import Empty
 
-from .agent_loop import AgentEvent, AgentLoop
+from .agent_loop import AgentLoop
 from .config import RuntimeConfig, load_runtime_config
 from .control import ApprovalDecision
 from .model_invoker import ModelInvoker
@@ -16,13 +16,27 @@ from .providers.factory import (
     ProviderConfig,
     create_provider_adapter,
 )
-from .runtime import (
-    AgentRuntime,
-    InterruptTurn,
-    ResolveApproval,
-    RuntimeEvent,
-    StartTurn,
+from .protocol import (
+    AbortTurnCommand,
+    ApprovalRequestedEvent,
+    ExecutePlanCommand,
+    InterruptTurnCommand,
+    ModeChangedEvent,
+    ModelChangedEvent,
+    PlanApprovedEvent,
+    PlanRevisionRequestedEvent,
+    ResolveApprovalCommand,
+    RevisePlanCommand,
+    StartTurnCommand,
+    SwitchModeCommand,
+    SwitchModelCommand,
+    TurnAbortedEvent,
+    TurnCompletedEvent,
+    TurnFailedEvent,
+    TurnInterruptedEvent,
 )
+from .runtime import AgentRuntime
+from .service import AgentService
 from .session import SessionState, SessionStore
 from .terminal import (
     LineEditor,
@@ -67,6 +81,8 @@ PLAN_ACTIONS = (
     SelectionOption("Execute plan", "Approve, switch to Build, and execute now"),
     SelectionOption("Revise plan", "Stay in Plan mode and describe changes"),
 )
+
+TerminalEvent = TurnCompletedEvent | TurnFailedEvent | TurnInterruptedEvent
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -192,25 +208,30 @@ def _run_ask(args: argparse.Namespace) -> int:
     loop, _ = _build_runtime(args, workspace, state.trace_path)
     _sync_session_model(state, loop)
     _sync_session_mode(state, loop)
-    runtime = AgentRuntime(loop, state, interactive_approvals=False)
+    service = _build_agent_service(
+        args,
+        store,
+        state,
+        loop,
+        interactive_approvals=False,
+    )
     renderer = StreamRenderer(
         answer_prefix="",
         show_thinking=args.show_thinking,
         hide_plan_protocol=loop.mode.produces_plan,
     )
     try:
-        runtime.send(StartTurn(user_input=prompt))
-        terminal_event = _consume_runtime_events(args, runtime, renderer)
-        if terminal_event.kind != "turn_completed" or terminal_event.result is None:
-            raise RuntimeError(terminal_event.text or terminal_event.kind)
-        result = terminal_event.result
+        service.dispatch(StartTurnCommand(session_id=state.session_id, user_input=prompt))
+        terminal_event = _consume_service_events(args, service, state.session_id, renderer)
+        if not isinstance(terminal_event, TurnCompletedEvent):
+            raise RuntimeError(_terminal_event_message(terminal_event))
     finally:
-        runtime.close()
+        service.close()
         _save_session_artifacts(store, state)
     if args.stream:
-        renderer.finish(result.answer)
+        renderer.finish(terminal_event.answer)
     else:
-        print(result.answer)
+        print(terminal_event.answer)
     return 0
 
 
@@ -236,7 +257,13 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
     _sync_session_model(state, loop)
     _sync_session_mode(state, loop)
     _save_session_artifacts(store, state)
-    runtime = AgentRuntime(loop, state, interactive_approvals=True)
+    service = _build_agent_service(
+        args,
+        store,
+        state,
+        loop,
+        interactive_approvals=True,
+    )
     print(f"session: {state.session_id}")
 
     history_path = store.root.parent / "history"
@@ -252,13 +279,14 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
             status_provider=current_toolbar,
         ) as editor:
             while True:
-                snapshot = loop.inspect_context(state)
+                view = service.session_view(state.session_id)
+                snapshot = service.inspect_context(state.session_id)
                 toolbar = format_context_status(
                     snapshot,
-                    provider_id=loop.model.profile.provider_id,
-                    model_id=loop.model.profile.model_id,
-                    mode_id=loop.mode.mode_id,
-                    pending=state.pending_turn is not None,
+                    provider_id=view.provider_id,
+                    model_id=view.model_id,
+                    mode_id=view.mode_id,
+                    pending=view.pending_turn_id is not None,
                 )
                 try:
                     user_input = editor.read("you> ").strip()
@@ -276,11 +304,17 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                     _save_session_artifacts(store, state)
                     return 0
                 if user_input == "/new":
-                    runtime.close()
+                    service.close()
                     state = store.create(state.workspace)
                     workspace = Workspace(state.workspace)
                     loop, _ = _build_runtime(args, workspace, state.trace_path)
-                    runtime = AgentRuntime(loop, state, interactive_approvals=True)
+                    service = _build_agent_service(
+                        args,
+                        store,
+                        state,
+                        loop,
+                        interactive_approvals=True,
+                    )
                     _sync_session_model(state, loop)
                     _sync_session_mode(state, loop)
                     _save_session_artifacts(store, state)
@@ -302,9 +336,8 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                     )
                     print(
                         f"session={state.session_id} workspace={state.workspace} "
-                        f"model={loop.model.profile.provider_id}/"
-                        f"{loop.model.profile.model_id} "
-                        f"mode={loop.mode.mode_id} "
+                        f"model={view.provider_id}/{view.model_id} "
+                        f"mode={view.mode_id} "
                         f"messages={len(state.messages)} summarized="
                         f"{state.summarized_message_count} pending={pending} plan={plan}"
                     )
@@ -313,19 +346,19 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                     if state.pending_turn is not None:
                         print("pending turn exists; use /retry or /abort before switching model")
                         continue
-                    current_profile = loop.model.profile
+                    current_model_ref = f"{view.provider_id}/{view.model_id}"
                     entries = tuple(
                         model
                         for model in args.runtime_config.models()
                         if model.provider_id in SUPPORTED_PROVIDER_IDS
                     )
                     if not entries:
-                        print(f"no selectable models for {current_profile.provider_id}")
+                        print(f"no selectable models for {view.provider_id}")
                         continue
                     if not editor.supports_interactive_selection:
                         _print_model_catalog(
                             args.runtime_config,
-                            f"{current_profile.provider_id}/{current_profile.model_id}",
+                            current_model_ref,
                         )
                         print("interactive model selection requires a TTY")
                         continue
@@ -336,35 +369,38 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                             for entry in entries
                         ),
                         current_value=(
-                            f"{current_profile.provider_id}/{current_profile.model_id}"
+                            current_model_ref
                         ),
                     )
                     if requested_model is None:
                         print("model selection cancelled")
                         continue
-                    current_model_ref = (
-                        f"{current_profile.provider_id}/{current_profile.model_id}"
-                    )
                     if requested_model == current_model_ref:
                         print(
-                            f"already using {current_profile.provider_id}/"
-                            f"{current_profile.model_id}"
+                            f"already using {view.provider_id}/{view.model_id}"
                         )
                         continue
-                    model = _build_model(args, model_ref=requested_model)
-                    runtime.switch_model(model)
-                    args.provider = model.profile.provider_id
-                    args.model = model.profile.model_id
-                    _sync_session_model(state, loop)
-                    _save_session_artifacts(store, state)
-                    print(f"model: {model.profile.provider_id}/{model.profile.model_id}")
+                    service.dispatch(
+                        SwitchModelCommand(
+                            session_id=state.session_id,
+                            model_ref=requested_model,
+                        )
+                    )
+                    changed = service.next_event(timeout=1)
+                    if not isinstance(changed, ModelChangedEvent):
+                        raise RuntimeError(
+                            f"expected model.changed, got {changed.event_type.value}"
+                        )
+                    args.provider = changed.provider_id
+                    args.model = changed.model_id
+                    print(f"model: {changed.provider_id}/{changed.model_id}")
                     continue
                 if user_input == "/mode":
                     if state.pending_turn is not None:
                         print("pending turn exists; use /retry or /abort before switching mode")
                         continue
                     if not editor.supports_interactive_selection:
-                        _print_mode_catalog(loop.mode.mode_id)
+                        _print_mode_catalog(view.mode_id)
                         print("interactive mode selection requires a TTY")
                         continue
                     requested_mode = editor.select(
@@ -373,21 +409,27 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                             SelectionOption(mode.mode_id, mode.description)
                             for mode in COLLABORATION_MODES
                         ),
-                        current_value=loop.mode.mode_id,
+                        current_value=view.mode_id,
                     )
                     if requested_mode is None:
                         print("mode selection cancelled")
                         continue
-                    if requested_mode == loop.mode.mode_id:
+                    if requested_mode == view.mode_id:
                         print(f"already using mode: {requested_mode}")
                         continue
-                    mode = get_mode(requested_mode)
-                    mode_registry = build_tool_registry(mode)
-                    runtime.switch_mode(mode, mode_registry)
-                    args.mode = mode.mode_id
-                    _sync_session_mode(state, loop)
-                    _save_session_artifacts(store, state)
-                    print(f"mode: {mode.mode_id}")
+                    service.dispatch(
+                        SwitchModeCommand(
+                            session_id=state.session_id,
+                            mode_id=requested_mode,
+                        )
+                    )
+                    changed = service.next_event(timeout=1)
+                    if not isinstance(changed, ModeChangedEvent):
+                        raise RuntimeError(
+                            f"expected mode.changed, got {changed.event_type.value}"
+                        )
+                    args.mode = changed.mode_id
+                    print(f"mode: {changed.mode_id}")
                     continue
                 if user_input == "/approve":
                     if state.pending_turn is not None:
@@ -398,7 +440,7 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                             args,
                             store,
                             state,
-                            runtime,
+                            service,
                             editor,
                         )
                     except ValueError as exc:
@@ -408,7 +450,7 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                     _print_runtime_config(args.runtime_config)
                     continue
                 if user_input == "/context":
-                    snapshot = loop.inspect_context(state)
+                    snapshot = service.inspect_context(state.session_id)
                     print(
                         render_context_usage(
                             snapshot,
@@ -422,30 +464,34 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                         print("no pending turn to retry")
                         continue
                     terminal_event = _run_chat_turn(
-                        args, store, state, runtime, editor, retry=True
+                        args, store, state, service, editor, retry=True
                     )
                     _offer_plan_action(
-                        args, store, state, runtime, editor, terminal_event
+                        args, store, state, service, editor, terminal_event
                     )
                     continue
                 if user_input == "/abort":
                     if state.pending_turn is None:
                         print("no pending turn to abort")
                         continue
-                    pending = loop.abort_turn(state)
-                    _save_session_artifacts(store, state)
+                    service.dispatch(AbortTurnCommand(session_id=state.session_id))
+                    aborted = service.next_event(timeout=1)
+                    if not isinstance(aborted, TurnAbortedEvent):
+                        raise RuntimeError(
+                            f"expected turn.aborted, got {aborted.event_type.value}"
+                        )
                     warning = (
                         " Filesystem changes from completed tools were not reverted."
-                        if pending.tool_calls_executed
+                        if aborted.tool_calls_executed
                         else ""
                     )
-                    print(f"aborted {pending.turn_id}.{warning}")
+                    print(f"aborted {aborted.turn_id}.{warning}")
                     continue
                 if user_input == "/trace":
                     print(state.trace_path)
                     continue
                 if user_input == "/tools":
-                    print("\n".join(loop.tools.names()))
+                    print("\n".join(service.tool_names(state.session_id)))
                     continue
                 if user_input == "/help":
                     print("Commands")
@@ -465,56 +511,54 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                     print("pending turn exists; use /retry or /abort before sending a new message")
                     continue
                 terminal_event = _run_chat_turn(
-                    args, store, state, runtime, editor, user_input=user_input
+                    args, store, state, service, editor, user_input=user_input
                 )
                 _offer_plan_action(
-                    args, store, state, runtime, editor, terminal_event
+                    args, store, state, service, editor, terminal_event
                 )
     finally:
-        runtime.close()
+        service.close()
 
 
 def _approve_and_execute_plan(
     args: argparse.Namespace,
     store: SessionStore,
     state: SessionState,
-    runtime: AgentRuntime,
+    service: AgentService,
     editor: LineEditor,
-) -> RuntimeEvent:
-    plan = runtime.loop.approve_plan(state)
-    mode_registry = build_tool_registry(BUILD_MODE)
-    runtime.switch_mode(BUILD_MODE, mode_registry)
-    args.mode = BUILD_MODE.mode_id
-    _sync_session_mode(state, runtime.loop)
-    _save_session_artifacts(store, state)
-    print(f"plan approved: {plan.plan_id}; mode: build")
-    return _run_chat_turn(
+) -> TerminalEvent:
+    service.dispatch(ExecutePlanCommand(session_id=state.session_id))
+    approved = service.next_event(timeout=1)
+    if not isinstance(approved, PlanApprovedEvent):
+        raise RuntimeError(
+            f"expected plan.approved, got {approved.event_type.value}"
+        )
+    args.mode = approved.mode_id
+    print(f"plan approved: {approved.plan_id}; mode: {approved.mode_id}")
+    renderer = StreamRenderer(show_thinking=args.show_thinking)
+    terminal_event = _consume_service_events(
         args,
-        store,
-        state,
-        runtime,
+        service,
+        state.session_id,
+        renderer,
         editor,
-        user_input=(
-            "Execute the approved plan from the previous assistant message. "
-            "Re-check the current workspace state, implement it, and validate the result."
-        ),
-        approved_plan_id=plan.plan_id,
     )
+    _save_session_artifacts(store, state)
+    _render_terminal_event(args, renderer, terminal_event)
+    return terminal_event
 
 
 def _offer_plan_action(
     args: argparse.Namespace,
     store: SessionStore,
     state: SessionState,
-    runtime: AgentRuntime,
+    service: AgentService,
     editor: LineEditor,
-    terminal_event: RuntimeEvent,
+    terminal_event: TerminalEvent,
 ) -> None:
-    result = terminal_event.result
     if (
-        terminal_event.kind != "turn_completed"
-        or result is None
-        or result.stopped_by != "proposed_plan"
+        not isinstance(terminal_event, TurnCompletedEvent)
+        or terminal_event.stopped_by != "proposed_plan"
     ):
         return
     if not editor.supports_interactive_selection:
@@ -528,17 +572,21 @@ def _offer_plan_action(
     )
     if action == "Execute plan":
         try:
-            _approve_and_execute_plan(args, store, state, runtime, editor)
+            _approve_and_execute_plan(args, store, state, service, editor)
         except ValueError as exc:
             print(str(exc))
         return
     if action == "Revise plan":
         try:
-            runtime.loop.request_plan_revision(state)
+            service.dispatch(RevisePlanCommand(session_id=state.session_id))
+            revised = service.next_event(timeout=1)
+            if not isinstance(revised, PlanRevisionRequestedEvent):
+                raise RuntimeError(
+                    f"expected plan.revision_requested, got {revised.event_type.value}"
+                )
         except ValueError as exc:
             print(str(exc))
             return
-        _save_session_artifacts(store, state)
         print("plan marked for revision; describe the changes you want")
         return
     print("plan kept as proposed; use /approve to execute it later")
@@ -548,95 +596,118 @@ def _run_chat_turn(
     args: argparse.Namespace,
     store: SessionStore,
     state: SessionState,
-    runtime: AgentRuntime,
+    service: AgentService,
     editor: LineEditor,
     *,
     user_input: str | None = None,
     retry: bool = False,
-    approved_plan_id: str | None = None,
-) -> RuntimeEvent:
+) -> TerminalEvent:
+    mode = get_mode(service.session_view(state.session_id).mode_id)
     renderer = StreamRenderer(
         show_thinking=args.show_thinking,
-        hide_plan_protocol=runtime.loop.mode.produces_plan,
+        hide_plan_protocol=mode.produces_plan,
     )
     try:
-        runtime.send(
-            StartTurn(
+        service.dispatch(
+            StartTurnCommand(
+                session_id=state.session_id,
                 user_input=user_input or "",
                 retry=retry,
-                approved_plan_id=approved_plan_id,
             )
         )
-        terminal_event = _consume_runtime_events(args, runtime, renderer, editor)
+        terminal_event = _consume_service_events(
+            args,
+            service,
+            state.session_id,
+            renderer,
+            editor,
+        )
     finally:
         _save_session_artifacts(store, state)
-
-    if terminal_event.kind == "turn_completed" and terminal_event.result is not None:
-        if args.stream:
-            renderer.finish(terminal_event.result.answer)
-        else:
-            print(f"assistant> {terminal_event.result.answer}")
-        return terminal_event
-    renderer.finish("")
-    if terminal_event.kind == "turn_interrupted":
-        print("generation interrupted; use /retry to continue or /abort to discard the turn")
-    else:
-        if not args.stream:
-            print(f"error: {terminal_event.text}")
-        print("use /retry to continue or /abort to discard the pending turn")
+    _render_terminal_event(args, renderer, terminal_event)
     return terminal_event
 
 
-def _consume_runtime_events(
+def _consume_service_events(
     args: argparse.Namespace,
-    runtime: AgentRuntime,
+    service: AgentService,
+    session_id: str,
     renderer: StreamRenderer,
     editor: LineEditor | None = None,
-) -> RuntimeEvent:
+) -> TerminalEvent:
     interrupt_requested = False
     while True:
         try:
-            event = runtime.next_event(timeout=0.1)
+            event = service.next_event(timeout=0.1)
         except Empty:
             continue
         except KeyboardInterrupt:
             if not interrupt_requested:
-                runtime.send(InterruptTurn())
+                service.dispatch(InterruptTurnCommand(session_id=session_id))
                 print("interrupt requested", file=sys.stderr)
                 interrupt_requested = True
             continue
 
         if args.stream:
-            renderer.handle(AgentEvent(kind=event.kind, text=event.text, data=event.data))
-        if event.kind == "approval_requested":
+            renderer.handle(event)
+        if isinstance(event, ApprovalRequestedEvent):
             if args.stream:
                 renderer.finish("")
             if editor is None:
                 raise RuntimeError("non-interactive runtime requested approval")
             decision = _prompt_for_approval(editor, event)
             if decision is None:
-                runtime.send(InterruptTurn())
+                service.dispatch(InterruptTurnCommand(session_id=session_id))
                 interrupt_requested = True
             else:
-                runtime.send(
-                    ResolveApproval(
-                        request_id=event.data["request_id"],
+                service.dispatch(
+                    ResolveApprovalCommand(
+                        session_id=session_id,
+                        request_id=event.request_id,
                         decision=decision,
                     )
                 )
-        if event.kind in {"turn_completed", "turn_failed", "turn_interrupted"}:
-            if args.stream and event.kind != "turn_completed":
+        if isinstance(event, (TurnCompletedEvent, TurnFailedEvent, TurnInterruptedEvent)):
+            if args.stream and not isinstance(event, TurnCompletedEvent):
                 renderer.finish("")
-            runtime.wait()
+            service.wait(session_id)
             return event
+
+
+def _render_terminal_event(
+    args: argparse.Namespace,
+    renderer: StreamRenderer,
+    event: TerminalEvent,
+) -> None:
+    if isinstance(event, TurnCompletedEvent):
+        if args.stream:
+            renderer.finish(event.answer)
+        else:
+            print(f"assistant> {event.answer}")
+        return
+    renderer.finish("")
+    if isinstance(event, TurnInterruptedEvent):
+        print("generation interrupted; use /retry to continue or /abort to discard the turn")
+    else:
+        if not args.stream:
+            print(f"error: {event.error}")
+        print("use /retry to continue or /abort to discard the pending turn")
+
+
+def _terminal_event_message(event: TerminalEvent) -> str:
+    if isinstance(event, TurnCompletedEvent):
+        return event.answer
+    if isinstance(event, TurnInterruptedEvent):
+        return event.reason
+    return event.error
 
 
 def _prompt_for_approval(
     editor: LineEditor,
-    event: RuntimeEvent,
+    event: ApprovalRequestedEvent,
 ) -> ApprovalDecision | None:
-    details = event.data.get("details", {})
-    print(f"approval> {event.data.get('description', event.data.get('action', 'tool action'))}")
+    details = event.details
+    print(f"approval> {event.description or event.action}")
     if details.get("argv"):
         print(f"  argv: {details['argv']}")
         print(f"  cwd: {details.get('cwd', '.')}")
@@ -687,6 +758,24 @@ def _build_runtime(
         mode=mode,
     )
     return loop, registry
+
+
+def _build_agent_service(
+    args: argparse.Namespace,
+    store: SessionStore,
+    state: SessionState,
+    loop: AgentLoop,
+    *,
+    interactive_approvals: bool,
+) -> AgentService:
+    runtime = AgentRuntime(loop, state, interactive_approvals=interactive_approvals)
+    service = AgentService(
+        tool_registry_factory=build_tool_registry,
+        model_resolver=lambda model_ref: _build_model(args, model_ref=model_ref),
+        save_session=lambda session: _save_session_artifacts(store, session),
+    )
+    service.register(runtime)
+    return service
 
 
 def _build_model(

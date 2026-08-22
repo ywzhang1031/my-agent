@@ -20,8 +20,19 @@ from prompt_toolkit.output.defaults import create_output
 from prompt_toolkit.shortcuts import CompleteStyle
 from prompt_toolkit.styles import Style
 
-from .agent_loop import AgentEvent
 from .context import ContextSnapshot
+from .protocol import (
+    AgentEventType,
+    ContentDeltaEvent,
+    ContextCompactedEvent,
+    ModelStartedEvent,
+    ProviderRetryEvent,
+    ReasoningDeltaEvent,
+    ToolFinishedEvent,
+    ToolStartedEvent,
+    TurnErrorEvent,
+    TurnResumedEvent,
+)
 
 
 @dataclass(frozen=True)
@@ -319,21 +330,21 @@ class StreamRenderer:
         self._reasoning_status_seen = False
         self._plan_filter = _PlanProtocolFilter() if hide_plan_protocol else None
 
-    def handle(self, event: AgentEvent) -> None:
-        if event.kind == "model_started":
+    def handle(self, event: AgentEventType) -> None:
+        if isinstance(event, ModelStartedEvent):
             self._close_line()
             self._mode = None
             self._model_content_seen = False
             self._reasoning_status_seen = False
             if self.hide_plan_protocol:
                 self._plan_filter = _PlanProtocolFilter()
-        elif event.kind == "reasoning_delta":
+        elif isinstance(event, ReasoningDeltaEvent):
             if self.show_thinking:
                 self._write_delta("reasoning", "thinking> ", event.text)
             elif not self._reasoning_status_seen:
                 self._status("thinking...")
                 self._reasoning_status_seen = True
-        elif event.kind == "content_delta":
+        elif isinstance(event, ContentDeltaEvent):
             text = (
                 self._plan_filter.feed(event.text)
                 if self._plan_filter is not None
@@ -342,36 +353,34 @@ class StreamRenderer:
             if text:
                 self._model_content_seen = True
                 self._write_delta("content", self.answer_prefix, text)
-        elif event.kind == "tool_started":
+        elif isinstance(event, ToolStartedEvent):
             self._close_line()
-            arguments = _short_json(event.data.get("arguments", {}))
-            self._status(f"tool> {event.data.get('name', '')} {arguments}".rstrip())
-        elif event.kind == "tool_finished":
+            arguments = _short_json(event.arguments)
+            self._status(f"tool> {event.name} {arguments}".rstrip())
+        elif isinstance(event, ToolFinishedEvent):
             self._close_line()
-            status = event.data.get("status") or (
-                "success" if event.data.get("ok") else "failed"
-            )
-            duration = event.data.get("duration_ms")
+            status = event.status or ("success" if event.ok else "failed")
+            duration = event.duration_ms
             suffix = f" ({duration} ms)" if duration is not None else ""
-            self._status(f"tool< {event.data.get('name', '')} {status}{suffix}".rstrip())
-        elif event.kind == "provider_retry":
+            self._status(f"tool< {event.name} {status}{suffix}".rstrip())
+        elif isinstance(event, ProviderRetryEvent):
             self._close_line()
-            attempt = event.data.get("attempt")
-            delay = event.data.get("delay_seconds")
-            self._status(f"retry> attempt {attempt} in {delay}s: {event.text}")
-        elif event.kind == "context_compacted":
+            self._status(
+                f"retry> attempt {event.attempt} in {event.delay_seconds}s: {event.error}"
+            )
+        elif isinstance(event, ContextCompactedEvent):
             self._close_line()
             self._status(
                 "context> compacted "
-                f"{event.data.get('compacted_messages', 0)} messages; "
-                f"estimated {event.data.get('estimated_tokens', 0)}/"
-                f"{event.data.get('input_budget', 0)} tokens"
+                f"{event.snapshot.get('compacted_messages', 0)} messages; "
+                f"estimated {event.snapshot.get('estimated_tokens', 0)}/"
+                f"{event.snapshot.get('input_budget', 0)} tokens"
             )
-        elif event.kind == "turn_resumed":
-            self._status(f"retry> resuming model step {event.data.get('step')}")
-        elif event.kind == "turn_error":
+        elif isinstance(event, TurnResumedEvent):
+            self._status(f"retry> resuming model step {event.step}")
+        elif isinstance(event, TurnErrorEvent):
             self._close_line()
-            self._status(f"error> {event.text}")
+            self._status(f"error> {event.error}")
 
     def finish(self, fallback_answer: str) -> None:
         if self._plan_filter is not None:
