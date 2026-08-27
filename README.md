@@ -97,7 +97,7 @@ OpenAI 模型目录；凭据文件不存在时仍可使用环境变量。
 上限，模型便会出现在 `/model` 选择器中。只有已经实现 adapter 的 provider 才会显示为可选项；
 当前实现为 `deepseek` 和 `openai`。
 
-CLI 只提供 `ask`、`chat` 和 `resume` 三个 session-aware 入口。
+CLI 提供 `ask`、`chat`、`resume` 和 transport-facing `serve` 入口。
 执行一个可恢复的单轮任务：
 
 ```bash
@@ -120,6 +120,32 @@ stdout。之后可以用同一个 ID 继续对话：
 ```bash
 .venv/bin/python cli.py chat --workspace .
 ```
+
+## JSONL Agent Server
+
+`serve` 将一个新建或恢复的 session 暴露为双向 stdin/stdout JSONL 协议。stdout 不混入普通终端
+文本；第一行是 `server.ready`，客户端取得 `session_id` 后发送 `command_to_dict()` 生成的命令：
+
+```bash
+DEEPSEEK_API_KEY=... .venv/bin/python cli.py serve --workspace .
+```
+
+```json
+{"protocol_version":1,"type":"turn.start","command_id":"cmd-1","session_id":"<id>","payload":{"user_input":"Inspect this repo","retry":false,"approved_plan_id":null}}
+```
+
+同一 session 的 typed events 会追加到 `.my-agent/sessions/<id>/events.jsonl`。客户端断线后可以发送：
+
+```json
+{"protocol_version":1,"type":"events.replay","command_id":"cmd-2","session_id":"<id>","payload":{"after_sequence":42}}
+```
+
+service 会按原始 `event_id` 和 `sequence` 重放大于 cursor 的事件，最后发送新的
+`events.replay_completed`。恢复已有 session 使用 `serve --session-id <id>`。当前一个 `serve`
+进程只绑定一个 session；多 session catalog、鉴权和 WebSocket transport 尚未实现。
+
+`events.jsonl` 与 `trace.jsonl` 用途不同：前者是客户端 UI 可恢复的协议时间线，后者记录更详细的
+model request/response、tool call/result 和 plan lifecycle，供 trajectory 和调试使用。
 
 ## Collaboration Modes
 
@@ -246,11 +272,13 @@ OpenAI reasoning 默认使用配置中的 `medium` effort 和 `auto` summary，�
 
 代码按这几个边界拆分：
 
-- `cli.py`：解析 `ask/chat/resume`，控制 REPL，只发送 typed command 和渲染 typed event
+- `cli.py`：解析 `ask/chat/resume/serve`，控制 REPL 或组装 JSONL server，不参与 agent 决策
 - `terminal.py`：封装 command completion、context UI、history 和 typed event 流式渲染，不参与 agent 决策
 - `protocol.py`：定义 transport-neutral command/event 类型、协议版本、序号和 JSON 编解码
+- `event_store.py`：按 session 追加 typed events，校验单调 sequence，并按 cursor 重放
 - `service.py`：按 session 路由命令，编排 model/mode/plan/abort 状态转换，保存 session，并把内部
   runtime event 提升为客户端协议事件
+- `transport.py`：实现单 session 双向 JSONL stdio server、`server.ready` 和协议错误输出
 - `runtime.py`：单 session 执行器；在 worker 中驱动一个 turn，并发布内部 `RuntimeEvent`
 - `control.py`：定义 cancellation、permission request 和 approval decision 契约
 - `session.py`：序列化统一 `Message`、context 状态和可重试的 `PendingTurn`
@@ -292,6 +320,7 @@ CLI loads SessionState
   -> selected ProviderAdapter performs one API attempt and maps its wire protocol
   -> typed ModelEvent deltas become internal AgentEvent / RuntimeEvent
   -> AgentService converts them to versioned, sequenced protocol events
+     -> EventStore appends each event before publishing it to the client
   -> CLI renders concrete types such as ContentDeltaEvent and ToolStartedEvent
   -> ModelCompleted contains ordered text/reasoning/tool-call output plus usage/metadata
   -> AgentLoop either accepts a final answer
@@ -326,10 +355,10 @@ Build execution -> final answer: completed
 递增序号和显式状态，并可转换为 JSON object。
 
 `AgentRuntime` 降为 service 内部的单 session 执行器，状态机仍使用 `idle`、`running_model`、
-`waiting_approval`、`running_tool`、`completed`、`failed`、`interrupted`。首版 service 仍由 CLI
-在进程内调用，尚未启动 HTTP/WebSocket server；下一步 transport 只需解码 command、调用
-`dispatch()` 并编码 event，不需要复制 plan approval 或 mode switching。`AgentLoop` 不读取 stdin，
-也不知道 prompt_toolkit、service 或 transport。
+`waiting_approval`、`running_tool`、`completed`、`failed`、`interrupted`。`ask/chat/resume` 仍在进程
+内调用 service；`serve` 则证明同一 service 可以通过外部 JSONL transport 驱动。后续 WebSocket
+adapter 只需解码 command、调用 `dispatch()` 并编码 event，不需要复制 plan approval 或 mode
+switching。`AgentLoop` 不读取 stdin，也不知道 prompt_toolkit、service、event store 或 transport。
 
 Context token 数量是保守估算，不是 provider tokenizer 的精确计数。达到输入预算的 85% 时，
 `ContextManager` 会按完整 user turn 边界压缩较老历史，目标降到 70%；当前 active turn、最近

@@ -12,6 +12,8 @@ from my_agent.protocol import (
     AgentState,
     ContentDeltaEvent,
     ExecutePlanCommand,
+    ReplayCompletedEvent,
+    ReplayEventsCommand,
     ResolveApprovalCommand,
     StartTurnCommand,
     TurnCompletedEvent,
@@ -22,6 +24,7 @@ from my_agent.protocol import (
 )
 from my_agent.runtime import RuntimeEvent, RuntimeState, StartTurn
 from my_agent.service import AgentService
+from my_agent.event_store import EventStore
 from my_agent.session import ProposedPlan, SessionState
 
 
@@ -55,6 +58,7 @@ class _Runtime:
     def __init__(self, state: SessionState) -> None:
         self.session = state
         self.loop = _Loop()
+        self.state = RuntimeState.IDLE
         self.events: queue.Queue[RuntimeEvent] = queue.Queue()
         self.commands = []
         self.closed = False
@@ -211,6 +215,61 @@ class AgentServiceTests(unittest.TestCase):
             self.assertIsInstance(runtime.commands[0], StartTurn)
             self.assertEqual(runtime.commands[0].approved_plan_id, "plan-1")
             self.assertTrue(saved)
+            service.close()
+
+    def test_service_replays_persisted_events_after_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = self._state(root)
+            runtime = _Runtime(state)
+            runtime.events.put(
+                RuntimeEvent(
+                    kind="content_delta",
+                    state=RuntimeState.RUNNING_MODEL,
+                    text="hello",
+                    data={"step": 1},
+                )
+            )
+            runtime.events.put(
+                RuntimeEvent(
+                    kind="turn_completed",
+                    state=RuntimeState.COMPLETED,
+                    text="hello",
+                    data={
+                        "steps": 1,
+                        "stopped_by": "final_answer",
+                        "mode_id": "build",
+                        "plan_id": None,
+                    },
+                    result=TurnResult(
+                        answer="hello",
+                        messages=[],
+                        steps=1,
+                        stopped_by="final_answer",
+                    ),
+                )
+            )
+            service = AgentService(
+                tool_registry_factory=lambda mode: object(),
+                event_store=EventStore(root / ".my-agent" / "sessions"),
+            )
+            service.register(runtime)
+            service.dispatch(StartTurnCommand(session_id=state.session_id, user_input="hi"))
+            service.next_event(timeout=1)
+            service.next_event(timeout=1)
+
+            service.dispatch(
+                ReplayEventsCommand(session_id=state.session_id, after_sequence=1)
+            )
+            replayed = service.next_event(timeout=1)
+            completed = service.next_event(timeout=1)
+
+            self.assertIsInstance(replayed, TurnCompletedEvent)
+            self.assertEqual(replayed.sequence, 2)
+            self.assertIsInstance(completed, ReplayCompletedEvent)
+            self.assertEqual(completed.replayed_events, 1)
+            self.assertEqual(completed.latest_sequence, 2)
+            self.assertEqual(completed.sequence, 3)
             service.close()
 
 

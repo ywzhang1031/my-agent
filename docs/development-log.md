@@ -288,6 +288,23 @@ CLI 与 agent harness 之间新增 transport-neutral application boundary，避�
 - CLI 仍在同一 Python 进程内调用 service。当前没有 HTTP/WebSocket/stdio server，也没有远程
   session create/list protocol；这些是稳定 command/event schema 之上的后续 transport 工作。
 
+## Milestone 18: Durable Events and JSONL Transport
+
+typed protocol 从进程内 queue 扩展到可恢复的客户端时间线和真实进程边界。
+
+- `EventStore` 将每个客户端事件以 compact JSONL 追加到 session 的 `events.jsonl`；写入发生在
+  publish 之前，sequence 必须严格递增，损坏、session mismatch 或乱序日志会显式失败。
+- `AgentService.register()` 从 event log 恢复 sequence，因此 `serve --session-id` 后的新事件不会
+  从 1 重新开始。`ReplayEventsCommand(after_sequence)` 重放原 event ID/sequence，并以新的
+  `ReplayCompletedEvent` 标记 replay 边界。
+- `JsonlAgentServer` 使用 stdin 接收 `command_to_dict()`，用 stdout 输出 `event_to_dict()`；独立 writer
+  thread 允许模型生成期间继续接收 interrupt 和 approval command。无效 JSON、版本、类型或 session
+  mismatch 返回 `server.error`，不污染 stdout 协议。
+- `serve` 启动时创建 session，或用 `--session-id` 恢复；第一条消息为 `server.ready`。当前每个 server
+  进程绑定一个 session，先验证 transport 和 recovery，不提前实现多租户 app daemon。
+- `ask/chat/resume` 也启用同一 EventStore。event log 服务 UI replay；raw trace 继续服务 trajectory，
+  两者不混用。
+
 ## Current Boundaries
 
 - `apply_patch` 可以自动修改 workspace 内的单个普通 UTF-8/LF 文件。
@@ -310,13 +327,13 @@ CLI 与 agent harness 之间新增 transport-neutral application boundary，避�
 - 本地 `.my-agent/`、`trace.jsonl` 和 `trajectory.json` 默认不提交到 Git。
 - 当前实现 DeepSeek Chat Completions 和 OpenAI Responses adapter；其他厂商仍需实现并测试自己的
   wire adapter。
-- `AgentService` 当前只管理调用方已注册的 runtime；尚未提供独立 daemon、远程 transport、鉴权、
-  event replay 或跨进程 crash recovery。
+- `serve` 是单 session stdio server；尚未提供多 session daemon、session create/list RPC、鉴权、
+  WebSocket、event retention/compaction 或运行中 turn 的跨进程恢复。
 
 ## Next Candidates
 
-- 在 typed protocol 上增加 JSONL stdio 或 HTTP/WebSocket transport，以及 session create/list/resume。
-- 为 event sequence 增加持久化和 replay cursor，让 UI 断线后可以恢复同一 turn 时间线。
+- 在同一 typed protocol 上增加 session create/list/resume RPC 和 HTTP/WebSocket transport。
+- 为 event log 增加 retention/compaction；当前每个 model delta 都会持久化。
 - 使用 macOS Seatbelt、Linux bubblewrap 或 container 将允许的进程放入 OS sandbox。
 - 在确定性 compactor 之上增加可选的 provider semantic summary 和 summary 质量验证。
 - 增加更多 provider adapter，并对 streaming/tool-call edge cases 建立 contract tests。

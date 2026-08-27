@@ -1308,7 +1308,7 @@ class MyAgentTests(unittest.TestCase):
             )
             self.assertEqual(without_tools.breakdown.tool_definition_tokens, 0)
 
-    def test_cli_only_accepts_current_subcommands(self):
+    def test_cli_accepts_session_and_server_subcommands(self):
         parser = build_parser()
         ask = parser.parse_args(
             [
@@ -1326,6 +1326,9 @@ class MyAgentTests(unittest.TestCase):
         )
         chat = parser.parse_args(["chat", "--workspace", "/tmp/repo"])
         resume = parser.parse_args(["resume", "session-123", "--workspace", "/tmp/repo"])
+        serve = parser.parse_args(
+            ["serve", "--session-id", "session-123", "--workspace", "/tmp/repo"]
+        )
 
         self.assertEqual(ask.command, "ask")
         self.assertEqual(ask.prompt, ["inspect", "this", "repo"])
@@ -1336,6 +1339,8 @@ class MyAgentTests(unittest.TestCase):
         self.assertEqual(chat.command, "chat")
         self.assertEqual(resume.command, "resume")
         self.assertEqual(resume.session_id, "session-123")
+        self.assertEqual(serve.command, "serve")
+        self.assertEqual(serve.session_id, "session-123")
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             parser.parse_args(["--workspace", "/tmp/repo", "inspect", "this", "repo"])
 

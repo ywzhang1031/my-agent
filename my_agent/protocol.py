@@ -30,6 +30,7 @@ class CommandType(str, Enum):
     EXECUTE_PLAN = "plan.execute"
     REVISE_PLAN = "plan.revise"
     ABORT_TURN = "turn.abort"
+    REPLAY_EVENTS = "events.replay"
 
 
 class EventType(str, Enum):
@@ -54,6 +55,7 @@ class EventType(str, Enum):
     PLAN_APPROVED = "plan.approved"
     PLAN_REVISION_REQUESTED = "plan.revision_requested"
     TURN_ABORTED = "turn.aborted"
+    REPLAY_COMPLETED = "events.replay_completed"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -110,6 +112,16 @@ class AbortTurnCommand(AgentCommand):
     command_type: ClassVar[CommandType] = CommandType.ABORT_TURN
 
 
+@dataclass(frozen=True, kw_only=True)
+class ReplayEventsCommand(AgentCommand):
+    after_sequence: int = 0
+    command_type: ClassVar[CommandType] = CommandType.REPLAY_EVENTS
+
+    def __post_init__(self) -> None:
+        if self.after_sequence < 0:
+            raise ValueError("after_sequence must not be negative")
+
+
 AgentCommandType: TypeAlias = (
     StartTurnCommand
     | InterruptTurnCommand
@@ -119,6 +131,7 @@ AgentCommandType: TypeAlias = (
     | ExecutePlanCommand
     | RevisePlanCommand
     | AbortTurnCommand
+    | ReplayEventsCommand
 )
 
 
@@ -298,6 +311,14 @@ class TurnAbortedEvent(AgentEvent):
     event_type: ClassVar[EventType] = EventType.TURN_ABORTED
 
 
+@dataclass(frozen=True, kw_only=True)
+class ReplayCompletedEvent(AgentEvent):
+    after_sequence: int
+    replayed_events: int
+    latest_sequence: int
+    event_type: ClassVar[EventType] = EventType.REPLAY_COMPLETED
+
+
 AgentEventType: TypeAlias = (
     TurnStartedEvent
     | TurnResumedEvent
@@ -320,6 +341,7 @@ AgentEventType: TypeAlias = (
     | PlanApprovedEvent
     | PlanRevisionRequestedEvent
     | TurnAbortedEvent
+    | ReplayCompletedEvent
 )
 
 
@@ -334,6 +356,7 @@ _COMMAND_TYPES = {
         ExecutePlanCommand,
         RevisePlanCommand,
         AbortTurnCommand,
+        ReplayEventsCommand,
     )
 }
 
@@ -361,6 +384,7 @@ _EVENT_TYPES = {
         PlanApprovedEvent,
         PlanRevisionRequestedEvent,
         TurnAbortedEvent,
+        ReplayCompletedEvent,
     )
 }
 

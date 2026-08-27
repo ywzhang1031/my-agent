@@ -5,6 +5,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Callable
 
+from .event_store import EventStore
 from .model_invoker import ModelInvoker
 from .modes import BUILD_MODE, CollaborationMode, get_mode
 from .protocol import (
@@ -25,6 +26,8 @@ from .protocol import (
     PlanRevisionRequestedEvent,
     ProviderRetryEvent,
     ReasoningDeltaEvent,
+    ReplayCompletedEvent,
+    ReplayEventsCommand,
     ResolveApprovalCommand,
     RevisePlanCommand,
     StartTurnCommand,
@@ -92,10 +95,12 @@ class AgentService:
         tool_registry_factory: ToolRegistryFactory,
         model_resolver: ModelResolver | None = None,
         save_session: SessionSaver | None = None,
+        event_store: EventStore | None = None,
     ) -> None:
         self._tool_registry_factory = tool_registry_factory
         self._model_resolver = model_resolver
         self._save_session = save_session or (lambda state: None)
+        self._event_store = event_store
         self._sessions: dict[str, _SessionHandle] = {}
         self._events: queue.Queue[AgentEventType] = queue.Queue()
         self._lock = threading.Lock()
@@ -105,7 +110,15 @@ class AgentService:
         with self._lock:
             if session_id in self._sessions:
                 raise ValueError(f"session already registered: {session_id}")
-            self._sessions[session_id] = _SessionHandle(runtime=runtime)
+            sequence = (
+                self._event_store.latest_sequence(session_id)
+                if self._event_store is not None
+                else 0
+            )
+            self._sessions[session_id] = _SessionHandle(
+                runtime=runtime,
+                sequence=sequence,
+            )
 
     def dispatch(self, command: AgentCommandType) -> None:
         handle = self._handle(command.session_id)
@@ -145,6 +158,9 @@ class AgentService:
             return
         if isinstance(command, AbortTurnCommand):
             self._abort_turn(handle)
+            return
+        if isinstance(command, ReplayEventsCommand):
+            self._replay_events(handle, command.after_sequence)
             return
         raise TypeError(f"unsupported service command: {type(command).__name__}")
 
@@ -303,6 +319,29 @@ class AgentService:
             tool_calls_executed=pending.tool_calls_executed,
         )
 
+    def _replay_events(self, handle: _SessionHandle, after_sequence: int) -> None:
+        if self._event_store is None:
+            raise RuntimeError("agent service has no event store")
+        with handle.lock:
+            events = self._event_store.replay(
+                handle.runtime.session.session_id,
+                after_sequence=after_sequence,
+            )
+            latest = handle.sequence
+            for event in events:
+                self._events.put(event)
+            handle.sequence += 1
+            completed = ReplayCompletedEvent(
+                session_id=handle.runtime.session.session_id,
+                sequence=handle.sequence,
+                state=AgentState(handle.runtime.state.value),
+                after_sequence=after_sequence,
+                replayed_events=len(events),
+                latest_sequence=latest,
+            )
+            self._event_store.append(completed)
+            self._events.put(completed)
+
     def _publish_runtime_event(
         self,
         handle: _SessionHandle,
@@ -446,12 +485,12 @@ class AgentService:
     def _publish(self, handle, event_type, state: AgentState, **payload) -> None:
         with handle.lock:
             handle.sequence += 1
-            sequence = handle.sequence
-        self._events.put(
-            event_type(
+            event = event_type(
                 session_id=handle.runtime.session.session_id,
-                sequence=sequence,
+                sequence=handle.sequence,
                 state=state,
                 **payload,
             )
-        )
+            if self._event_store is not None:
+                self._event_store.append(event)
+            self._events.put(event)

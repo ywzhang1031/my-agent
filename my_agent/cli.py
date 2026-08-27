@@ -8,6 +8,7 @@ from queue import Empty
 from .agent_loop import AgentLoop
 from .config import RuntimeConfig, load_runtime_config
 from .control import ApprovalDecision
+from .event_store import EventStore
 from .model_invoker import ModelInvoker
 from .modes import BUILD_MODE, COLLABORATION_MODES, CollaborationMode, get_mode
 from .permissions import PermissionPolicy
@@ -46,6 +47,7 @@ from .terminal import (
     format_context_status,
     render_context_usage,
 )
+from .transport import JsonlAgentServer
 from .tools import (
     ApplyPatchTool,
     ExecCommandTool,
@@ -99,6 +101,17 @@ def build_parser() -> argparse.ArgumentParser:
     resume = subparsers.add_parser("resume", help="Resume an existing interactive session.")
     resume.add_argument("session_id", help="Session identifier printed by ask or chat.")
     _add_runtime_options(resume)
+
+    serve = subparsers.add_parser(
+        "serve",
+        help="Run a one-session JSONL agent server over stdin/stdout.",
+    )
+    serve.add_argument(
+        "--session-id",
+        default=None,
+        help="Resume this session. Creates a new session when omitted.",
+    )
+    _add_runtime_options(serve)
     return parser
 
 
@@ -112,6 +125,8 @@ def main(argv: list[str] | None = None) -> int:
             return _run_new_chat(args)
         if args.command == "resume":
             return _run_resume(args)
+        if args.command == "serve":
+            return _run_serve(args)
         raise ValueError(f"unknown command: {args.command}")
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -247,6 +262,36 @@ def _run_resume(args: argparse.Namespace) -> int:
     store = _session_store(args, requested_workspace)
     state = store.load(args.session_id)
     return _chat(args, store, state)
+
+
+def _run_serve(args: argparse.Namespace) -> int:
+    requested_workspace = Workspace(args.workspace)
+    store = _session_store(args, requested_workspace)
+    state = (
+        store.load(args.session_id)
+        if args.session_id is not None
+        else store.create(requested_workspace.root)
+    )
+    _restore_session_model(args, state)
+    _restore_session_mode(args, state)
+    workspace = Workspace(state.workspace)
+    loop, _ = _build_runtime(args, workspace, state.trace_path)
+    _sync_session_model(state, loop)
+    _sync_session_mode(state, loop)
+    _save_session_artifacts(store, state)
+    service = _build_agent_service(
+        args,
+        store,
+        state,
+        loop,
+        interactive_approvals=True,
+    )
+    server = JsonlAgentServer(service, session_id=state.session_id)
+    try:
+        server.serve(sys.stdin, sys.stdout)
+    finally:
+        _save_session_artifacts(store, state)
+    return 0
 
 
 def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) -> int:
@@ -773,6 +818,7 @@ def _build_agent_service(
         tool_registry_factory=build_tool_registry,
         model_resolver=lambda model_ref: _build_model(args, model_ref=model_ref),
         save_session=lambda session: _save_session_artifacts(store, session),
+        event_store=EventStore(store.root),
     )
     service.register(runtime)
     return service
