@@ -121,28 +121,51 @@ stdout。之后可以用同一个 ID 继续对话：
 .venv/bin/python cli.py chat --workspace .
 ```
 
-## JSONL Agent Server
+## Multi-session JSONL AppServer
 
-`serve` 将一个新建或恢复的 session 暴露为双向 stdin/stdout JSONL 协议。stdout 不混入普通终端
-文本；第一行是 `server.ready`，客户端取得 `session_id` 后发送 `command_to_dict()` 生成的命令：
+`serve` 启动一个绑定当前 workspace 的长生命周期 AppServer。它不会在启动时隐式创建 session；
+客户端通过同步 RPC 管理多个 session，再从同一个 stdout 接收异步 agent events：
 
 ```bash
 DEEPSEEK_API_KEY=... .venv/bin/python cli.py serve --workspace .
 ```
 
 ```json
-{"protocol_version":1,"type":"turn.start","command_id":"cmd-1","session_id":"<id>","payload":{"user_input":"Inspect this repo","retry":false,"approved_plan_id":null}}
+{"channel":"request","rpc_version":1,"request_id":"req-1","method":"session.create","params":{"mode_id":"plan"}}
 ```
 
-同一 session 的 typed events 会追加到 `.my-agent/sessions/<id>/events.jsonl`。客户端断线后可以发送：
+对应 response 使用同一个 `request_id`：
 
 ```json
-{"protocol_version":1,"type":"events.replay","command_id":"cmd-2","session_id":"<id>","payload":{"after_sequence":42}}
+{"channel":"response","rpc_version":1,"request_id":"req-1","ok":true,"result":{"session":{"session_id":"<id>","active":true}}}
 ```
 
-service 会按原始 `event_id` 和 `sequence` 重放大于 cursor 的事件，最后发送新的
-`events.replay_completed`。恢复已有 session 使用 `serve --session-id <id>`。当前一个 `serve`
-进程只绑定一个 session；多 session catalog、鉴权和 WebSocket transport 尚未实现。
+创建后可以启动 turn：
+
+```json
+{"channel":"request","rpc_version":1,"request_id":"req-2","method":"turn.start","params":{"session_id":"<id>","user_input":"Inspect this repo"}}
+```
+
+`turn.start` response 只说明 command 已被接收。模型、tool、approval 和 terminal event 通过
+`channel=event` 异步发送，仍使用 `protocol_version`、`event_id`、`session_id` 和单 session
+递增 `sequence`。response 与 event 之间不承诺全局先后顺序；客户端按 `request_id` 关联 RPC，
+按 `(session_id, sequence)` 处理事件。
+
+control plane 提供：
+
+- `session.create/list/read/resume/close`
+- `model.list`、`mode.list`
+- `turn.start/retry/interrupt/abort`
+- `approval.resolve`、`model.switch`、`mode.switch`
+- `plan.execute/revise`、`events.replay`
+
+`session.close` 只停止并卸载内存 runtime，不删除磁盘记录；`session.resume` 将它重新加载。AppServer
+保证同一 session 同时只有一个 active turn，不同 session 可以并发运行。客户端断线后先
+`session.resume`，再调用 `events.replay` 并传入最后确认的 `after_sequence`。service 会按原始
+`event_id` 和 `sequence` 重放事件，最后异步发送新的 `events.replay_completed`。
+
+当前 stdio transport 适合本地 UI 子进程，不包含鉴权、多客户端连接或 WebSocket；这些是同一
+AppServer/RPC 边界上的后续 transport。
 
 `events.jsonl` 与 `trace.jsonl` 用途不同：前者是客户端 UI 可恢复的协议时间线，后者记录更详细的
 model request/response、tool call/result 和 plan lifecycle，供 trajectory 和调试使用。
@@ -275,10 +298,12 @@ OpenAI reasoning 默认使用配置中的 `medium` effort 和 `auto` summary，�
 - `cli.py`：解析 `ask/chat/resume/serve`，控制 REPL 或组装 JSONL server，不参与 agent 决策
 - `terminal.py`：封装 command completion、context UI、history 和 typed event 流式渲染，不参与 agent 决策
 - `protocol.py`：定义 transport-neutral command/event 类型、协议版本、序号和 JSON 编解码
+- `rpc.py`：定义同步 request/response envelope、`request_id` 和结构化 RPC error
 - `event_store.py`：按 session 追加 typed events，校验单调 sequence，并按 cursor 重放
 - `service.py`：按 session 路由命令，编排 model/mode/plan/abort 状态转换，保存 session，并把内部
   runtime event 提升为客户端协议事件
-- `transport.py`：实现单 session 双向 JSONL stdio server、`server.ready` 和协议错误输出
+- `app_server.py`：管理多 session runtime 生命周期、catalog，并把 RPC 翻译为 typed command
+- `transport.py`：实现 multiplexed JSONL stdio transport，区分 control/response/event channel
 - `runtime.py`：单 session 执行器；在 worker 中驱动一个 turn，并发布内部 `RuntimeEvent`
 - `control.py`：定义 cancellation、permission request 和 approval decision 契约
 - `session.py`：序列化统一 `Message`、context 状态和可重试的 `PendingTurn`
@@ -304,10 +329,12 @@ OpenAI reasoning 默认使用配置中的 `medium` effort 和 `auto` summary，�
 一次 turn 的调用顺序是：
 
 ```text
-CLI loads SessionState
+CLI or AppServer loads SessionState
   -> resolves the persisted collaboration mode
      -> builds a mode-specific ToolRegistry and system prompt
-  -> CLI sends StartTurnCommand(session_id, ...) to AgentService
+  -> local CLI sends StartTurnCommand directly
+     or remote client sends turn.start RPC to AppServer
+        -> AppServer validates params and creates StartTurnCommand
   -> AgentService routes the command to the registered session
      -> translates it into the internal StartTurn command
   -> AgentRuntime starts one worker and publishes lifecycle events
@@ -321,14 +348,15 @@ CLI loads SessionState
   -> typed ModelEvent deltas become internal AgentEvent / RuntimeEvent
   -> AgentService converts them to versioned, sequenced protocol events
      -> EventStore appends each event before publishing it to the client
-  -> CLI renders concrete types such as ContentDeltaEvent and ToolStartedEvent
+  -> CLI or remote client renders concrete types such as ContentDeltaEvent and ToolStartedEvent
   -> ModelCompleted contains ordered text/reasoning/tool-call output plus usage/metadata
   -> AgentLoop either accepts a final answer
      -> in Plan mode, a complete proposed_plan block becomes persisted ProposedPlan state
      or asks ToolRegistry to validate and describe every tool call
   -> write/exec action becomes PermissionRequest
-     -> CLI receives ApprovalRequestedEvent
-     -> user sends ResolveApprovalCommand(allow_once/allow_session/deny)
+     -> client receives ApprovalRequestedEvent
+     -> local CLI sends ResolveApprovalCommand
+        or remote client sends approval.resolve RPC
      -> the same suspended tool call resumes; the model is not called again first
   -> approved call executes; denied call becomes a failed ToolResult
   -> ToolResult becomes ToolResultMessage
@@ -347,7 +375,8 @@ Build execution -> final answer: completed
                 -> abort/length/max_steps: proposed again
 ```
 
-`AgentService` 现在是客户端和 harness 的应用边界。`StartTurnCommand`、
+`AppServer` 是 UI/transport 的 control-plane 边界；`AgentService` 是 session runtime 与 harness 的
+应用边界。`StartTurnCommand`、
 `InterruptTurnCommand`、`ResolveApprovalCommand`、`SwitchModelCommand`、`SwitchModeCommand`、
 `ExecutePlanCommand`、`RevisePlanCommand` 和 `AbortTurnCommand` 都只包含可序列化字段。输出不再是
 `kind: str + data: dict`，而是 `ContentDeltaEvent`、`ApprovalRequestedEvent`、
@@ -356,9 +385,10 @@ Build execution -> final answer: completed
 
 `AgentRuntime` 降为 service 内部的单 session 执行器，状态机仍使用 `idle`、`running_model`、
 `waiting_approval`、`running_tool`、`completed`、`failed`、`interrupted`。`ask/chat/resume` 仍在进程
-内调用 service；`serve` 则证明同一 service 可以通过外部 JSONL transport 驱动。后续 WebSocket
-adapter 只需解码 command、调用 `dispatch()` 并编码 event，不需要复制 plan approval 或 mode
-switching。`AgentLoop` 不读取 stdin，也不知道 prompt_toolkit、service、event store 或 transport。
+内调用 service；`serve` 用一个 AppServer 持有多个 runtime。后续 WebSocket adapter 只需解码 RPC、
+调用 `AppServer.handle()` 并编码 response/event，不需要复制 session lifecycle、plan approval 或
+mode switching。`AgentLoop` 不读取 stdin，也不知道 prompt_toolkit、AppServer、event store 或
+transport。
 
 Context token 数量是保守估算，不是 provider tokenizer 的精确计数。达到输入预算的 85% 时，
 `ContextManager` 会按完整 user turn 边界压缩较老历史，目标降到 70%；当前 active turn、最近

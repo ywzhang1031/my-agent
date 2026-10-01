@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import sys
 from pathlib import Path
 from queue import Empty
 
 from .agent_loop import AgentLoop
+from .app_server import AppServer
 from .config import RuntimeConfig, load_runtime_config
 from .control import ApprovalDecision
 from .event_store import EventStore
@@ -47,7 +49,7 @@ from .terminal import (
     format_context_status,
     render_context_usage,
 )
-from .transport import JsonlAgentServer
+from .transport import JsonlAppServer
 from .tools import (
     ApplyPatchTool,
     ExecCommandTool,
@@ -104,14 +106,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     serve = subparsers.add_parser(
         "serve",
-        help="Run a one-session JSONL agent server over stdin/stdout.",
+        help="Run a multi-session JSONL app server over stdin/stdout.",
     )
-    serve.add_argument(
-        "--session-id",
-        default=None,
-        help="Resume this session. Creates a new session when omitted.",
-    )
-    _add_runtime_options(serve)
+    _add_runtime_options(serve, terminal_ui=False)
     return parser
 
 
@@ -133,7 +130,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
 
-def _add_runtime_options(parser: argparse.ArgumentParser) -> None:
+def _add_runtime_options(
+    parser: argparse.ArgumentParser,
+    *,
+    terminal_ui: bool = True,
+) -> None:
     _add_provider_options(parser)
     parser.add_argument("--workspace", default=".", help="Workspace root the agent may inspect.")
     parser.add_argument(
@@ -148,17 +149,18 @@ def _add_runtime_options(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Collaboration mode. New sessions default to build.",
     )
-    parser.add_argument(
-        "--stream",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Stream model text and tool progress. Enabled by default.",
-    )
-    parser.add_argument(
-        "--show-thinking",
-        action="store_true",
-        help="Display streamed reasoning_content before answer content.",
-    )
+    if terminal_ui:
+        parser.add_argument(
+            "--stream",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help="Stream model text and tool progress. Enabled by default.",
+        )
+        parser.add_argument(
+            "--show-thinking",
+            action="store_true",
+            help="Display streamed reasoning_content before answer content.",
+        )
     parser.add_argument(
         "--context-window-tokens",
         type=int,
@@ -265,32 +267,32 @@ def _run_resume(args: argparse.Namespace) -> int:
 
 
 def _run_serve(args: argparse.Namespace) -> int:
-    requested_workspace = Workspace(args.workspace)
-    store = _session_store(args, requested_workspace)
-    state = (
-        store.load(args.session_id)
-        if args.session_id is not None
-        else store.create(requested_workspace.root)
+    workspace = Workspace(args.workspace)
+    store = _session_store(args, workspace)
+    service = AgentService(
+        tool_registry_factory=build_tool_registry,
+        model_resolver=lambda model_ref: _build_model(args, model_ref=model_ref),
+        save_session=lambda session: _save_session_artifacts(store, session),
+        event_store=EventStore(store.root),
     )
-    _restore_session_model(args, state)
-    _restore_session_mode(args, state)
-    workspace = Workspace(state.workspace)
-    loop, _ = _build_runtime(args, workspace, state.trace_path)
-    _sync_session_model(state, loop)
-    _sync_session_mode(state, loop)
-    _save_session_artifacts(store, state)
-    service = _build_agent_service(
-        args,
-        store,
-        state,
-        loop,
-        interactive_approvals=True,
+    app_server = AppServer(
+        workspace=workspace.root,
+        session_store=store,
+        agent_service=service,
+        runtime_factory=lambda state, model_ref, mode_id: _build_server_runtime(
+            args,
+            state,
+            model_ref=model_ref,
+            mode_id=mode_id,
+        ),
+        models=(
+            model
+            for model in args.runtime_config.models()
+            if model.provider_id in SUPPORTED_PROVIDER_IDS
+        ),
+        modes=COLLABORATION_MODES,
     )
-    server = JsonlAgentServer(service, session_id=state.session_id)
-    try:
-        server.serve(sys.stdin, sys.stdout)
-    finally:
-        _save_session_artifacts(store, state)
+    JsonlAppServer(app_server).serve(sys.stdin, sys.stdout)
     return 0
 
 
@@ -803,6 +805,32 @@ def _build_runtime(
         mode=mode,
     )
     return loop, registry
+
+
+def _build_server_runtime(
+    args: argparse.Namespace,
+    state: SessionState,
+    *,
+    model_ref: str | None,
+    mode_id: str | None,
+) -> AgentRuntime:
+    session_args = copy.copy(args)
+    is_new = state.provider_id is None and state.model_id is None
+    session_args.provider = args.provider if is_new else None
+    session_args.model = args.model if is_new else None
+    session_args.mode = args.mode if is_new else None
+    if model_ref is not None:
+        session_args.provider = None
+        session_args.model = model_ref
+    if mode_id is not None:
+        session_args.mode = mode_id
+    _restore_session_model(session_args, state)
+    _restore_session_mode(session_args, state)
+    workspace = Workspace(state.workspace)
+    loop, _ = _build_runtime(session_args, workspace, state.trace_path)
+    _sync_session_model(state, loop)
+    _sync_session_mode(state, loop)
+    return AgentRuntime(loop, state, interactive_approvals=True)
 
 
 def _build_agent_service(

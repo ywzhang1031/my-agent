@@ -3,22 +3,23 @@ from __future__ import annotations
 import json
 import queue
 import threading
-from typing import Any, TextIO
+from typing import Any, Mapping, TextIO
 
-from .protocol import (
-    PROTOCOL_VERSION,
-    command_from_dict,
-    event_to_dict,
+from .app_server import AppServer
+from .protocol import PROTOCOL_VERSION, event_to_dict
+from .rpc import (
+    RPC_VERSION,
+    ResponseEnvelope,
+    request_from_dict,
+    response_to_dict,
 )
-from .service import AgentService
 
 
-class JsonlAgentServer:
-    """Bidirectional stdio transport for one registered agent session."""
+class JsonlAppServer:
+    """Multiplexed JSONL stdio transport for one multi-session AppServer."""
 
-    def __init__(self, service: AgentService, *, session_id: str) -> None:
-        self.service = service
-        self.session_id = session_id
+    def __init__(self, app_server: AppServer) -> None:
+        self.app_server = app_server
         self._write_lock = threading.Lock()
         self._stop = threading.Event()
 
@@ -26,15 +27,17 @@ class JsonlAgentServer:
         self._write(
             output_stream,
             {
-                "protocol_version": PROTOCOL_VERSION,
+                "channel": "control",
                 "type": "server.ready",
-                "session_id": self.session_id,
+                "rpc_version": RPC_VERSION,
+                "protocol_version": PROTOCOL_VERSION,
+                "workspace": str(self.app_server.workspace),
             },
         )
         writer = threading.Thread(
             target=self._write_events,
             args=(output_stream,),
-            name=f"agent-jsonl-writer-{self.session_id}",
+            name="agent-jsonl-event-writer",
             daemon=True,
         )
         writer.start()
@@ -42,57 +45,51 @@ class JsonlAgentServer:
             for line in input_stream:
                 if not line.strip():
                     continue
-                try:
-                    command = command_from_dict(json.loads(line))
-                    if command.session_id != self.session_id:
-                        raise ValueError(
-                            f"command session {command.session_id!r} does not match "
-                            f"server session {self.session_id!r}"
-                        )
-                    self.service.dispatch(command)
-                except (
-                    AttributeError,
-                    KeyError,
-                    TypeError,
-                    ValueError,
-                    RuntimeError,
-                    json.JSONDecodeError,
-                ) as exc:
-                    self._write_error(output_stream, str(exc))
+                response = self._handle_line(line)
+                self._write(output_stream, response_to_dict(response))
         finally:
-            self.service.close()
+            self.app_server.close()
             self._stop.set()
             writer.join(5.0)
             if writer.is_alive():
                 raise RuntimeError("JSONL event writer did not finish")
 
+    def _handle_line(self, line: str) -> ResponseEnvelope:
+        request_id: str | None = None
+        try:
+            data = json.loads(line)
+            if not isinstance(data, Mapping):
+                raise ValueError("RPC request must be a JSON object")
+            raw_request_id = data.get("request_id")
+            if isinstance(raw_request_id, str):
+                request_id = raw_request_id
+            request = request_from_dict(data)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            return ResponseEnvelope.failure(
+                request_id,
+                code="invalid_request",
+                message=str(exc),
+            )
+        return self.app_server.handle(request)
+
     def _write_events(self, output_stream: TextIO) -> None:
         while not self._stop.is_set():
             try:
-                event = self.service.next_event(timeout=0.05)
+                event = self.app_server.next_event(timeout=0.05)
             except queue.Empty:
                 continue
-            self._write(output_stream, event_to_dict(event))
+            self._write_event(output_stream, event)
         while True:
             try:
-                event = self.service.next_event(timeout=0)
+                event = self.app_server.next_event(timeout=0)
             except queue.Empty:
                 return
-            self._write(output_stream, event_to_dict(event))
+            self._write_event(output_stream, event)
 
-    def _write_error(self, output_stream: TextIO, message: str) -> None:
-        self._write(
-            output_stream,
-            {
-                "protocol_version": PROTOCOL_VERSION,
-                "type": "server.error",
-                "session_id": self.session_id,
-                "error": {
-                    "code": "invalid_command",
-                    "message": message,
-                },
-            },
-        )
+    def _write_event(self, output_stream: TextIO, event) -> None:
+        message = event_to_dict(event)
+        message["channel"] = "event"
+        self._write(output_stream, message)
 
     def _write(self, output_stream: TextIO, message: dict[str, Any]) -> None:
         with self._write_lock:

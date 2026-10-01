@@ -8,27 +8,27 @@ import unittest
 from pathlib import Path
 
 from my_agent.event_store import EventStore
-from my_agent.protocol import (
-    AgentState,
-    ContentDeltaEvent,
-    StartTurnCommand,
-    TurnCompletedEvent,
-    command_to_dict,
+from my_agent.protocol import AgentState, ContentDeltaEvent, TurnCompletedEvent
+from my_agent.rpc import (
+    RequestEnvelope,
+    ResponseEnvelope,
+    request_to_dict,
 )
-from my_agent.transport import JsonlAgentServer
+from my_agent.transport import JsonlAppServer
 
 
-class _Service:
+class _AppServer:
     def __init__(self) -> None:
-        self.commands = []
+        self.workspace = Path("/tmp/workspace")
+        self.requests = []
         self.events = queue.Queue()
         self.closed = False
 
-    def dispatch(self, command) -> None:
-        self.commands.append(command)
+    def handle(self, request: RequestEnvelope) -> ResponseEnvelope:
+        self.requests.append(request)
         self.events.put(
             TurnCompletedEvent(
-                session_id=command.session_id,
+                session_id=request.params["session_id"],
                 sequence=1,
                 state=AgentState.COMPLETED,
                 answer="done",
@@ -36,6 +36,10 @@ class _Service:
                 stopped_by="final_answer",
                 mode_id="build",
             )
+        )
+        return ResponseEnvelope.success(
+            request.request_id,
+            {"accepted": True},
         )
 
     def next_event(self, timeout=None):
@@ -88,34 +92,61 @@ class EventStoreTests(unittest.TestCase):
                 store.append(event)
 
 
-class JsonlAgentServerTests(unittest.TestCase):
-    def test_server_decodes_commands_and_writes_typed_events(self) -> None:
-        service = _Service()
-        command = StartTurnCommand(session_id="session-1", user_input="hello")
-        input_stream = io.StringIO(json.dumps(command_to_dict(command)) + "\n")
+class JsonlAppServerTests(unittest.TestCase):
+    def test_server_writes_correlated_response_and_async_event_channels(self) -> None:
+        app_server = _AppServer()
+        request = RequestEnvelope(
+            request_id="request-1",
+            method="turn.start",
+            params={"session_id": "session-1", "user_input": "hello"},
+        )
+        input_stream = io.StringIO(json.dumps(request_to_dict(request)) + "\n")
         output_stream = io.StringIO()
-        server = JsonlAgentServer(service, session_id="session-1")
 
-        server.serve(input_stream, output_stream)
+        JsonlAppServer(app_server).serve(input_stream, output_stream)
 
         messages = [json.loads(line) for line in output_stream.getvalue().splitlines()]
+        self.assertEqual(messages[0]["channel"], "control")
         self.assertEqual(messages[0]["type"], "server.ready")
-        self.assertEqual(messages[0]["session_id"], "session-1")
-        self.assertEqual(messages[1]["type"], "turn.completed")
-        self.assertEqual(messages[1]["payload"]["answer"], "done")
-        self.assertEqual(service.commands, [command])
-        self.assertTrue(service.closed)
+        response = next(item for item in messages if item["channel"] == "response")
+        event = next(item for item in messages if item["channel"] == "event")
+        self.assertEqual(response["request_id"], "request-1")
+        self.assertTrue(response["ok"])
+        self.assertEqual(event["type"], "turn.completed")
+        self.assertEqual(event["session_id"], "session-1")
+        self.assertEqual(app_server.requests, [request])
+        self.assertTrue(app_server.closed)
 
-    def test_server_returns_protocol_error_for_invalid_json(self) -> None:
-        service = _Service()
+    def test_server_returns_correlated_error_for_invalid_request(self) -> None:
+        app_server = _AppServer()
         output_stream = io.StringIO()
-        server = JsonlAgentServer(service, session_id="session-1")
+        invalid = json.dumps(
+            {
+                "channel": "request",
+                "rpc_version": 999,
+                "request_id": "request-2",
+                "method": "session.list",
+                "params": {},
+            }
+        )
 
-        server.serve(io.StringIO("not-json\n"), output_stream)
+        JsonlAppServer(app_server).serve(io.StringIO(invalid + "\n"), output_stream)
 
         messages = [json.loads(line) for line in output_stream.getvalue().splitlines()]
-        self.assertEqual(messages[1]["type"], "server.error")
-        self.assertEqual(messages[1]["error"]["code"], "invalid_command")
+        self.assertEqual(messages[1]["channel"], "response")
+        self.assertEqual(messages[1]["request_id"], "request-2")
+        self.assertFalse(messages[1]["ok"])
+        self.assertEqual(messages[1]["error"]["code"], "invalid_request")
+
+    def test_server_returns_null_request_id_for_invalid_json(self) -> None:
+        app_server = _AppServer()
+        output_stream = io.StringIO()
+
+        JsonlAppServer(app_server).serve(io.StringIO("not-json\n"), output_stream)
+
+        messages = [json.loads(line) for line in output_stream.getvalue().splitlines()]
+        self.assertIsNone(messages[1]["request_id"])
+        self.assertEqual(messages[1]["error"]["code"], "invalid_request")
 
 
 if __name__ == "__main__":

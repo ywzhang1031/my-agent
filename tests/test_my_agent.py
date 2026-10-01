@@ -1326,9 +1326,7 @@ class MyAgentTests(unittest.TestCase):
         )
         chat = parser.parse_args(["chat", "--workspace", "/tmp/repo"])
         resume = parser.parse_args(["resume", "session-123", "--workspace", "/tmp/repo"])
-        serve = parser.parse_args(
-            ["serve", "--session-id", "session-123", "--workspace", "/tmp/repo"]
-        )
+        serve = parser.parse_args(["serve", "--workspace", "/tmp/repo"])
 
         self.assertEqual(ask.command, "ask")
         self.assertEqual(ask.prompt, ["inspect", "this", "repo"])
@@ -1340,7 +1338,9 @@ class MyAgentTests(unittest.TestCase):
         self.assertEqual(resume.command, "resume")
         self.assertEqual(resume.session_id, "session-123")
         self.assertEqual(serve.command, "serve")
-        self.assertEqual(serve.session_id, "session-123")
+        self.assertFalse(hasattr(serve, "session_id"))
+        self.assertFalse(hasattr(serve, "stream"))
+        self.assertFalse(hasattr(serve, "show_thinking"))
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             parser.parse_args(["--workspace", "/tmp/repo", "inspect", "this", "repo"])
 

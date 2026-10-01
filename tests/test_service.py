@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import queue
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from my_agent.protocol import (
     ReplayEventsCommand,
     ResolveApprovalCommand,
     StartTurnCommand,
+    SwitchModeCommand,
     TurnCompletedEvent,
     command_from_dict,
     command_to_dict,
@@ -26,6 +28,13 @@ from my_agent.runtime import RuntimeEvent, RuntimeState, StartTurn
 from my_agent.service import AgentService
 from my_agent.event_store import EventStore
 from my_agent.session import ProposedPlan, SessionState
+
+
+def _capture_error(errors, action) -> None:
+    try:
+        action()
+    except Exception as exc:
+        errors.append(exc)
 
 
 class _Profile:
@@ -164,6 +173,70 @@ class AgentServiceTests(unittest.TestCase):
             self.assertEqual(second.answer, "hello")
             self.assertIsInstance(runtime.commands[0], StartTurn)
             service.close()
+
+    def test_service_registers_and_unregisters_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._state(Path(tmp))
+            runtime = _Runtime(state)
+            saved = []
+            service = AgentService(
+                tool_registry_factory=lambda mode: object(),
+                save_session=lambda session: saved.append(session.session_id),
+            )
+
+            service.register(runtime)
+
+            self.assertTrue(service.has_session(state.session_id))
+            self.assertEqual(service.registered_session_ids(), (state.session_id,))
+            service.unregister(state.session_id)
+            self.assertFalse(service.has_session(state.session_id))
+            self.assertTrue(runtime.closed)
+            self.assertEqual(saved, [state.session_id])
+
+    def test_unregister_waits_for_in_flight_session_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._state(Path(tmp))
+            command_started = threading.Event()
+            release_command = threading.Event()
+
+            class BlockingRuntime(_Runtime):
+                def switch_mode(self, mode, tools) -> None:
+                    command_started.set()
+                    release_command.wait(1)
+                    super().switch_mode(mode, tools)
+
+            runtime = BlockingRuntime(state)
+            service = AgentService(tool_registry_factory=lambda mode: object())
+            service.register(runtime)
+            errors = []
+            dispatch = threading.Thread(
+                target=lambda: _capture_error(
+                    errors,
+                    lambda: service.dispatch(
+                        SwitchModeCommand(session_id=state.session_id, mode_id="build")
+                    ),
+                )
+            )
+            unregister = threading.Thread(
+                target=lambda: _capture_error(
+                    errors,
+                    lambda: service.unregister(state.session_id),
+                )
+            )
+
+            dispatch.start()
+            self.assertTrue(command_started.wait(1))
+            unregister.start()
+            self.assertTrue(unregister.is_alive())
+            release_command.set()
+            dispatch.join(1)
+            unregister.join(1)
+
+            self.assertFalse(dispatch.is_alive())
+            self.assertFalse(unregister.is_alive())
+            self.assertEqual(errors, [])
+            self.assertFalse(service.has_session(state.session_id))
+            self.assertTrue(runtime.closed)
 
     def test_execute_plan_is_owned_by_service(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -84,6 +84,8 @@ class _SessionHandle:
     forwarding: bool = False
     forwarder: threading.Thread | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
+    operation_lock: threading.Lock = field(default_factory=threading.Lock)
+    closed: bool = False
 
 
 class AgentService:
@@ -120,8 +122,36 @@ class AgentService:
                 sequence=sequence,
             )
 
+    def has_session(self, session_id: str) -> bool:
+        with self._lock:
+            return session_id in self._sessions
+
+    def registered_session_ids(self) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(self._sessions)
+
+    def unregister(self, session_id: str, timeout: float = 5.0) -> None:
+        with self._lock:
+            handle = self._sessions.get(session_id)
+            if handle is None:
+                raise ValueError(f"session is not registered: {session_id}")
+            with handle.operation_lock:
+                handle.closed = True
+                del self._sessions[session_id]
+        self._close_handle(handle, timeout)
+
     def dispatch(self, command: AgentCommandType) -> None:
         handle = self._handle(command.session_id)
+        with handle.operation_lock:
+            if handle.closed:
+                raise ValueError(f"session is not registered: {command.session_id}")
+            self._dispatch_to_handle(handle, command)
+
+    def _dispatch_to_handle(
+        self,
+        handle: _SessionHandle,
+        command: AgentCommandType,
+    ) -> None:
         runtime = handle.runtime
         if isinstance(command, StartTurnCommand):
             self._start_turn(
@@ -201,11 +231,20 @@ class AgentService:
     def close(self, timeout: float = 5.0) -> None:
         with self._lock:
             handles = list(self._sessions.values())
+            for handle in handles:
+                with handle.operation_lock:
+                    handle.closed = True
             self._sessions.clear()
         for handle in handles:
-            handle.runtime.close(timeout)
-            if handle.forwarder is not None:
-                handle.forwarder.join(timeout)
+            self._close_handle(handle, timeout)
+
+    def _close_handle(self, handle: _SessionHandle, timeout: float) -> None:
+        handle.runtime.close(timeout)
+        if handle.forwarder is not None:
+            handle.forwarder.join(timeout)
+            if handle.forwarder.is_alive():
+                raise RuntimeError("service event forwarder did not finish")
+        self._save_session(handle.runtime.session)
 
     def _handle(self, session_id: str) -> _SessionHandle:
         with self._lock:

@@ -305,6 +305,27 @@ typed protocol 从进程内 queue 扩展到可恢复的客户端时间线和真�
 - `ask/chat/resume` 也启用同一 EventStore。event log 服务 UI replay；raw trace 继续服务 trajectory，
   两者不混用。
 
+## Milestone 19: Multi-session AppServer and RPC Control Plane
+
+单 session stdio server 被直接升级为 workspace-bound AppServer，为桌面 UI 或其他客户端提供稳定的
+session 生命周期和请求响应边界。
+
+- `rpc.py` 定义独立 `RequestEnvelope`、`ResponseEnvelope`、`RpcError` 和 `rpc_version`。RPC response
+  用 `request_id` 关联同步操作是否被接受；agent event 继续使用 `event_id`、`session_id` 和单 session
+  `sequence`，两套身份不混用。
+- `AppServer` 持有一个 `AgentService` 和多个 `AgentRuntime`，实现 `session.create/list/read/resume/close`、
+  `model.list`、`mode.list`，并把 turn、approval、model/mode、plan 和 replay RPC 翻译为原有 typed
+  command。session close 只卸载 runtime，不删除 durable state。
+- 同一 session 的第二个 active turn 返回结构化 `conflict`；不同 session 的 runtime worker 和 event
+  sequence 相互独立，可以并发运行。
+- `JsonlAppServer` stdout 明确复用三个 channel：`control` 输出 ready，`response` 输出 RPC 结果，
+  `event` 输出异步 agent event。response/event 不依赖全局顺序，客户端分别按 request ID 和 session
+  sequence 消费。
+- `serve --session-id` 和直接 command JSONL 被删除。新客户端必须先发送 `session.create` 或
+  `session.resume` RPC，再发送 control RPC；不保留旧 wire protocol 的兼容分支。
+- 当前 AppServer 只绑定一个 workspace，stdio 只承载一个本地 client connection。鉴权、多 client、
+  HTTP/WebSocket 和运行中 turn 的进程崩溃恢复仍未实现。
+
 ## Current Boundaries
 
 - `apply_patch` 可以自动修改 workspace 内的单个普通 UTF-8/LF 文件。
@@ -327,12 +348,12 @@ typed protocol 从进程内 queue 扩展到可恢复的客户端时间线和真�
 - 本地 `.my-agent/`、`trace.jsonl` 和 `trajectory.json` 默认不提交到 Git。
 - 当前实现 DeepSeek Chat Completions 和 OpenAI Responses adapter；其他厂商仍需实现并测试自己的
   wire adapter。
-- `serve` 是单 session stdio server；尚未提供多 session daemon、session create/list RPC、鉴权、
-  WebSocket、event retention/compaction 或运行中 turn 的跨进程恢复。
+- `serve` 是单 workspace、多 session 的 stdio AppServer；尚未提供鉴权、多 client、WebSocket、
+  event retention/compaction 或运行中 turn 的跨进程恢复。
 
 ## Next Candidates
 
-- 在同一 typed protocol 上增加 session create/list/resume RPC 和 HTTP/WebSocket transport。
+- 在现有 AppServer 上增加 HTTP/WebSocket transport，并设计 authentication 与多 client subscription。
 - 为 event log 增加 retention/compaction；当前每个 model delta 都会持久化。
 - 使用 macOS Seatbelt、Linux bubblewrap 或 container 将允许的进程放入 OS sandbox。
 - 在确定性 compactor 之上增加可选的 provider semantic summary 和 summary 质量验证。
