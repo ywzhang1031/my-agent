@@ -174,6 +174,46 @@ class AgentServiceTests(unittest.TestCase):
             self.assertIsInstance(runtime.commands[0], StartTurn)
             service.close()
 
+    def test_terminal_state_is_saved_before_terminal_event_is_published(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._state(Path(tmp))
+            runtime = _Runtime(state)
+            runtime.events.put(
+                RuntimeEvent(
+                    kind="turn_completed",
+                    state=RuntimeState.COMPLETED,
+                    text="done",
+                    data={
+                        "steps": 1,
+                        "stopped_by": "final_answer",
+                        "mode_id": "build",
+                        "plan_id": None,
+                    },
+                )
+            )
+            save_started = threading.Event()
+            release_save = threading.Event()
+
+            def save_session(session: SessionState) -> None:
+                save_started.set()
+                release_save.wait(1)
+
+            service = AgentService(
+                tool_registry_factory=lambda mode: object(),
+                save_session=save_session,
+            )
+            service.register(runtime)
+            service.dispatch(StartTurnCommand(session_id=state.session_id, user_input="hi"))
+
+            self.assertTrue(save_started.wait(1))
+            with self.assertRaises(queue.Empty):
+                service.next_event(timeout=0.05)
+            release_save.set()
+            completed = service.next_event(timeout=1)
+
+            self.assertIsInstance(completed, TurnCompletedEvent)
+            service.close()
+
     def test_service_registers_and_unregisters_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state = self._state(Path(tmp))

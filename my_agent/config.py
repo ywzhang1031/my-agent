@@ -4,6 +4,7 @@ import copy
 import json
 import os
 import stat
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
@@ -162,6 +163,27 @@ def load_runtime_config(
         providers=providers,
         credentials=credentials,
     )
+
+
+def save_provider_credential(
+    config: RuntimeConfig,
+    provider_id: str,
+    api_key: str,
+) -> RuntimeConfig:
+    """Persist one provider API key and return a freshly loaded config."""
+    if provider_id not in config.providers:
+        raise ValueError(f"unknown provider in config: {provider_id}")
+    key = _required_string(api_key, f"credential {provider_id} key")
+    if len(key) > 16_384:
+        raise ValueError(f"credential {provider_id} key is too long")
+
+    credentials = {
+        name: {"type": "api", "key": value}
+        for name, value in config.credentials.items()
+    }
+    credentials[provider_id] = {"type": "api", "key": key}
+    _write_secure_json(config.credentials_path, credentials)
+    return load_runtime_config(config.config_path, config.credentials_path)
 
 
 def config_paths(
@@ -338,6 +360,28 @@ def _read_json_object(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"configuration file must contain a JSON object: {path}")
     return value
+
+
+def _write_secure_json(path: Path, value: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        dir=path.parent,
+        text=True,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        path.chmod(0o600)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
 
 
 def _required_string(value: Any, field_name: str) -> str:

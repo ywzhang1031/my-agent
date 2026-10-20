@@ -38,6 +38,30 @@ class _Loop:
         self.mode = get_mode(mode_id)
         self.tools = _Tools(self.mode.tool_names)
 
+    def inspect_context(self, state):
+        return _ContextSnapshot()
+
+
+class _ContextSnapshot:
+    def to_dict(self):
+        return {
+            "estimated_tokens": 125,
+            "context_window_tokens": 10_000,
+            "input_budget": 9_000,
+            "reserve_output_tokens": 1_000,
+            "active_messages": 2,
+            "summarized_messages": 0,
+            "compacted_messages": 0,
+            "breakdown": {
+                "system_prompt_tokens": 25,
+                "tool_definition_tokens": 50,
+                "summary_tokens": 0,
+                "conversation_tokens": 34,
+                "protocol_tokens": 16,
+                "total_tokens": 125,
+            },
+        }
+
 
 class _Tools:
     def __init__(self, names) -> None:
@@ -95,6 +119,8 @@ class AppServerTests(unittest.TestCase):
             event_store=EventStore(self.store.root),
         )
         self.runtimes: dict[str, _Runtime] = {}
+        self.saved_credentials: list[tuple[str, str]] = []
+        self.credentials_path = self.workspace / "credentials.json"
 
         def runtime_factory(
             state: SessionState,
@@ -127,6 +153,10 @@ class AppServerTests(unittest.TestCase):
                 ),
             ),
             modes=COLLABORATION_MODES,
+            credentials_path=self.credentials_path,
+            credential_setter=lambda provider_id, api_key: self.saved_credentials.append(
+                (provider_id, api_key)
+            ),
         )
 
     def tearDown(self) -> None:
@@ -190,6 +220,7 @@ class AppServerTests(unittest.TestCase):
         read = self.rpc("session.read", session_id=session_id)
         models = self.rpc("model.list")
         modes = self.rpc("mode.list")
+        context = self.rpc("context.inspect", session_id=session_id)
 
         self.assertEqual(listed.result["sessions"][0]["session_id"], session_id)
         self.assertTrue(listed.result["sessions"][0]["active"])
@@ -200,6 +231,7 @@ class AppServerTests(unittest.TestCase):
             [item["mode_id"] for item in modes.result["modes"]],
             ["build", "plan"],
         )
+        self.assertEqual(context.result["context"]["estimated_tokens"], 125)
 
         closed = self.rpc("session.close", session_id=session_id)
         closed_again = self.rpc("session.close", session_id=session_id)
@@ -245,6 +277,30 @@ class AppServerTests(unittest.TestCase):
 
         self.assertFalse(response.ok)
         self.assertEqual(response.error.code, "session_not_active")
+
+    def test_provider_credential_set_rebuilds_runtime_without_returning_secret(self) -> None:
+        session_id = self.create_session()
+        original_runtime = self.runtimes[session_id]
+
+        response = self.rpc(
+            "provider.credential.set",
+            session_id=session_id,
+            api_key="new-secret",
+        )
+
+        self.assertTrue(response.ok, response.error)
+        self.assertEqual(self.saved_credentials, [("test", "new-secret")])
+        self.assertTrue(original_runtime.closed)
+        self.assertIsNot(self.runtimes[session_id], original_runtime)
+        self.assertEqual(response.result["provider_id"], "test")
+        self.assertEqual(
+            response.result["credentials_path"],
+            str(self.credentials_path.resolve()),
+        )
+        self.assertNotIn("new-secret", str(response.result))
+        persisted_session = self.store.load(session_id)
+        self.assertNotIn("new-secret", persisted_session.metadata_path.read_text())
+        self.assertNotIn("new-secret", persisted_session.messages_path.read_text())
 
     def test_closing_an_active_session_interrupts_and_flushes_its_event(self) -> None:
         session_id = self.create_session()

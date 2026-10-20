@@ -8,7 +8,7 @@ from queue import Empty
 
 from .agent_loop import AgentLoop
 from .app_server import AppServer
-from .config import RuntimeConfig, load_runtime_config
+from .config import RuntimeConfig, load_runtime_config, save_provider_credential
 from .control import ApprovalDecision
 from .event_store import EventStore
 from .model_invoker import ModelInvoker
@@ -62,6 +62,7 @@ from .tools import (
 from .trace import TraceRecorder
 from .trajectory import make_trajectory, read_jsonl_trace, write_trajectory_json
 from .workspace import Workspace
+from .web_server import LocalWebServer
 
 
 SLASH_COMMANDS = (
@@ -109,6 +110,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run a multi-session JSONL app server over stdin/stdout.",
     )
     _add_runtime_options(serve, terminal_ui=False)
+
+    ui = subparsers.add_parser(
+        "ui",
+        help="Run the local multi-session web interface.",
+    )
+    _add_runtime_options(ui, terminal_ui=False)
+    ui.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="Loopback HTTP port. Use 0 to select an available port.",
+    )
+    ui.add_argument(
+        "--open-browser",
+        action="store_true",
+        help="Open the web interface in the default browser.",
+    )
     return parser
 
 
@@ -124,6 +142,8 @@ def main(argv: list[str] | None = None) -> int:
             return _run_resume(args)
         if args.command == "serve":
             return _run_serve(args)
+        if args.command == "ui":
+            return _run_ui(args)
         raise ValueError(f"unknown command: {args.command}")
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -267,6 +287,27 @@ def _run_resume(args: argparse.Namespace) -> int:
 
 
 def _run_serve(args: argparse.Namespace) -> int:
+    app_server = _build_app_server(args)
+    JsonlAppServer(app_server).serve(sys.stdin, sys.stdout)
+    return 0
+
+
+def _run_ui(args: argparse.Namespace) -> int:
+    app_server = _build_app_server(args)
+    server = LocalWebServer(app_server, port=args.port)
+    print(f"My Agent UI: {server.url}", file=sys.stderr)
+    if args.open_browser:
+        import webbrowser
+
+        webbrowser.open(server.url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def _build_app_server(args: argparse.Namespace) -> AppServer:
     workspace = Workspace(args.workspace)
     store = _session_store(args, workspace)
     service = AgentService(
@@ -275,7 +316,7 @@ def _run_serve(args: argparse.Namespace) -> int:
         save_session=lambda session: _save_session_artifacts(store, session),
         event_store=EventStore(store.root),
     )
-    app_server = AppServer(
+    return AppServer(
         workspace=workspace.root,
         session_store=store,
         agent_service=service,
@@ -291,9 +332,34 @@ def _run_serve(args: argparse.Namespace) -> int:
             if model.provider_id in SUPPORTED_PROVIDER_IDS
         ),
         modes=COLLABORATION_MODES,
+        credentials_path=args.runtime_config.credentials_path,
+        credential_setter=lambda provider_id, api_key: _store_provider_credential(
+            args,
+            provider_id,
+            api_key,
+        ),
     )
-    JsonlAppServer(app_server).serve(sys.stdin, sys.stdout)
-    return 0
+
+
+def _store_provider_credential(
+    args: argparse.Namespace,
+    provider_id: str,
+    api_key: str,
+) -> dict[str, str]:
+    provider = args.runtime_config.providers.get(provider_id)
+    if provider is None:
+        raise ValueError(f"unknown provider in config: {provider_id}")
+    args.runtime_config = save_provider_credential(
+        args.runtime_config,
+        provider_id,
+        api_key,
+    )
+    # Keep the running process aligned with the credential the user just selected.
+    # This also supersedes a stale environment value until the process restarts.
+    import os
+
+    os.environ[provider.api_key_env] = api_key
+    return {"credentials_path": str(args.runtime_config.credentials_path)}
 
 
 def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) -> int:

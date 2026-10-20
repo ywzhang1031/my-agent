@@ -97,7 +97,7 @@ OpenAI 模型目录；凭据文件不存在时仍可使用环境变量。
 上限，模型便会出现在 `/model` 选择器中。只有已经实现 adapter 的 provider 才会显示为可选项；
 当前实现为 `deepseek` 和 `openai`。
 
-CLI 提供 `ask`、`chat`、`resume` 和 transport-facing `serve` 入口。
+CLI 提供 `ask`、`chat`、`resume`、本地 Web `ui` 和 transport-facing `serve` 入口。
 执行一个可恢复的单轮任务：
 
 ```bash
@@ -120,6 +120,39 @@ stdout。之后可以用同一个 ID 继续对话：
 ```bash
 .venv/bin/python cli.py chat --workspace .
 ```
+
+## Local Web UI
+
+`ui` 在 loopback 地址上启动与 CLI 共用的 multi-session AppServer，并提供浏览器客户端：
+
+```bash
+DEEPSEEK_API_KEY=... .venv/bin/python cli.py ui --workspace . --open-browser
+```
+
+默认地址是 `http://127.0.0.1:8765/`；端口被占用时可以传 `--port 0` 让操作系统选择可用端口，
+实际 URL 会打印到 stderr。页面支持：
+
+- 创建、恢复和切换持久化 session
+- 流式 answer/thinking、provider retry 和 tool activity
+- `apply_patch` / `exec_command` 的 once/session/deny 审批
+- Plan mode 计划正文、执行或修改操作
+- provider/model 与 Build/Plan mode 切换
+- 分类 context 使用量、pending turn 的 retry/abort 和运行中 turn 的 interrupt
+- provider 报告 API key 缺失或认证失败时，显示凭据面板并将 key 原子写入
+  `credentials.json`（`0600`）；保存后热重载当前 session 并自动重试 pending turn
+
+浏览器不直接调用 provider 或 tool。所有操作都通过 `POST /api/rpc` 进入 `AppServer`，异步状态通过
+`GET /api/events` long-poll 消费 typed events；历史消息仍以 `session.read` 的持久化投影为准。
+HTTP server 只允许 loopback bind/Host，启动时生成随机 token，RPC/event 请求必须携带
+`X-My-Agent-Token`。它不返回 CORS header，并设置 CSP、`frame-ancestors 'none'`、`no-store` 和
+`nosniff`。这个 token 是本地页面的 CSRF/跨站访问防线，不是远程部署的用户鉴权机制。
+API key 只通过 loopback RPC 传给配置层，不进入 trace、session、event 或 RPC response；浏览器不会把
+key 写入 `localStorage`。环境变量仍是启动时的最高优先级，但通过页面保存的 key 会立即成为当前
+进程的有效凭据，并在后续启动未覆盖环境变量时从 `credentials.json` 加载。
+
+当前 HTTP event bridge 仍是一个进程内队列的单消费者适配器，只应打开一个 UI 页面；多个 tab 会争抢
+事件。下一阶段需要把它升级为 per-client subscription/fan-out，并把 answer、reasoning、tool 和 diff
+收敛为可重建的 `turn/item` 生命周期。
 
 ## Multi-session JSONL AppServer
 
@@ -154,7 +187,7 @@ DEEPSEEK_API_KEY=... .venv/bin/python cli.py serve --workspace .
 control plane 提供：
 
 - `session.create/list/read/resume/close`
-- `model.list`、`mode.list`
+- `model.list`、`mode.list`、`context.inspect`
 - `turn.start/retry/interrupt/abort`
 - `approval.resolve`、`model.switch`、`mode.switch`
 - `plan.execute/revise`、`events.replay`
@@ -164,8 +197,9 @@ control plane 提供：
 `session.resume`，再调用 `events.replay` 并传入最后确认的 `after_sequence`。service 会按原始
 `event_id` 和 `sequence` 重放事件，最后异步发送新的 `events.replay_completed`。
 
-当前 stdio transport 适合本地 UI 子进程，不包含鉴权、多客户端连接或 WebSocket；这些是同一
-AppServer/RPC 边界上的后续 transport。
+stdio transport 适合本地 UI 子进程；local Web transport 提供 loopback token 和单浏览器 long-poll，
+但两者都还不支持真正的多客户端订阅或远程鉴权。WebSocket/SSE fan-out 是同一 AppServer/RPC
+边界上的后续 transport。
 
 `events.jsonl` 与 `trace.jsonl` 用途不同：前者是客户端 UI 可恢复的协议时间线，后者记录更详细的
 model request/response、tool call/result 和 plan lifecycle，供 trajectory 和调试使用。
@@ -295,7 +329,7 @@ OpenAI reasoning 默认使用配置中的 `medium` effort 和 `auto` summary，�
 
 代码按这几个边界拆分：
 
-- `cli.py`：解析 `ask/chat/resume/serve`，控制 REPL 或组装 JSONL server，不参与 agent 决策
+- `cli.py`：解析 `ask/chat/resume/serve/ui`，控制 REPL 或组装 AppServer transport，不参与 agent 决策
 - `terminal.py`：封装 command completion、context UI、history 和 typed event 流式渲染，不参与 agent 决策
 - `protocol.py`：定义 transport-neutral command/event 类型、协议版本、序号和 JSON 编解码
 - `rpc.py`：定义同步 request/response envelope、`request_id` 和结构化 RPC error
@@ -304,6 +338,8 @@ OpenAI reasoning 默认使用配置中的 `medium` effort 和 `auto` summary，�
   runtime event 提升为客户端协议事件
 - `app_server.py`：管理多 session runtime 生命周期、catalog，并把 RPC 翻译为 typed command
 - `transport.py`：实现 multiplexed JSONL stdio transport，区分 control/response/event channel
+- `web_server.py`：实现 loopback HTTP RPC、event long-poll、随机 token 和静态 UI 资源服务
+- `web/`：浏览器端 session/context 投影与 typed event 渲染，不包含 agent 决策
 - `runtime.py`：单 session 执行器；在 worker 中驱动一个 turn，并发布内部 `RuntimeEvent`
 - `control.py`：定义 cancellation、permission request 和 approval decision 契约
 - `session.py`：序列化统一 `Message`、context 状态和可重试的 `PendingTurn`

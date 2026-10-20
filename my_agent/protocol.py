@@ -253,6 +253,7 @@ class TurnErrorEvent(AgentEvent):
     step: int
     error: str
     retryable: bool
+    details: dict[str, Any] = field(default_factory=dict)
     event_type: ClassVar[EventType] = EventType.TURN_ERROR
 
 

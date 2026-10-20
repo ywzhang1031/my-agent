@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>My Agent</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/bootstrap.js" defer></script>
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="session-sidebar" id="session-sidebar" aria-label="会话">
+        <div class="sidebar-header">
+          <div class="brand">My Agent</div>
+          <button class="icon-button" id="new-session" type="button" title="新建会话" aria-label="新建会话">+</button>
+        </div>
+        <div class="workspace-path" id="workspace-path"></div>
+        <nav class="session-list" id="session-list" aria-label="会话列表"></nav>
+      </aside>
+
+      <section class="conversation-pane">
+        <header class="topbar">
+          <button class="icon-button mobile-only" id="sidebar-toggle" type="button" title="会话列表" aria-label="会话列表">☰</button>
+          <div class="session-heading">
+            <strong id="session-title">未选择会话</strong>
+            <span id="connection-status" class="connection-status" data-state="connecting">连接中</span>
+          </div>
+          <div class="topbar-controls">
+            <div class="mode-selector" id="mode-selector" aria-label="协作模式"></div>
+            <label class="model-control">
+              <span class="sr-only">模型</span>
+              <select id="model-select" disabled></select>
+            </label>
+            <button class="icon-button inspector-toggle" id="inspector-toggle" type="button" title="上下文与活动" aria-label="上下文与活动">ⓘ</button>
+          </div>
+        </header>
+
+        <main class="conversation" id="conversation" aria-live="polite">
+          <div class="empty-state" id="empty-state">
+            <strong>选择或新建一个会话</strong>
+          </div>
+        </main>
+
+        <div class="action-panel approval-panel" id="approval-panel" hidden>
+          <div>
+            <span class="panel-label">需要审批</span>
+            <strong id="approval-title"></strong>
+            <pre id="approval-details"></pre>
+          </div>
+          <div class="action-buttons">
+            <button type="button" data-approval="deny" class="button secondary">拒绝</button>
+            <button type="button" data-approval="allow_session" class="button secondary">本会话允许</button>
+            <button type="button" data-approval="allow_once" class="button primary">允许一次</button>
+          </div>
+        </div>
+
+        <div class="action-panel plan-panel" id="plan-panel" hidden>
+          <div>
+            <span class="panel-label">计划已生成</span>
+            <strong>选择下一步</strong>
+          </div>
+          <div class="action-buttons">
+            <button type="button" id="revise-plan" class="button secondary">修改计划</button>
+            <button type="button" id="execute-plan" class="button primary">执行计划</button>
+          </div>
+        </div>
+
+        <div class="action-panel recovery-panel" id="recovery-panel" hidden>
+          <div>
+            <span class="panel-label">Turn 未完成</span>
+            <strong>重试或放弃当前 turn</strong>
+            <p class="panel-message" id="recovery-error"></p>
+          </div>
+          <div class="action-buttons">
+            <button type="button" id="abort-turn" class="button secondary">放弃</button>
+            <button type="button" id="retry-turn" class="button primary">重试</button>
+          </div>
+        </div>
+
+        <form class="action-panel credential-panel" id="credential-panel" hidden>
+          <div>
+            <span class="panel-label">API 凭据需要处理</span>
+            <strong id="credential-title">配置 Provider API Key</strong>
+            <p class="panel-message credential-error" id="credential-error"></p>
+            <p class="panel-path" id="credential-path"></p>
+          </div>
+          <div class="credential-controls">
+            <label class="sr-only" for="credential-key">API Key</label>
+            <input
+              id="credential-key"
+              type="password"
+              placeholder="输入 API Key"
+              autocomplete="new-password"
+              spellcheck="false"
+              required
+            >
+            <div class="action-buttons">
+              <button type="button" id="credential-abort" class="button secondary">放弃 Turn</button>
+              <button type="submit" id="credential-save" class="button primary">保存并重试</button>
+            </div>
+          </div>
+        </form>
+
+        <form class="composer" id="composer">
+          <textarea id="prompt-input" rows="1" placeholder="输入任务" disabled></textarea>
+          <button class="icon-button stop-button" id="stop-turn" type="button" title="停止" aria-label="停止" hidden>■</button>
+          <button class="send-button" id="send-prompt" type="submit" title="发送" aria-label="发送" disabled>↑</button>
+        </form>
+      </section>
+
+      <aside class="inspector" id="inspector" aria-label="上下文与活动">
+        <div class="inspector-header">
+          <strong>上下文</strong>
+          <button class="icon-button inspector-close" id="inspector-close" type="button" title="关闭" aria-label="关闭">×</button>
+        </div>
+        <div class="context-total">
+          <div>
+            <strong id="context-percent">0%</strong>
+            <span id="context-tokens">0 / 0 tokens</span>
+          </div>
+          <div class="usage-track"><span id="usage-fill"></span></div>
+        </div>
+        <div class="context-breakdown" id="context-breakdown"></div>
+        <div class="context-meta" id="context-meta"></div>
+
+        <div class="activity-header">
+          <strong>活动</strong>
+          <button class="text-button" id="clear-activity" type="button">清空</button>
+        </div>
+        <div class="activity-list" id="activity-list"></div>
+      </aside>
+    </div>
+    <div class="backdrop" id="backdrop" hidden></div>
+    <div class="toast" id="toast" role="status" hidden></div>
+  </body>
+</html>

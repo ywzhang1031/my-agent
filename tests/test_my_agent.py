@@ -27,7 +27,7 @@ from my_agent.cli import (
     build_tool_registry,
     main,
 )
-from my_agent.config import load_runtime_config
+from my_agent.config import load_runtime_config, save_provider_credential
 from my_agent.context import ContextManager, estimate_text_tokens
 from my_agent.control import ApprovalDecision, raise_if_cancelled
 from my_agent.messages import AssistantMessage, ToolCall, ToolResultMessage, UserMessage
@@ -278,6 +278,32 @@ class MyAgentTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "mode 0600"):
                 load_runtime_config(Path(tmpdir, "config.json"), credentials_path)
 
+    def test_save_provider_credential_is_secure_and_preserves_other_providers(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir, "config.json")
+            credentials_path = Path(tmpdir, "auth", "credentials.json")
+            with patch.dict(
+                os.environ,
+                {"DEEPSEEK_API_KEY": "", "OPENAI_API_KEY": ""},
+            ):
+                config = load_runtime_config(config_path, credentials_path)
+                config = save_provider_credential(config, "deepseek", "deepseek-key")
+                config = save_provider_credential(config, "openai", "openai-key")
+
+                self.assertEqual(
+                    config.resolve_model(model_ref="deepseek/deepseek-v4-flash").api_key,
+                    "deepseek-key",
+                )
+                self.assertEqual(
+                    config.resolve_model(model_ref="openai/gpt-5.6").api_key,
+                    "openai-key",
+                )
+
+            saved = json.loads(credentials_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["deepseek"]["key"], "deepseek-key")
+            self.assertEqual(saved["openai"]["key"], "openai-key")
+            self.assertEqual(credentials_path.stat().st_mode & 0o777, 0o600)
+
     def test_list_files_ignores_session_state_directory(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             Path(tmpdir, "app.py").write_text("print('hello')\n", encoding="utf-8")
@@ -349,6 +375,13 @@ class MyAgentTests(unittest.TestCase):
                 seen_calls={"call-key": 1},
                 mode_id="build",
                 approved_plan_id=state.proposed_plan.plan_id,
+                last_error="API key missing",
+                last_error_retryable=False,
+                last_error_details={
+                    "kind": "configuration",
+                    "provider_id": "deepseek",
+                    "action_required": "configure_api_key",
+                },
             )
 
             store.save(state)
@@ -491,6 +524,44 @@ class MyAgentTests(unittest.TestCase):
             self.assertEqual(trajectory["turns"][0]["outcome"]["status"], "completed")
             self.assertEqual(len(trajectory["turns"][0]["errors"]), 1)
             self.assertEqual(trajectory["metrics"]["turn_errors"], 1)
+
+    def test_agent_loop_persists_structured_api_key_error(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace_path = Path(tmpdir, "workspace")
+            workspace_path.mkdir()
+            state = SessionStore(Path(tmpdir, "sessions")).create(workspace_path)
+            provider = ScriptedProviderAdapter(
+                [
+                    ModelError(
+                        "API key is invalid",
+                        kind=ModelErrorKind.AUTHENTICATION,
+                        provider_id="deepseek",
+                        model_id="deepseek-v4-flash",
+                        status_code=401,
+                    )
+                ]
+            )
+            events: list[AgentEvent] = []
+            loop = AgentLoop(
+                workspace=Workspace(workspace_path),
+                model=_model(provider),
+                tools=ToolRegistry([]),
+                permissions=PermissionPolicy(),
+                trace=TraceRecorder(state.trace_path),
+                max_steps=2,
+            )
+
+            with self.assertRaisesRegex(ModelError, "API key is invalid"):
+                loop.run_turn(state, "hello", event_handler=events.append)
+
+            self.assertEqual(state.pending_turn.last_error, "API key is invalid")
+            self.assertFalse(state.pending_turn.last_error_retryable)
+            self.assertEqual(
+                state.pending_turn.last_error_details["action_required"],
+                "configure_api_key",
+            )
+            error_event = next(event for event in events if event.kind == "turn_error")
+            self.assertEqual(error_event.data["details"]["kind"], "authentication")
 
     def test_agent_loop_records_harness_retry_without_creating_pending_error(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1327,6 +1398,9 @@ class MyAgentTests(unittest.TestCase):
         chat = parser.parse_args(["chat", "--workspace", "/tmp/repo"])
         resume = parser.parse_args(["resume", "session-123", "--workspace", "/tmp/repo"])
         serve = parser.parse_args(["serve", "--workspace", "/tmp/repo"])
+        ui = parser.parse_args(
+            ["ui", "--workspace", "/tmp/repo", "--port", "0", "--open-browser"]
+        )
 
         self.assertEqual(ask.command, "ask")
         self.assertEqual(ask.prompt, ["inspect", "this", "repo"])
@@ -1341,6 +1415,11 @@ class MyAgentTests(unittest.TestCase):
         self.assertFalse(hasattr(serve, "session_id"))
         self.assertFalse(hasattr(serve, "stream"))
         self.assertFalse(hasattr(serve, "show_thinking"))
+        self.assertEqual(ui.command, "ui")
+        self.assertEqual(ui.port, 0)
+        self.assertTrue(ui.open_browser)
+        self.assertFalse(hasattr(ui, "stream"))
+        self.assertFalse(hasattr(ui, "show_thinking"))
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             parser.parse_args(["--workspace", "/tmp/repo", "inspect", "this", "repo"])
 

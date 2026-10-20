@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 from .config import ConfiguredModel
 from .control import ApprovalDecision
@@ -28,6 +28,7 @@ from .session import SessionState, SessionStore, message_to_dict
 
 
 RuntimeFactory = Callable[[SessionState, str | None, str | None], AgentRuntime]
+CredentialSetter = Callable[[str, str], Mapping[str, Any] | None]
 
 
 class _RpcCallError(Exception):
@@ -55,6 +56,8 @@ class AppServer:
         runtime_factory: RuntimeFactory,
         models: Iterable[ConfiguredModel],
         modes: Iterable[CollaborationMode],
+        credentials_path: str | Path | None = None,
+        credential_setter: CredentialSetter | None = None,
     ) -> None:
         self.workspace = Path(workspace).expanduser().resolve()
         self.session_store = session_store
@@ -62,6 +65,12 @@ class AppServer:
         self._runtime_factory = runtime_factory
         self._models = tuple(models)
         self._modes = tuple(modes)
+        self._credentials_path = (
+            Path(credentials_path).expanduser().resolve()
+            if credentials_path is not None
+            else None
+        )
+        self._credential_setter = credential_setter
         self._lifecycle_lock = threading.Lock()
 
     def handle(self, request: RequestEnvelope) -> ResponseEnvelope:
@@ -114,7 +123,9 @@ class AppServer:
             "session.resume": self._resume_session,
             "session.close": self._close_session,
             "model.list": self._list_models,
+            "provider.credential.set": self._set_provider_credential,
             "mode.list": self._list_modes,
+            "context.inspect": self._inspect_context,
             "turn.start": self._start_turn,
             "turn.retry": self._retry_turn,
             "turn.interrupt": self._interrupt_turn,
@@ -191,7 +202,7 @@ class AppServer:
 
     def _list_models(self, params: dict[str, Any]) -> dict[str, Any]:
         self._check_params(params)
-        return {
+        result: dict[str, Any] = {
             "models": [
                 {
                     "ref": model.ref,
@@ -204,6 +215,43 @@ class AppServer:
                 for model in self._models
             ]
         }
+        if self._credentials_path is not None:
+            result["credentials_path"] = str(self._credentials_path)
+        return result
+
+    def _set_provider_credential(self, params: dict[str, Any]) -> dict[str, Any]:
+        self._check_params(params, required={"session_id", "api_key"})
+        session_id = self._required_string(params, "session_id")
+        api_key = self._required_string(params, "api_key")
+        if len(api_key) > 16_384:
+            raise ValueError("api_key is too long")
+        if self._credential_setter is None:
+            raise RuntimeError("provider credential storage is not configured")
+
+        with self._lifecycle_lock:
+            self._require_active_session(session_id)
+            state = self.session_store.load(session_id)
+            self._require_workspace(state)
+            provider_id = state.provider_id
+            if provider_id is None:
+                raise RuntimeError("session has no provider to configure")
+            if provider_id not in {model.provider_id for model in self._models}:
+                raise ValueError(f"unknown provider: {provider_id}")
+
+            metadata = dict(self._credential_setter(provider_id, api_key) or {})
+            self.agent_service.unregister(session_id)
+            refreshed_state = self.session_store.load(session_id)
+            self._attach(refreshed_state)
+
+        result = {
+            "provider_id": provider_id,
+            "saved": True,
+            "session": self._active_session_to_dict(session_id),
+        }
+        if self._credentials_path is not None:
+            result["credentials_path"] = str(self._credentials_path)
+        result.update(metadata)
+        return result
 
     def _list_modes(self, params: dict[str, Any]) -> dict[str, Any]:
         self._check_params(params)
@@ -218,6 +266,11 @@ class AppServer:
                 for mode in self._modes
             ]
         }
+
+    def _inspect_context(self, params: dict[str, Any]) -> dict[str, Any]:
+        session_id = self._session_id(params)
+        self._require_active_session(session_id)
+        return {"context": self.agent_service.inspect_context(session_id).to_dict()}
 
     def _start_turn(self, params: dict[str, Any]) -> dict[str, Any]:
         self._check_params(params, required={"session_id", "user_input"})
@@ -295,11 +348,7 @@ class AppServer:
         return self._dispatch_command(command)
 
     def _dispatch_command(self, command: AgentCommandType) -> dict[str, Any]:
-        if not self.agent_service.has_session(command.session_id):
-            raise _RpcCallError(
-                "session_not_active",
-                f"session is not active: {command.session_id}; call session.resume first",
-            )
+        self._require_active_session(command.session_id)
         try:
             self.agent_service.dispatch(command)
         except ValueError as exc:
@@ -314,6 +363,13 @@ class AppServer:
             "command_id": command.command_id,
             "session_id": command.session_id,
         }
+
+    def _require_active_session(self, session_id: str) -> None:
+        if not self.agent_service.has_session(session_id):
+            raise _RpcCallError(
+                "session_not_active",
+                f"session is not active: {session_id}; call session.resume first",
+            )
 
     def _attach(
         self,
@@ -352,6 +408,17 @@ class AppServer:
             "model_id": state.model_id,
             "mode_id": state.mode_id,
             "pending_turn_id": state.pending_turn.turn_id if state.pending_turn else None,
+            "pending_turn_error": (
+                state.pending_turn.last_error if state.pending_turn else None
+            ),
+            "pending_turn_retryable": (
+                state.pending_turn.last_error_retryable if state.pending_turn else None
+            ),
+            "pending_turn_error_details": (
+                dict(state.pending_turn.last_error_details)
+                if state.pending_turn
+                else {}
+            ),
             "proposed_plan_id": plan.plan_id if plan else None,
             "proposed_plan_status": plan.status if plan else None,
             "active": active,

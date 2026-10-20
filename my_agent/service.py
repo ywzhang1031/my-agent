@@ -268,20 +268,26 @@ class AgentService:
             handle.forwarder.start()
 
     def _forward_runtime_events(self, handle: _SessionHandle) -> None:
+        terminal_saved = False
         try:
             while True:
                 event = handle.runtime.next_event()
-                self._publish_runtime_event(handle, event)
-                if event.kind in {
+                terminal = event.kind in {
                     "turn_completed",
                     "turn_failed",
                     "turn_interrupted",
-                }:
+                }
+                if terminal:
+                    self._save_session(handle.runtime.session)
+                    terminal_saved = True
+                self._publish_runtime_event(handle, event)
+                if terminal:
                     break
         finally:
             with handle.lock:
                 handle.forwarding = False
-            self._save_session(handle.runtime.session)
+            if not terminal_saved:
+                self._save_session(handle.runtime.session)
 
     def _switch_model(self, handle: _SessionHandle, model_ref: str) -> None:
         if self._model_resolver is None:
@@ -502,6 +508,7 @@ class AgentService:
                 step=int(data["step"]),
                 error=event.text,
                 retryable=bool(data["retryable"]),
+                details=dict(data.get("details", {})),
             )
         elif event.kind == "turn_completed":
             self._publish(

@@ -328,12 +328,19 @@ class AgentLoop:
                 )
                 raise
             except Exception as exc:
+                error_details = exc.to_dict() if isinstance(exc, ModelError) else {}
+                if isinstance(exc, ModelError) and exc.kind.value in {
+                    "configuration",
+                    "authentication",
+                }:
+                    error_details["action_required"] = "configure_api_key"
                 self._record_turn_error(
                     pending,
                     step,
                     event_context,
                     str(exc),
                     retryable=isinstance(exc, ModelError) and exc.retryable,
+                    details=error_details,
                     event_handler=event_handler,
                 )
                 raise
@@ -825,9 +832,14 @@ class AgentLoop:
         error: str,
         *,
         retryable: bool,
+        details: dict[str, Any] | None = None,
         event_handler: EventHandler | None,
     ) -> None:
+        error_details = dict(details or {})
         pending.step = step
+        pending.last_error = error
+        pending.last_error_retryable = retryable
+        pending.last_error_details = error_details
         self.trace.write(
             "turn_error",
             {
@@ -835,6 +847,7 @@ class AgentLoop:
                 "step": step,
                 "error": error,
                 "retryable": retryable,
+                "details": error_details,
             },
         )
         self._emit(
@@ -842,7 +855,11 @@ class AgentLoop:
             AgentEvent(
                 kind="turn_error",
                 text=error,
-                data={"step": step, "retryable": retryable},
+                data={
+                    "step": step,
+                    "retryable": retryable,
+                    "details": error_details,
+                },
             ),
         )
 

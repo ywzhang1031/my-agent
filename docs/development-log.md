@@ -326,6 +326,39 @@ session 生命周期和请求响应边界。
 - 当前 AppServer 只绑定一个 workspace，stdio 只承载一个本地 client connection。鉴权、多 client、
   HTTP/WebSocket 和运行中 turn 的进程崩溃恢复仍未实现。
 
+## Milestone 20: Local Web Client and Loopback HTTP Bridge
+
+在原有 AppServer 上增加第一版可用浏览器客户端，没有复制 agent loop 或 provider 逻辑。
+
+- `LocalWebServer` 只绑定 loopback，通过 `POST /api/rpc` 转发原有 RPC，通过 `GET /api/events` long-poll
+  转发 typed events，并直接提供无外部依赖的 HTML/CSS/JavaScript。
+- server 启动时生成随机页面 token；RPC/event 要求 `X-My-Agent-Token`，Host 必须是 loopback，响应
+  设置 no-store、CSP、nosniff、no-referrer 和禁止 framing。该边界只面向本机，不等价于远程鉴权。
+- Web UI 从 `session.read` 构建权威历史，从 typed events 构建运行中投影；支持 session、流式
+  answer/thinking、tool activity、approval、Plan execute/revise、model/mode、interrupt/retry/abort 和
+  context breakdown。
+- 新增 `context.inspect` RPC；浏览器不读取 `AgentRuntime`、`AgentLoop` 或 session 文件内部对象。
+- terminal event 发布前先保存 session，保证客户端收到 `turn.completed/failed/interrupted` 后立即读取
+  时不会看到旧投影。
+- 当前 long-poll 仍消费一个全局 queue，只支持一个 UI consumer。对照 Codex 的 per-connection
+  notification 与 turn/item lifecycle、OpenCode 的 session projection + durable log + live delta 分层，
+  下一步应先增加 subscriber fan-out 和结构化 item projection，再考虑多窗口或远程客户端。
+
+## Milestone 21: Provider Credential Recovery
+
+Web UI 将 provider authentication failure 从通用 pending-turn 恢复提升为可操作的凭据流程。
+
+- `AgentLoop` 将 `ModelError` 的 kind、phase、provider/model 和 action requirement 写入结构化
+  `turn.error`，并持久化到 `PendingTurn`；页面刷新后仍能恢复失败原因。
+- `provider.credential.set` RPC 从目标 session 推导 provider，不接受浏览器指定 provider；配置层原子
+  更新既有 provider-keyed `credentials.json`，新文件权限固定为 `0600`，响应不包含 key。
+- 保存后 AppServer 重建当前 session runtime，使 adapter 立即读取新凭据；Web 客户端自动重试原
+  pending turn，不重复追加用户消息。
+- 缺失 key 和 HTTP authentication error 都进入凭据面板；其他 retryable/provider 错误仍使用原有
+  retry/abort 恢复流程。
+- API key 不进入 trace、session、event、activity 或浏览器存储。loopback token 继续保护 RPC，远程
+  credential management 仍不在当前安全边界内。
+
 ## Current Boundaries
 
 - `apply_patch` 可以自动修改 workspace 内的单个普通 UTF-8/LF 文件。
@@ -348,12 +381,15 @@ session 生命周期和请求响应边界。
 - 本地 `.my-agent/`、`trace.jsonl` 和 `trajectory.json` 默认不提交到 Git。
 - 当前实现 DeepSeek Chat Completions 和 OpenAI Responses adapter；其他厂商仍需实现并测试自己的
   wire adapter。
-- `serve` 是单 workspace、多 session 的 stdio AppServer；尚未提供鉴权、多 client、WebSocket、
-  event retention/compaction 或运行中 turn 的跨进程恢复。
+- `serve` 是单 workspace、多 session 的 stdio AppServer；`ui` 是 loopback-only、单消费者 HTTP
+  client；尚未提供远程鉴权、多 client fan-out、WebSocket/SSE subscription、event retention/compaction
+  或运行中 turn 的跨进程恢复。
 
 ## Next Candidates
 
-- 在现有 AppServer 上增加 HTTP/WebSocket transport，并设计 authentication 与多 client subscription。
+- 把全局 event queue 升级为 per-client subscription/fan-out，并定义连接初始化与 capability negotiation。
+- 引入 `turn -> item` projection，让 text/reasoning/tool/diff 具有稳定 identity、started/delta/completed
+  生命周期；durable terminal facts 与 live-only delta 分开保存。
 - 为 event log 增加 retention/compaction；当前每个 model delta 都会持久化。
 - 使用 macOS Seatbelt、Linux bubblewrap 或 container 将允许的进程放入 OS sandbox。
 - 在确定性 compactor 之上增加可选的 provider semantic summary 和 summary 质量验证。
