@@ -915,6 +915,7 @@ def _build_agent_service(
         event_store=EventStore(store.root),
     )
     service.register(runtime)
+    service.open_default_event_stream(session_ids=(state.session_id,))
     return service
 
 

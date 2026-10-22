@@ -36,11 +36,10 @@ from my_agent.modes import BUILD_MODE, PLAN_MODE, extract_proposed_plan, get_mod
 from my_agent.permissions import PermissionPolicy
 from my_agent.protocol import (
     AgentState,
-    ContentDeltaEvent,
+    ItemCompletedEvent,
+    ItemDeltaEvent,
+    ItemStartedEvent,
     ModelStartedEvent,
-    ReasoningDeltaEvent,
-    ToolFinishedEvent,
-    ToolStartedEvent,
 )
 from my_agent.provider import (
     ModelCompleted,
@@ -2145,29 +2144,53 @@ class MyAgentTests(unittest.TestCase):
 
         event = {
             "session_id": "session-1",
+            "turn_id": "session-1:1",
             "sequence": 1,
             "state": AgentState.RUNNING_MODEL,
             "step": 1,
         }
         renderer.handle(ModelStartedEvent(**event))
-        renderer.handle(ReasoningDeltaEvent(**event, text="Inspecting."))
-        renderer.handle(ContentDeltaEvent(**event, text="I found "))
-        renderer.handle(ContentDeltaEvent(**event, text="app.py."))
         renderer.handle(
-            ToolStartedEvent(
+            ItemDeltaEvent(
                 **event,
-                call_id="call-1",
-                name="read_file",
-                arguments={"path": "app.py"},
+                durable=False,
+                item_id="reasoning-1",
+                item_type="reasoning",
+                delta="Inspecting.",
             )
         )
         renderer.handle(
-            ToolFinishedEvent(
+            ItemDeltaEvent(
                 **event,
-                call_id="call-1",
-                name="read_file",
-                ok=True,
-                status="success",
+                durable=False,
+                item_id="assistant-1",
+                item_type="assistant_message",
+                delta="I found ",
+            )
+        )
+        renderer.handle(
+            ItemDeltaEvent(
+                **event,
+                durable=False,
+                item_id="assistant-1",
+                item_type="assistant_message",
+                delta="app.py.",
+            )
+        )
+        renderer.handle(
+            ItemStartedEvent(
+                **event,
+                item_id="tool-1",
+                item_type="tool_call",
+                data={"name": "read_file", "arguments": {"path": "app.py"}},
+            )
+        )
+        renderer.handle(
+            ItemCompletedEvent(
+                **event,
+                item_id="tool-1",
+                item_type="tool_call",
+                data={"name": "read_file", "ok": True, "status": "success"},
             )
         )
         renderer.finish("I found app.py.")
@@ -2189,26 +2212,50 @@ class MyAgentTests(unittest.TestCase):
 
         event = {
             "session_id": "session-1",
+            "turn_id": "session-1:1",
             "sequence": 1,
             "state": AgentState.RUNNING_MODEL,
             "step": 1,
         }
         renderer.handle(ModelStartedEvent(**event))
         renderer.handle(
-            ContentDeltaEvent(**event, text="Here is the plan.\n<pro")
+            ItemDeltaEvent(
+                **event,
+                durable=False,
+                item_id="assistant-1",
+                item_type="assistant_message",
+                delta="Here is the plan.\n<pro",
+            )
         )
         self.assertEqual(output.getvalue(), "assistant> Here is the plan.\n")
         renderer.handle(
-            ContentDeltaEvent(
+            ItemDeltaEvent(
                 **event,
-                text="posed_plan>\n# Plan\n\nUpdate app.py and run focused tests.",
+                durable=False,
+                item_id="assistant-1",
+                item_type="assistant_message",
+                delta="posed_plan>\n# Plan\n\nUpdate app.py and run focused tests.",
             )
         )
         self.assertIn("# Plan", output.getvalue())
         self.assertNotIn("proposed_plan", output.getvalue())
-        renderer.handle(ContentDeltaEvent(**event, text="</proposed"))
         renderer.handle(
-            ContentDeltaEvent(**event, text="_plan>\nConfirm and I will execute it.")
+            ItemDeltaEvent(
+                **event,
+                durable=False,
+                item_id="assistant-1",
+                item_type="assistant_message",
+                delta="</proposed",
+            )
+        )
+        renderer.handle(
+            ItemDeltaEvent(
+                **event,
+                durable=False,
+                item_id="assistant-1",
+                item_type="assistant_message",
+                delta="_plan>\nConfirm and I will execute it.",
+            )
         )
         renderer.finish(plan)
 
@@ -2225,12 +2272,21 @@ class MyAgentTests(unittest.TestCase):
 
         event = {
             "session_id": "session-1",
+            "turn_id": "session-1:1",
             "sequence": 1,
             "state": AgentState.RUNNING_MODEL,
             "step": 1,
         }
         renderer.handle(ModelStartedEvent(**event))
-        renderer.handle(ContentDeltaEvent(**event, text="Which file should change?"))
+        renderer.handle(
+            ItemDeltaEvent(
+                **event,
+                durable=False,
+                item_id="assistant-1",
+                item_type="assistant_message",
+                delta="Which file should change?",
+            )
+        )
 
         self.assertEqual(output.getvalue(), "assistant> Which file should change?")
         renderer.finish("Which file should change?")

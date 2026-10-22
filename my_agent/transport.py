@@ -22,6 +22,7 @@ class JsonlAppServer:
         self.app_server = app_server
         self._write_lock = threading.Lock()
         self._stop = threading.Event()
+        self._subscription_id: str | None = None
 
     def serve(self, input_stream: TextIO, output_stream: TextIO) -> None:
         self._write(
@@ -34,6 +35,7 @@ class JsonlAppServer:
                 "workspace": str(self.app_server.workspace),
             },
         )
+        self._subscription_id = self.app_server.subscribe_events()
         writer = threading.Thread(
             target=self._write_events,
             args=(output_stream,),
@@ -48,11 +50,14 @@ class JsonlAppServer:
                 response = self._handle_line(line)
                 self._write(output_stream, response_to_dict(response))
         finally:
-            self.app_server.close()
             self._stop.set()
             writer.join(5.0)
             if writer.is_alive():
                 raise RuntimeError("JSONL event writer did not finish")
+            if self._subscription_id is not None:
+                self.app_server.unsubscribe_events(self._subscription_id)
+                self._subscription_id = None
+            self.app_server.close()
 
     def _handle_line(self, line: str) -> ResponseEnvelope:
         request_id: str | None = None
@@ -73,15 +78,23 @@ class JsonlAppServer:
         return self.app_server.handle(request)
 
     def _write_events(self, output_stream: TextIO) -> None:
+        if self._subscription_id is None:
+            raise RuntimeError("JSONL event subscription is not initialized")
         while not self._stop.is_set():
             try:
-                event = self.app_server.next_event(timeout=0.05)
+                event = self.app_server.next_event(
+                    self._subscription_id,
+                    timeout=0.05,
+                )
             except queue.Empty:
                 continue
             self._write_event(output_stream, event)
         while True:
             try:
-                event = self.app_server.next_event(timeout=0)
+                event = self.app_server.next_event(
+                    self._subscription_id,
+                    timeout=0,
+                )
             except queue.Empty:
                 return
             self._write_event(output_stream, event)

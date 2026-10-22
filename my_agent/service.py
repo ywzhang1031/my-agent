@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import queue
 import threading
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Iterable, Mapping
 
+from .event_broker import EventBroker
 from .event_store import EventStore
+from .messages import UserMessage
 from .model_invoker import ModelInvoker
 from .modes import BUILD_MODE, CollaborationMode, get_mode
 from .protocol import (
@@ -15,27 +16,24 @@ from .protocol import (
     AgentState,
     ApprovalRequestedEvent,
     ApprovalResolvedEvent,
-    ContentDeltaEvent,
     ContextCompactedEvent,
     ExecutePlanCommand,
     InterruptTurnCommand,
+    ItemCompletedEvent,
+    ItemDeltaEvent,
+    ItemFailedEvent,
+    ItemStartedEvent,
     ModeChangedEvent,
     ModelChangedEvent,
     ModelStartedEvent,
     PlanApprovedEvent,
     PlanRevisionRequestedEvent,
     ProviderRetryEvent,
-    ReasoningDeltaEvent,
-    ReplayCompletedEvent,
-    ReplayEventsCommand,
     ResolveApprovalCommand,
     RevisePlanCommand,
     StartTurnCommand,
     SwitchModeCommand,
     SwitchModelCommand,
-    ToolFinishedEvent,
-    ToolProposedEvent,
-    ToolStartedEvent,
     TurnAbortedEvent,
     TurnCompletedEvent,
     TurnErrorEvent,
@@ -44,6 +42,7 @@ from .protocol import (
     TurnResumedEvent,
     TurnStartedEvent,
 )
+from .projection import SessionProjection
 from .runtime import (
     AgentRuntime,
     InterruptTurn,
@@ -72,6 +71,7 @@ class ServiceSessionView:
     provider_id: str
     model_id: str
     mode_id: str
+    runtime_state: str
     pending_turn_id: str | None
     proposed_plan_id: str | None
     proposed_plan_status: str | None
@@ -80,7 +80,11 @@ class ServiceSessionView:
 @dataclass
 class _SessionHandle:
     runtime: AgentRuntime
+    projection: SessionProjection
     sequence: int = 0
+    current_turn_id: str | None = None
+    active_items: dict[str, tuple[str, int, str]] = field(default_factory=dict)
+    completed_items: set[str] = field(default_factory=set)
     forwarding: bool = False
     forwarder: threading.Thread | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -104,7 +108,8 @@ class AgentService:
         self._save_session = save_session or (lambda state: None)
         self._event_store = event_store
         self._sessions: dict[str, _SessionHandle] = {}
-        self._events: queue.Queue[AgentEventType] = queue.Queue()
+        self._event_broker = EventBroker()
+        self._default_subscription_id: str | None = None
         self._lock = threading.Lock()
 
     def register(self, runtime: AgentRuntime) -> None:
@@ -112,14 +117,18 @@ class AgentService:
         with self._lock:
             if session_id in self._sessions:
                 raise ValueError(f"session already registered: {session_id}")
-            sequence = (
-                self._event_store.latest_sequence(session_id)
+            projection = SessionProjection(session_id)
+            persisted_events = (
+                self._event_store.replay(session_id)
                 if self._event_store is not None
-                else 0
+                else []
             )
+            for event in persisted_events:
+                projection.apply(event)
             self._sessions[session_id] = _SessionHandle(
                 runtime=runtime,
-                sequence=sequence,
+                projection=projection,
+                sequence=projection.latest_sequence,
             )
 
     def has_session(self, session_id: str) -> bool:
@@ -189,13 +198,83 @@ class AgentService:
         if isinstance(command, AbortTurnCommand):
             self._abort_turn(handle)
             return
-        if isinstance(command, ReplayEventsCommand):
-            self._replay_events(handle, command.after_sequence)
-            return
         raise TypeError(f"unsupported service command: {type(command).__name__}")
 
-    def next_event(self, timeout: float | None = None) -> AgentEventType:
-        return self._events.get(timeout=timeout)
+    def subscribe_events(
+        self,
+        *,
+        session_ids: Iterable[str] | None = None,
+        after_sequences: Mapping[str, int] | None = None,
+    ) -> tuple[str, dict[str, int]]:
+        selected = (
+            tuple(sorted(session_ids))
+            if session_ids is not None
+            else self.registered_session_ids()
+        )
+        handles = [(session_id, self._handle(session_id)) for session_id in selected]
+        for _, handle in handles:
+            handle.lock.acquire()
+        try:
+            subscription_id = self._event_broker.subscribe(
+                None if session_ids is None else selected
+            )
+            if after_sequences and self._event_store is not None:
+                for session_id, after_sequence in after_sequences.items():
+                    if session_id not in dict(handles):
+                        raise ValueError(
+                            f"event replay session is not subscribed: {session_id}"
+                        )
+                    for event in self._event_store.replay(
+                        session_id,
+                        after_sequence=after_sequence,
+                    ):
+                        self._event_broker.deliver(subscription_id, event)
+            cursors = {session_id: handle.sequence for session_id, handle in handles}
+        except Exception:
+            if "subscription_id" in locals():
+                self._event_broker.unsubscribe(subscription_id)
+            raise
+        finally:
+            for _, handle in reversed(handles):
+                handle.lock.release()
+        return subscription_id, cursors
+
+    def unsubscribe_events(self, subscription_id: str) -> bool:
+        return self._event_broker.unsubscribe(subscription_id)
+
+    def open_default_event_stream(
+        self,
+        *,
+        session_ids: Iterable[str] | None = None,
+    ) -> str:
+        if self._default_subscription_id is not None:
+            raise RuntimeError("default event stream is already open")
+        subscription_id, _ = self.subscribe_events(session_ids=session_ids)
+        self._default_subscription_id = subscription_id
+        return subscription_id
+
+    def next_event(
+        self,
+        subscription_id: str | None = None,
+        timeout: float | None = None,
+    ) -> AgentEventType:
+        if subscription_id is None:
+            subscription_id = self._default_subscription_id
+        if subscription_id is None:
+            raise RuntimeError("event subscription is required")
+        return self._event_broker.next_event(subscription_id, timeout=timeout)
+
+    def projection(self, session_id: str) -> dict:
+        with self._lock:
+            handle = self._sessions.get(session_id)
+        if handle is not None:
+            with handle.lock:
+                return handle.projection.to_dict()
+        projection = SessionProjection(session_id)
+        if self._event_store is not None:
+            for event in self._event_store.replay(session_id):
+                projection.apply(event)
+        return projection.to_dict()
 
     def inspect_context(self, session_id: str):
         handle = self._handle(session_id)
@@ -211,6 +290,7 @@ class AgentService:
             provider_id=runtime.loop.model.profile.provider_id,
             model_id=runtime.loop.model.profile.model_id,
             mode_id=runtime.loop.mode.mode_id,
+            runtime_state=runtime.state.value,
             pending_turn_id=(state.pending_turn.turn_id if state.pending_turn else None),
             proposed_plan_id=(plan.plan_id if plan else None),
             proposed_plan_status=(plan.status if plan else None),
@@ -237,6 +317,7 @@ class AgentService:
             self._sessions.clear()
         for handle in handles:
             self._close_handle(handle, timeout)
+        self._event_broker.close()
 
     def _close_handle(self, handle: _SessionHandle, timeout: float) -> None:
         handle.runtime.close(timeout)
@@ -257,6 +338,19 @@ class AgentService:
         with handle.lock:
             if handle.forwarding:
                 raise RuntimeError("session already has an active event stream")
+            if command.retry and handle.runtime.session.pending_turn is not None:
+                handle.current_turn_id = handle.runtime.session.pending_turn.turn_id
+            elif not command.retry:
+                turn_number = (
+                    sum(
+                        isinstance(message, UserMessage)
+                        for message in handle.runtime.session.messages
+                    )
+                    + 1
+                )
+                handle.current_turn_id = (
+                    f"{handle.runtime.session.session_id}:{turn_number}"
+                )
             handle.runtime.send(command)
             handle.forwarding = True
             handle.forwarder = threading.Thread(
@@ -302,6 +396,7 @@ class AgentService:
             handle,
             ModelChangedEvent,
             AgentState.IDLE,
+            turn_id=None,
             provider_id=model.profile.provider_id,
             model_id=model.profile.model_id,
         )
@@ -316,6 +411,7 @@ class AgentService:
             handle,
             ModeChangedEvent,
             AgentState.IDLE,
+            turn_id=None,
             mode_id=mode.mode_id,
         )
 
@@ -330,6 +426,7 @@ class AgentService:
             handle,
             PlanApprovedEvent,
             AgentState.IDLE,
+            turn_id=plan.source_turn_id,
             plan_id=plan.plan_id,
             mode_id=BUILD_MODE.mode_id,
         )
@@ -349,6 +446,7 @@ class AgentService:
             handle,
             PlanRevisionRequestedEvent,
             AgentState.IDLE,
+            turn_id=plan.source_turn_id,
             plan_id=plan.plan_id,
         )
 
@@ -364,29 +462,6 @@ class AgentService:
             tool_calls_executed=pending.tool_calls_executed,
         )
 
-    def _replay_events(self, handle: _SessionHandle, after_sequence: int) -> None:
-        if self._event_store is None:
-            raise RuntimeError("agent service has no event store")
-        with handle.lock:
-            events = self._event_store.replay(
-                handle.runtime.session.session_id,
-                after_sequence=after_sequence,
-            )
-            latest = handle.sequence
-            for event in events:
-                self._events.put(event)
-            handle.sequence += 1
-            completed = ReplayCompletedEvent(
-                session_id=handle.runtime.session.session_id,
-                sequence=handle.sequence,
-                state=AgentState(handle.runtime.state.value),
-                after_sequence=after_sequence,
-                replayed_events=len(events),
-                latest_sequence=latest,
-            )
-            self._event_store.append(completed)
-            self._events.put(completed)
-
     def _publish_runtime_event(
         self,
         handle: _SessionHandle,
@@ -395,46 +470,114 @@ class AgentService:
         data = event.data
         state = AgentState(event.state.value)
         if event.kind == "turn_started":
+            turn_id = str(data["turn_id"])
+            handle.current_turn_id = turn_id
             self._publish(
                 handle,
                 TurnStartedEvent,
                 state,
-                turn_id=str(data["turn_id"]),
+                turn_id=turn_id,
                 task=str(data["task"]),
             )
+            user_item_id = f"{turn_id}:user"
+            self._ensure_item(
+                handle,
+                turn_id=turn_id,
+                item_id=user_item_id,
+                item_type="user_message",
+                step=0,
+                state=state,
+            )
+            self._complete_item(
+                handle,
+                turn_id=turn_id,
+                item_id=user_item_id,
+                item_type="user_message",
+                step=0,
+                state=state,
+                content=str(data["task"]),
+            )
         elif event.kind == "turn_resumed":
-            self._publish(handle, TurnResumedEvent, state, step=int(data["step"]))
+            turn_id = self._current_turn_id(handle)
+            self._publish(
+                handle,
+                TurnResumedEvent,
+                state,
+                turn_id=turn_id,
+                step=int(data["step"]),
+            )
         elif event.kind == "context_compacted":
             self._publish(
                 handle,
                 ContextCompactedEvent,
                 state,
+                turn_id=self._current_turn_id(handle),
                 step=int(data["step"]),
                 snapshot={key: value for key, value in data.items() if key != "step"},
             )
         elif event.kind == "model_started":
-            self._publish(handle, ModelStartedEvent, state, step=int(data["step"]))
-        elif event.kind == "content_delta":
             self._publish(
                 handle,
-                ContentDeltaEvent,
+                ModelStartedEvent,
                 state,
+                turn_id=self._current_turn_id(handle),
                 step=int(data["step"]),
-                text=event.text,
+            )
+        elif event.kind == "content_delta":
+            self._publish_item_delta(
+                handle,
+                turn_id=self._current_turn_id(handle),
+                item_type="assistant_message",
+                step=int(data["step"]),
+                delta=event.text,
+                state=state,
             )
         elif event.kind == "reasoning_delta":
-            self._publish(
+            self._publish_item_delta(
                 handle,
-                ReasoningDeltaEvent,
-                state,
+                turn_id=self._current_turn_id(handle),
+                item_type="reasoning",
                 step=int(data["step"]),
-                text=event.text,
+                delta=event.text,
+                state=state,
             )
+        elif event.kind == "model_completed":
+            turn_id = self._current_turn_id(handle)
+            step = int(data["step"])
+            for item_type, content in (
+                ("reasoning", str(data.get("reasoning") or "")),
+                ("assistant_message", str(data.get("content") or "")),
+            ):
+                item_id = self._model_item_id(turn_id, step, item_type)
+                if content or item_id in handle.active_items:
+                    self._ensure_item(
+                        handle,
+                        turn_id=turn_id,
+                        item_id=item_id,
+                        item_type=item_type,
+                        step=step,
+                        state=state,
+                    )
+                    self._complete_item(
+                        handle,
+                        turn_id=turn_id,
+                        item_id=item_id,
+                        item_type=item_type,
+                        step=step,
+                        state=state,
+                        content=content,
+                        data={
+                            "finish_reason": data.get("finish_reason"),
+                            "usage": data.get("usage"),
+                            "metadata": data.get("metadata"),
+                        },
+                    )
         elif event.kind == "provider_retry":
             self._publish(
                 handle,
                 ProviderRetryEvent,
                 state,
+                turn_id=self._current_turn_id(handle),
                 step=int(data["step"]),
                 error=event.text,
                 attempt=int(data["attempt"]),
@@ -442,42 +585,88 @@ class AgentService:
                 details=dict(data),
             )
         elif event.kind == "tool_proposed":
-            self._publish(
+            turn_id = self._current_turn_id(handle)
+            self._ensure_item(
                 handle,
-                ToolProposedEvent,
-                state,
+                turn_id=turn_id,
+                item_id=self._tool_item_id(turn_id, str(data["call_id"])),
+                item_type="tool_call",
                 step=int(data["step"]),
-                call_id=str(data["call_id"]),
-                name=str(data["name"]),
-                arguments=dict(data["arguments"]),
+                state=state,
+                data={
+                    "call_id": str(data["call_id"]),
+                    "name": str(data["name"]),
+                    "arguments": dict(data["arguments"]),
+                    "phase": "proposed",
+                },
             )
         elif event.kind == "tool_started":
+            turn_id = self._current_turn_id(handle)
+            item_id = self._tool_item_id(turn_id, str(data["call_id"]))
+            self._ensure_item(
+                handle,
+                turn_id=turn_id,
+                item_id=item_id,
+                item_type="tool_call",
+                step=int(data["step"]),
+                state=state,
+                data={
+                    "call_id": str(data["call_id"]),
+                    "name": str(data["name"]),
+                    "arguments": dict(data["arguments"]),
+                },
+            )
             self._publish(
                 handle,
-                ToolStartedEvent,
+                ItemDeltaEvent,
                 state,
+                turn_id=turn_id,
+                durable=False,
+                item_id=item_id,
+                item_type="tool_call",
                 step=int(data["step"]),
-                call_id=str(data["call_id"]),
-                name=str(data["name"]),
-                arguments=dict(data["arguments"]),
+                delta="",
+                data={"phase": "running"},
             )
         elif event.kind == "tool_finished":
-            self._publish(
+            turn_id = self._current_turn_id(handle)
+            item_id = self._tool_item_id(turn_id, str(data["call_id"]))
+            self._ensure_item(
                 handle,
-                ToolFinishedEvent,
-                state,
+                turn_id=turn_id,
+                item_id=item_id,
+                item_type="tool_call",
                 step=int(data["step"]),
-                call_id=str(data["call_id"]),
-                name=str(data["name"]),
-                ok=bool(data["ok"]),
-                status=str(data["status"]),
-                duration_ms=data.get("duration_ms"),
+                state=state,
+                data={
+                    "call_id": str(data["call_id"]),
+                    "name": str(data["name"]),
+                },
+            )
+            self._complete_item(
+                handle,
+                turn_id=turn_id,
+                item_id=item_id,
+                item_type="tool_call",
+                step=int(data["step"]),
+                state=state,
+                data={
+                    "call_id": str(data["call_id"]),
+                    "name": str(data["name"]),
+                    "arguments": dict(data.get("arguments", {})),
+                    "ok": bool(data["ok"]),
+                    "status": str(data["status"]),
+                    "duration_ms": data.get("duration_ms"),
+                    "result": dict(data.get("result", {})),
+                    "phase": "completed",
+                },
             )
         elif event.kind == "approval_requested":
             self._publish(
                 handle,
                 ApprovalRequestedEvent,
                 state,
+                turn_id=self._current_turn_id(handle),
                 step=int(data["step"]),
                 call_id=str(data["call_id"]),
                 tool_name=str(data["tool_name"]),
@@ -492,6 +681,7 @@ class AgentService:
                 handle,
                 ApprovalResolvedEvent,
                 state,
+                turn_id=self._current_turn_id(handle),
                 step=int(data["step"]),
                 call_id=str(data["call_id"]),
                 tool_name=str(data["tool_name"]),
@@ -505,38 +695,222 @@ class AgentService:
                 handle,
                 TurnErrorEvent,
                 state,
+                turn_id=self._current_turn_id(handle),
                 step=int(data["step"]),
                 error=event.text,
                 retryable=bool(data["retryable"]),
                 details=dict(data.get("details", {})),
             )
         elif event.kind == "turn_completed":
+            turn_id = self._current_turn_id(handle)
+            if data.get("plan_id"):
+                plan_item_id = str(data["plan_id"])
+                self._ensure_item(
+                    handle,
+                    turn_id=turn_id,
+                    item_id=plan_item_id,
+                    item_type="plan",
+                    step=int(data["steps"]),
+                    state=state,
+                )
+                self._complete_item(
+                    handle,
+                    turn_id=turn_id,
+                    item_id=plan_item_id,
+                    item_type="plan",
+                    step=int(data["steps"]),
+                    state=state,
+                    content=event.text,
+                )
             self._publish(
                 handle,
                 TurnCompletedEvent,
                 state,
+                turn_id=turn_id,
                 answer=event.text,
                 steps=int(data["steps"]),
                 stopped_by=str(data["stopped_by"]),
                 mode_id=str(data["mode_id"]),
                 plan_id=data.get("plan_id"),
             )
+            handle.current_turn_id = None
         elif event.kind == "turn_failed":
-            self._publish(handle, TurnFailedEvent, state, error=event.text)
+            turn_id = self._current_turn_id(handle)
+            self._fail_active_items(handle, turn_id, state, "failed", event.text)
+            self._publish(
+                handle,
+                TurnFailedEvent,
+                state,
+                turn_id=turn_id,
+                error=event.text,
+            )
+            handle.current_turn_id = None
         elif event.kind == "turn_interrupted":
-            self._publish(handle, TurnInterruptedEvent, state, reason=event.text)
+            turn_id = self._current_turn_id(handle)
+            self._fail_active_items(handle, turn_id, state, "interrupted", event.text)
+            self._publish(
+                handle,
+                TurnInterruptedEvent,
+                state,
+                turn_id=turn_id,
+                reason=event.text,
+            )
+            handle.current_turn_id = None
         else:
             raise ValueError(f"unsupported runtime event: {event.kind}")
 
-    def _publish(self, handle, event_type, state: AgentState, **payload) -> None:
+    def _publish_item_delta(
+        self,
+        handle: _SessionHandle,
+        *,
+        turn_id: str,
+        item_type: str,
+        step: int,
+        delta: str,
+        state: AgentState,
+    ) -> None:
+        item_id = self._model_item_id(turn_id, step, item_type)
+        self._ensure_item(
+            handle,
+            turn_id=turn_id,
+            item_id=item_id,
+            item_type=item_type,
+            step=step,
+            state=state,
+        )
+        self._publish(
+            handle,
+            ItemDeltaEvent,
+            state,
+            turn_id=turn_id,
+            durable=False,
+            item_id=item_id,
+            item_type=item_type,
+            step=step,
+            delta=delta,
+        )
+
+    def _ensure_item(
+        self,
+        handle: _SessionHandle,
+        *,
+        turn_id: str,
+        item_id: str,
+        item_type: str,
+        step: int,
+        state: AgentState,
+        data: dict | None = None,
+    ) -> None:
+        if item_id in handle.active_items or item_id in handle.completed_items:
+            return
+        handle.active_items[item_id] = (item_type, step, turn_id)
+        self._publish(
+            handle,
+            ItemStartedEvent,
+            state,
+            turn_id=turn_id,
+            durable=False,
+            item_id=item_id,
+            item_type=item_type,
+            step=step,
+            data=dict(data or {}),
+        )
+
+    def _complete_item(
+        self,
+        handle: _SessionHandle,
+        *,
+        turn_id: str,
+        item_id: str,
+        item_type: str,
+        step: int,
+        state: AgentState,
+        content: str = "",
+        data: dict | None = None,
+    ) -> None:
+        if item_id in handle.completed_items:
+            return
+        handle.active_items.pop(item_id, None)
+        handle.completed_items.add(item_id)
+        self._publish(
+            handle,
+            ItemCompletedEvent,
+            state,
+            turn_id=turn_id,
+            item_id=item_id,
+            item_type=item_type,
+            step=step,
+            content=content,
+            data=dict(data or {}),
+        )
+
+    def _fail_active_items(
+        self,
+        handle: _SessionHandle,
+        turn_id: str,
+        state: AgentState,
+        status: str,
+        error: str,
+    ) -> None:
+        active = [
+            (item_id, item_type, step)
+            for item_id, (item_type, step, item_turn_id) in handle.active_items.items()
+            if item_turn_id == turn_id
+        ]
+        for item_id, item_type, step in active:
+            handle.active_items.pop(item_id, None)
+            handle.completed_items.add(item_id)
+            self._publish(
+                handle,
+                ItemFailedEvent,
+                state,
+                turn_id=turn_id,
+                item_id=item_id,
+                item_type=item_type,
+                step=step,
+                status=status,
+                error=error,
+            )
+
+    @staticmethod
+    def _model_item_id(turn_id: str, step: int, item_type: str) -> str:
+        return f"{turn_id}:step:{step}:{item_type}"
+
+    @staticmethod
+    def _tool_item_id(turn_id: str, call_id: str) -> str:
+        return f"{turn_id}:tool:{call_id}"
+
+    @staticmethod
+    def _current_turn_id(handle: _SessionHandle) -> str:
+        if handle.current_turn_id is None:
+            pending = handle.runtime.session.pending_turn
+            if pending is not None:
+                handle.current_turn_id = pending.turn_id
+        if handle.current_turn_id is None:
+            raise RuntimeError("runtime event is not associated with an active turn")
+        return handle.current_turn_id
+
+    def _publish(
+        self,
+        handle: _SessionHandle,
+        event_type,
+        state: AgentState,
+        *,
+        turn_id: str | None,
+        durable: bool = True,
+        **payload,
+    ) -> None:
         with handle.lock:
             handle.sequence += 1
             event = event_type(
                 session_id=handle.runtime.session.session_id,
+                turn_id=turn_id,
                 sequence=handle.sequence,
                 state=state,
+                durable=durable,
                 **payload,
             )
-            if self._event_store is not None:
+            handle.projection.apply(event)
+            if durable and self._event_store is not None:
                 self._event_store.append(event)
-            self._events.put(event)
+            self._event_broker.publish(event)

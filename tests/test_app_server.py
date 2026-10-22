@@ -158,6 +158,7 @@ class AppServerTests(unittest.TestCase):
                 (provider_id, api_key)
             ),
         )
+        self.subscription_id = self.app.subscribe_events()
 
     def tearDown(self) -> None:
         self.app.close()
@@ -225,7 +226,9 @@ class AppServerTests(unittest.TestCase):
         self.assertEqual(listed.result["sessions"][0]["session_id"], session_id)
         self.assertTrue(listed.result["sessions"][0]["active"])
         self.assertEqual(read.result["session"]["mode_id"], "plan")
+        self.assertEqual(read.result["session"]["runtime_state"], "idle")
         self.assertEqual(read.result["messages"], [])
+        self.assertEqual(read.result["projection"]["turns"], [])
         self.assertEqual(models.result["models"][0]["ref"], "test/test-model")
         self.assertEqual(
             [item["mode_id"] for item in modes.result["modes"]],
@@ -259,7 +262,10 @@ class AppServerTests(unittest.TestCase):
 
         self.complete_turn(first, "first done")
         self.complete_turn(second, "second done")
-        events = [self.app.next_event(timeout=1), self.app.next_event(timeout=1)]
+        events = [
+            self.app.next_event(self.subscription_id, timeout=1),
+            self.app.next_event(self.subscription_id, timeout=1),
+        ]
 
         self.assertEqual({event.session_id for event in events}, {first, second})
         self.assertEqual([event.sequence for event in events], [1, 1])
@@ -311,7 +317,7 @@ class AppServerTests(unittest.TestCase):
         )
 
         closed = self.rpc("session.close", session_id=session_id)
-        event = self.app.next_event(timeout=1)
+        event = self.app.next_event(self.subscription_id, timeout=1)
 
         self.assertTrue(started.ok)
         self.assertTrue(closed.result["closed"])
@@ -319,6 +325,30 @@ class AppServerTests(unittest.TestCase):
         self.assertEqual(event.sequence, 1)
         self.assertEqual(event.reason, "server closed session")
         self.assertFalse(self.service.has_session(session_id))
+
+    def test_event_subscription_rpc_creates_independent_consumers(self) -> None:
+        session_id = self.create_session()
+        first = self.rpc("events.subscribe")
+        second = self.rpc("events.subscribe", session_ids=[session_id])
+
+        self.assertTrue(first.ok, first.error)
+        self.assertTrue(second.ok, second.error)
+        started = self.rpc(
+            "turn.start",
+            session_id=session_id,
+            user_input="test fan-out",
+        )
+        self.assertTrue(started.ok, started.error)
+        self.complete_turn(session_id, "done")
+        first_event = self.app.next_event(first.result["subscription_id"], timeout=1)
+        second_event = self.app.next_event(second.result["subscription_id"], timeout=1)
+
+        self.assertEqual(first_event.event_id, second_event.event_id)
+        unsubscribed = self.rpc(
+            "events.unsubscribe",
+            subscription_id=first.result["subscription_id"],
+        )
+        self.assertTrue(unsubscribed.result["unsubscribed"])
 
     def test_unknown_method_and_invalid_params_are_structured_errors(self) -> None:
         unknown = self.rpc("unknown.method")

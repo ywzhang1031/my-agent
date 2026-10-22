@@ -359,6 +359,28 @@ Web UI 将 provider authentication failure 从通用 pending-turn 恢复提升�
 - API key 不进入 trace、session、event、activity 或浏览器存储。loopback token 继续保护 RPC，远程
   credential management 仍不在当前安全边界内。
 
+## Milestone 22: Protocol V2, Item Projection, and Event Fan-out
+
+客户端协议从按渲染动作划分的零散 event，升级为可重建的 `session -> turn -> item` 生命周期。
+
+- `protocol_version=2` 为 event 增加稳定 `turn_id` 和 `durable`，并统一使用
+  `item.started/delta/completed/failed`。assistant text、reasoning、tool call、user message 和 plan 都是
+  带稳定 `item_id` 的 item。
+- `AgentService` 把 model 完整响应和 tool 完整结果收敛为 durable `item.completed`；started/delta 只用于
+  低延迟实时显示。`events-v2.jsonl` 因此保存完整终态而不保存逐 token delta。
+- `SessionProjection` 在服务端消费同一 typed event stream，形成可序列化的 turn/item 物化视图；
+  `session.read` 返回该 projection，浏览器刷新时不需要猜测尚未结束的 UI 状态。
+- `runtime_state` 单独表示当前进程是否真的在执行；服务重启后即使 durable projection 最后停在
+  `in_progress`，pending turn 也会显示为可重试，而不会被误判成仍在运行。
+- `EventBroker` 为每个客户端创建独立 subscription，可按 session 过滤并 fan-out 同一 event。订阅时
+  使用 `after_sequences` 从 durable log 补齐断线窗口，再无缝接收新事件。
+- Web UI 按 `item_id` 更新节点，而不是依赖“当前 assistant 气泡”这类隐式全局状态；subscription
+  过期时会重新订阅并读取服务端 projection。
+- V1 event log 保持原文件不动，但运行时直接使用 `events-v2.jsonl`，没有双协议兼容分支。
+
+概念边界同步固定：session/thread 是长生命周期容器，turn 是一次执行，item 是 turn 内原子内容或动作；
+mode 是横切的协作策略。plan artifact、subagent execution 和 cross-turn goal state 都不等于 mode。
+
 ## Current Boundaries
 
 - `apply_patch` 可以自动修改 workspace 内的单个普通 UTF-8/LF 文件。
@@ -381,16 +403,14 @@ Web UI 将 provider authentication failure 从通用 pending-turn 恢复提升�
 - 本地 `.my-agent/`、`trace.jsonl` 和 `trajectory.json` 默认不提交到 Git。
 - 当前实现 DeepSeek Chat Completions 和 OpenAI Responses adapter；其他厂商仍需实现并测试自己的
   wire adapter。
-- `serve` 是单 workspace、多 session 的 stdio AppServer；`ui` 是 loopback-only、单消费者 HTTP
-  client；尚未提供远程鉴权、多 client fan-out、WebSocket/SSE subscription、event retention/compaction
-  或运行中 turn 的跨进程恢复。
+- `serve` 是单 workspace、多 session 的 stdio AppServer；`ui` 是 loopback-only HTTP client，已支持
+  同一进程内多页面独立 subscription/fan-out，但尚未提供远程鉴权、WebSocket/SSE transport、event
+  retention/compaction 或运行中 turn 的跨进程恢复。
 
 ## Next Candidates
 
-- 把全局 event queue 升级为 per-client subscription/fan-out，并定义连接初始化与 capability negotiation。
-- 引入 `turn -> item` projection，让 text/reasoning/tool/diff 具有稳定 identity、started/delta/completed
-  生命周期；durable terminal facts 与 live-only delta 分开保存。
-- 为 event log 增加 retention/compaction；当前每个 model delta 都会持久化。
+- 为 subscription 增加连接 capability negotiation，并评估 WebSocket/SSE transport。
+- 为 durable event log 增加 retention/compaction；live-only delta 已不落盘，但 terminal facts 仍会持续增长。
 - 使用 macOS Seatbelt、Linux bubblewrap 或 container 将允许的进程放入 OS sandbox。
 - 在确定性 compactor 之上增加可选的 provider semantic summary 和 summary 质量验证。
 - 增加更多 provider adapter，并对 streaming/tool-call edge cases 建立 contract tests。

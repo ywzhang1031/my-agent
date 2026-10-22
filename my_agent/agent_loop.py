@@ -382,6 +382,21 @@ class AgentLoop:
                     "metadata": response_metadata,
                 },
             )
+            self._emit(
+                event_handler,
+                AgentEvent(
+                    kind="model_completed",
+                    data={
+                        "step": step,
+                        "content": reply.text,
+                        "reasoning": reply.reasoning,
+                        "finish_reason": reply.stop_reason.value,
+                        "tool_calls": [call.to_dict() for call in reply.tool_calls],
+                        "usage": response_usage,
+                        "metadata": response_metadata,
+                    },
+                ),
+            )
 
             if not reply.tool_calls:
                 answer = reply.text.strip() or "(model returned no final content)"
@@ -537,10 +552,12 @@ class AgentLoop:
                                 "step": step,
                                 "call_id": call.call_id,
                                 "name": call.name,
+                                "arguments": call.arguments,
                                 "ok": tool_result.ok,
                                 "status": tool_result.metadata.get("status")
                                 or ("success" if tool_result.ok else "failed"),
                                 "duration_ms": tool_result.metadata.get("duration_ms"),
+                                "result": result_payload,
                             },
                         ),
                     )
@@ -730,8 +747,10 @@ class AgentLoop:
                     "step": step,
                     "call_id": call.call_id,
                     "name": call.name,
+                    "arguments": call.arguments,
                     "ok": False,
                     "status": "interrupted",
+                    "result": result_payload,
                 },
             ),
         )

@@ -8,7 +8,7 @@ from uuid import uuid4
 from .control import ApprovalDecision
 
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 
 class AgentState(str, Enum):
@@ -30,7 +30,6 @@ class CommandType(str, Enum):
     EXECUTE_PLAN = "plan.execute"
     REVISE_PLAN = "plan.revise"
     ABORT_TURN = "turn.abort"
-    REPLAY_EVENTS = "events.replay"
 
 
 class EventType(str, Enum):
@@ -38,12 +37,11 @@ class EventType(str, Enum):
     TURN_RESUMED = "turn.resumed"
     CONTEXT_COMPACTED = "context.compacted"
     MODEL_STARTED = "model.started"
-    CONTENT_DELTA = "model.content_delta"
-    REASONING_DELTA = "model.reasoning_delta"
     PROVIDER_RETRY = "provider.retry"
-    TOOL_PROPOSED = "tool.proposed"
-    TOOL_STARTED = "tool.started"
-    TOOL_FINISHED = "tool.finished"
+    ITEM_STARTED = "item.started"
+    ITEM_DELTA = "item.delta"
+    ITEM_COMPLETED = "item.completed"
+    ITEM_FAILED = "item.failed"
     APPROVAL_REQUESTED = "approval.requested"
     APPROVAL_RESOLVED = "approval.resolved"
     TURN_ERROR = "turn.error"
@@ -55,7 +53,6 @@ class EventType(str, Enum):
     PLAN_APPROVED = "plan.approved"
     PLAN_REVISION_REQUESTED = "plan.revision_requested"
     TURN_ABORTED = "turn.aborted"
-    REPLAY_COMPLETED = "events.replay_completed"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -112,16 +109,6 @@ class AbortTurnCommand(AgentCommand):
     command_type: ClassVar[CommandType] = CommandType.ABORT_TURN
 
 
-@dataclass(frozen=True, kw_only=True)
-class ReplayEventsCommand(AgentCommand):
-    after_sequence: int = 0
-    command_type: ClassVar[CommandType] = CommandType.REPLAY_EVENTS
-
-    def __post_init__(self) -> None:
-        if self.after_sequence < 0:
-            raise ValueError("after_sequence must not be negative")
-
-
 AgentCommandType: TypeAlias = (
     StartTurnCommand
     | InterruptTurnCommand
@@ -131,22 +118,22 @@ AgentCommandType: TypeAlias = (
     | ExecutePlanCommand
     | RevisePlanCommand
     | AbortTurnCommand
-    | ReplayEventsCommand
 )
 
 
 @dataclass(frozen=True, kw_only=True)
 class AgentEvent:
     session_id: str
+    turn_id: str | None
     sequence: int
     state: AgentState
+    durable: bool = True
     event_id: str = field(default_factory=lambda: uuid4().hex)
     event_type: ClassVar[EventType]
 
 
 @dataclass(frozen=True, kw_only=True)
 class TurnStartedEvent(AgentEvent):
-    turn_id: str
     task: str
     event_type: ClassVar[EventType] = EventType.TURN_STARTED
 
@@ -171,17 +158,43 @@ class ModelStartedEvent(AgentEvent):
 
 
 @dataclass(frozen=True, kw_only=True)
-class ContentDeltaEvent(AgentEvent):
+class ItemStartedEvent(AgentEvent):
+    item_id: str
+    item_type: str
     step: int
-    text: str
-    event_type: ClassVar[EventType] = EventType.CONTENT_DELTA
+    data: dict[str, Any] = field(default_factory=dict)
+    event_type: ClassVar[EventType] = EventType.ITEM_STARTED
 
 
 @dataclass(frozen=True, kw_only=True)
-class ReasoningDeltaEvent(AgentEvent):
+class ItemDeltaEvent(AgentEvent):
+    item_id: str
+    item_type: str
     step: int
-    text: str
-    event_type: ClassVar[EventType] = EventType.REASONING_DELTA
+    delta: str
+    data: dict[str, Any] = field(default_factory=dict)
+    event_type: ClassVar[EventType] = EventType.ITEM_DELTA
+
+
+@dataclass(frozen=True, kw_only=True)
+class ItemCompletedEvent(AgentEvent):
+    item_id: str
+    item_type: str
+    step: int
+    content: str = ""
+    data: dict[str, Any] = field(default_factory=dict)
+    event_type: ClassVar[EventType] = EventType.ITEM_COMPLETED
+
+
+@dataclass(frozen=True, kw_only=True)
+class ItemFailedEvent(AgentEvent):
+    item_id: str
+    item_type: str
+    step: int
+    status: str
+    error: str
+    data: dict[str, Any] = field(default_factory=dict)
+    event_type: ClassVar[EventType] = EventType.ITEM_FAILED
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -192,35 +205,6 @@ class ProviderRetryEvent(AgentEvent):
     delay_seconds: float
     details: dict[str, Any]
     event_type: ClassVar[EventType] = EventType.PROVIDER_RETRY
-
-
-@dataclass(frozen=True, kw_only=True)
-class ToolProposedEvent(AgentEvent):
-    step: int
-    call_id: str
-    name: str
-    arguments: dict[str, Any]
-    event_type: ClassVar[EventType] = EventType.TOOL_PROPOSED
-
-
-@dataclass(frozen=True, kw_only=True)
-class ToolStartedEvent(AgentEvent):
-    step: int
-    call_id: str
-    name: str
-    arguments: dict[str, Any]
-    event_type: ClassVar[EventType] = EventType.TOOL_STARTED
-
-
-@dataclass(frozen=True, kw_only=True)
-class ToolFinishedEvent(AgentEvent):
-    step: int
-    call_id: str
-    name: str
-    ok: bool
-    status: str
-    duration_ms: int | None = None
-    event_type: ClassVar[EventType] = EventType.TOOL_FINISHED
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -307,17 +291,8 @@ class PlanRevisionRequestedEvent(AgentEvent):
 
 @dataclass(frozen=True, kw_only=True)
 class TurnAbortedEvent(AgentEvent):
-    turn_id: str
     tool_calls_executed: int
     event_type: ClassVar[EventType] = EventType.TURN_ABORTED
-
-
-@dataclass(frozen=True, kw_only=True)
-class ReplayCompletedEvent(AgentEvent):
-    after_sequence: int
-    replayed_events: int
-    latest_sequence: int
-    event_type: ClassVar[EventType] = EventType.REPLAY_COMPLETED
 
 
 AgentEventType: TypeAlias = (
@@ -325,12 +300,11 @@ AgentEventType: TypeAlias = (
     | TurnResumedEvent
     | ContextCompactedEvent
     | ModelStartedEvent
-    | ContentDeltaEvent
-    | ReasoningDeltaEvent
+    | ItemStartedEvent
+    | ItemDeltaEvent
+    | ItemCompletedEvent
+    | ItemFailedEvent
     | ProviderRetryEvent
-    | ToolProposedEvent
-    | ToolStartedEvent
-    | ToolFinishedEvent
     | ApprovalRequestedEvent
     | ApprovalResolvedEvent
     | TurnErrorEvent
@@ -342,7 +316,6 @@ AgentEventType: TypeAlias = (
     | PlanApprovedEvent
     | PlanRevisionRequestedEvent
     | TurnAbortedEvent
-    | ReplayCompletedEvent
 )
 
 
@@ -357,7 +330,6 @@ _COMMAND_TYPES = {
         ExecutePlanCommand,
         RevisePlanCommand,
         AbortTurnCommand,
-        ReplayEventsCommand,
     )
 }
 
@@ -368,12 +340,11 @@ _EVENT_TYPES = {
         TurnResumedEvent,
         ContextCompactedEvent,
         ModelStartedEvent,
-        ContentDeltaEvent,
-        ReasoningDeltaEvent,
+        ItemStartedEvent,
+        ItemDeltaEvent,
+        ItemCompletedEvent,
+        ItemFailedEvent,
         ProviderRetryEvent,
-        ToolProposedEvent,
-        ToolStartedEvent,
-        ToolFinishedEvent,
         ApprovalRequestedEvent,
         ApprovalResolvedEvent,
         TurnErrorEvent,
@@ -385,7 +356,6 @@ _EVENT_TYPES = {
         PlanApprovedEvent,
         PlanRevisionRequestedEvent,
         TurnAbortedEvent,
-        ReplayCompletedEvent,
     )
 }
 
@@ -421,16 +391,20 @@ def command_from_dict(data: Mapping[str, Any]) -> AgentCommandType:
 def event_to_dict(event: AgentEventType) -> dict[str, Any]:
     payload = asdict(event)
     session_id = payload.pop("session_id")
+    turn_id = payload.pop("turn_id")
     sequence = payload.pop("sequence")
     state = payload.pop("state")
+    durable = payload.pop("durable")
     event_id = payload.pop("event_id")
     return {
         "protocol_version": PROTOCOL_VERSION,
         "type": event.event_type.value,
         "event_id": event_id,
         "session_id": session_id,
+        "turn_id": turn_id,
         "sequence": sequence,
         "state": state.value,
+        "durable": durable,
         "payload": _json_value(payload),
     }
 
@@ -442,8 +416,10 @@ def event_from_dict(data: Mapping[str, Any]) -> AgentEventType:
         raise ValueError(f"unknown event type: {data.get('type')}")
     return event_type(
         session_id=str(data["session_id"]),
+        turn_id=(str(data["turn_id"]) if data.get("turn_id") is not None else None),
         sequence=int(data["sequence"]),
         state=AgentState(data["state"]),
+        durable=bool(data["durable"]),
         event_id=str(data["event_id"]),
         **_payload(data),
     )

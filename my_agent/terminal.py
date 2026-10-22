@@ -23,13 +23,12 @@ from prompt_toolkit.styles import Style
 from .context import ContextSnapshot
 from .protocol import (
     AgentEventType,
-    ContentDeltaEvent,
     ContextCompactedEvent,
+    ItemCompletedEvent,
+    ItemDeltaEvent,
+    ItemStartedEvent,
     ModelStartedEvent,
     ProviderRetryEvent,
-    ReasoningDeltaEvent,
-    ToolFinishedEvent,
-    ToolStartedEvent,
     TurnErrorEvent,
     TurnResumedEvent,
 )
@@ -338,31 +337,35 @@ class StreamRenderer:
             self._reasoning_status_seen = False
             if self.hide_plan_protocol:
                 self._plan_filter = _PlanProtocolFilter()
-        elif isinstance(event, ReasoningDeltaEvent):
+        elif isinstance(event, ItemDeltaEvent) and event.item_type == "reasoning":
             if self.show_thinking:
-                self._write_delta("reasoning", "thinking> ", event.text)
+                self._write_delta("reasoning", "thinking> ", event.delta)
             elif not self._reasoning_status_seen:
                 self._status("thinking...")
                 self._reasoning_status_seen = True
-        elif isinstance(event, ContentDeltaEvent):
+        elif isinstance(event, ItemDeltaEvent) and event.item_type == "assistant_message":
             text = (
-                self._plan_filter.feed(event.text)
+                self._plan_filter.feed(event.delta)
                 if self._plan_filter is not None
-                else event.text
+                else event.delta
             )
             if text:
                 self._model_content_seen = True
                 self._write_delta("content", self.answer_prefix, text)
-        elif isinstance(event, ToolStartedEvent):
+        elif isinstance(event, ItemStartedEvent) and event.item_type == "tool_call":
             self._close_line()
-            arguments = _short_json(event.arguments)
-            self._status(f"tool> {event.name} {arguments}".rstrip())
-        elif isinstance(event, ToolFinishedEvent):
+            arguments = _short_json(event.data.get("arguments", {}))
+            self._status(
+                f"tool> {event.data.get('name', 'tool')} {arguments}".rstrip()
+            )
+        elif isinstance(event, ItemCompletedEvent) and event.item_type == "tool_call":
             self._close_line()
-            status = event.status or ("success" if event.ok else "failed")
-            duration = event.duration_ms
+            status = str(event.data.get("status") or "completed")
+            duration = event.data.get("duration_ms")
             suffix = f" ({duration} ms)" if duration is not None else ""
-            self._status(f"tool< {event.name} {status}{suffix}".rstrip())
+            self._status(
+                f"tool< {event.data.get('name', 'tool')} {status}{suffix}".rstrip()
+            )
         elif isinstance(event, ProviderRetryEvent):
             self._close_line()
             self._status(

@@ -10,7 +10,7 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from my_agent.protocol import AgentState, ContentDeltaEvent
+from my_agent.protocol import AgentState, ItemDeltaEvent
 from my_agent.rpc import RequestEnvelope, ResponseEnvelope, request_to_dict
 from my_agent.web_server import LocalWebServer
 
@@ -29,7 +29,9 @@ class _AppServer:
             {"method": request.method},
         )
 
-    def next_event(self, timeout=None):
+    def next_event(self, subscription_id, timeout=None):
+        if subscription_id != "subscription-1":
+            raise ValueError("unknown subscription")
         return self.events.get(timeout=timeout)
 
     def close(self, timeout=5.0) -> None:
@@ -128,23 +130,33 @@ class LocalWebServerTests(unittest.TestCase):
 
     def test_event_endpoint_long_polls_typed_events(self) -> None:
         self.app.events.put(
-            ContentDeltaEvent(
+            ItemDeltaEvent(
                 session_id="session-1",
+                turn_id="session-1:1",
                 sequence=4,
                 state=AgentState.RUNNING_MODEL,
+                durable=False,
+                item_id="assistant-1",
+                item_type="assistant_message",
                 step=1,
-                text="hello",
+                delta="hello",
             )
         )
 
-        with self.request("/api/events?timeout=0", token=True) as response:
+        with self.request(
+            "/api/events?timeout=0&subscription_id=subscription-1",
+            token=True,
+        ) as response:
             message = json.loads(response.read())
-        with self.request("/api/events?timeout=0", token=True) as response:
+        with self.request(
+            "/api/events?timeout=0&subscription_id=subscription-1",
+            token=True,
+        ) as response:
             empty_status = response.status
 
         self.assertEqual(message["channel"], "event")
-        self.assertEqual(message["type"], "model.content_delta")
-        self.assertEqual(message["payload"]["text"], "hello")
+        self.assertEqual(message["type"], "item.delta")
+        self.assertEqual(message["payload"]["delta"], "hello")
         self.assertEqual(empty_status, 204)
 
     def test_shutdown_closes_app_server(self) -> None:

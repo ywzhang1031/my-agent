@@ -89,7 +89,7 @@ class EventStore:
     def path(self, session_id: str) -> Path:
         if not re.fullmatch(r"[A-Za-z0-9._-]+", session_id):
             raise ValueError(f"invalid session id: {session_id}")
-        return self.root / session_id / "events.jsonl"
+        return self.root / session_id / "events-v2.jsonl"
 
     def _latest_sequence_unlocked(self, session_id: str) -> int:
         cached = self._latest.get(session_id)

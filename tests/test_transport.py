@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 from my_agent.event_store import EventStore
-from my_agent.protocol import AgentState, ContentDeltaEvent, TurnCompletedEvent
+from my_agent.protocol import AgentState, ItemCompletedEvent, TurnCompletedEvent
 from my_agent.rpc import (
     RequestEnvelope,
     ResponseEnvelope,
@@ -24,11 +24,18 @@ class _AppServer:
         self.events = queue.Queue()
         self.closed = False
 
+    def subscribe_events(self):
+        return "subscription-1"
+
+    def unsubscribe_events(self, subscription_id):
+        return subscription_id == "subscription-1"
+
     def handle(self, request: RequestEnvelope) -> ResponseEnvelope:
         self.requests.append(request)
         self.events.put(
             TurnCompletedEvent(
                 session_id=request.params["session_id"],
+                turn_id="session-1:1",
                 sequence=1,
                 state=AgentState.COMPLETED,
                 answer="done",
@@ -42,7 +49,9 @@ class _AppServer:
             {"accepted": True},
         )
 
-    def next_event(self, timeout=None):
+    def next_event(self, subscription_id, timeout=None):
+        if subscription_id != "subscription-1":
+            raise ValueError("unknown subscription")
         return self.events.get(timeout=timeout)
 
     def close(self, timeout=5.0) -> None:
@@ -53,15 +62,19 @@ class EventStoreTests(unittest.TestCase):
     def test_append_replay_and_latest_sequence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = EventStore(Path(tmp))
-            first = ContentDeltaEvent(
+            first = ItemCompletedEvent(
                 session_id="session-1",
+                turn_id="session-1:1",
                 sequence=1,
                 state=AgentState.RUNNING_MODEL,
+                item_id="assistant-1",
+                item_type="assistant_message",
                 step=1,
-                text="one",
+                content="one",
             )
             second = TurnCompletedEvent(
                 session_id="session-1",
+                turn_id="session-1:1",
                 sequence=2,
                 state=AgentState.COMPLETED,
                 answer="done",
@@ -79,12 +92,15 @@ class EventStoreTests(unittest.TestCase):
     def test_append_rejects_non_monotonic_sequence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = EventStore(Path(tmp))
-            event = ContentDeltaEvent(
+            event = ItemCompletedEvent(
                 session_id="session-1",
+                turn_id="session-1:1",
                 sequence=1,
                 state=AgentState.RUNNING_MODEL,
+                item_id="assistant-1",
+                item_type="assistant_message",
                 step=1,
-                text="one",
+                content="one",
             )
             store.append(event)
 

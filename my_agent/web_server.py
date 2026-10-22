@@ -175,7 +175,15 @@ class LocalWebServer:
                         {"error": "invalid UI token"},
                     )
                     return
-                raw_timeout = parse_qs(query).get("timeout", ["20"])[0]
+                query_params = parse_qs(query)
+                subscription_id = query_params.get("subscription_id", [""])[0]
+                if not subscription_id:
+                    self._send_json(
+                        HTTPStatus.BAD_REQUEST,
+                        {"error": "subscription_id is required"},
+                    )
+                    return
+                raw_timeout = query_params.get("timeout", ["20"])[0]
                 try:
                     timeout = float(raw_timeout)
                 except ValueError:
@@ -186,9 +194,18 @@ class LocalWebServer:
                     return
                 timeout = max(0.0, min(timeout, MAX_EVENT_WAIT_SECONDS))
                 try:
-                    event = owner.app_server.next_event(timeout=timeout)
+                    event = owner.app_server.next_event(
+                        subscription_id,
+                        timeout=timeout,
+                    )
                 except queue.Empty:
                     self._send_bytes(HTTPStatus.NO_CONTENT, b"", "application/json")
+                    return
+                except ValueError as exc:
+                    self._send_json(
+                        HTTPStatus.GONE,
+                        {"error": str(exc)},
+                    )
                     return
                 message = event_to_dict(event)
                 message["channel"] = "event"

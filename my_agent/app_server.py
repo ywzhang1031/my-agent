@@ -14,7 +14,6 @@ from .protocol import (
     AgentEventType,
     ExecutePlanCommand,
     InterruptTurnCommand,
-    ReplayEventsCommand,
     ResolveApprovalCommand,
     RevisePlanCommand,
     StartTurnCommand,
@@ -109,8 +108,19 @@ class AppServer:
             )
         return ResponseEnvelope.success(request.request_id, result)
 
-    def next_event(self, timeout: float | None = None) -> AgentEventType:
-        return self.agent_service.next_event(timeout=timeout)
+    def next_event(
+        self,
+        subscription_id: str,
+        timeout: float | None = None,
+    ) -> AgentEventType:
+        return self.agent_service.next_event(subscription_id, timeout=timeout)
+
+    def subscribe_events(self) -> str:
+        subscription_id, _ = self.agent_service.subscribe_events()
+        return subscription_id
+
+    def unsubscribe_events(self, subscription_id: str) -> bool:
+        return self.agent_service.unsubscribe_events(subscription_id)
 
     def close(self, timeout: float = 5.0) -> None:
         self.agent_service.close(timeout)
@@ -135,7 +145,8 @@ class AppServer:
             "plan.execute": self._execute_plan,
             "plan.revise": self._revise_plan,
             "turn.abort": self._abort_turn,
-            "events.replay": self._replay_events,
+            "events.subscribe": self._subscribe_events,
+            "events.unsubscribe": self._unsubscribe_events,
         }
         handler = handlers.get(request.method)
         if handler is None:
@@ -173,12 +184,19 @@ class AppServer:
         session_id = self._session_id(params)
         state = self.session_store.load(session_id)
         self._require_workspace(state)
+        active = self.agent_service.has_session(session_id)
         return {
             "session": self._state_to_dict(
                 state,
-                active=self.agent_service.has_session(session_id),
+                active=active,
+                runtime_state=(
+                    self.agent_service.session_view(session_id).runtime_state
+                    if active
+                    else "inactive"
+                ),
             ),
             "messages": [message_to_dict(message) for message in state.messages],
+            "projection": self.agent_service.projection(session_id),
         }
 
     def _resume_session(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -332,20 +350,43 @@ class AppServer:
             AbortTurnCommand(session_id=self._session_id(params))
         )
 
-    def _replay_events(self, params: dict[str, Any]) -> dict[str, Any]:
-        self._check_params(
-            params,
-            required={"session_id"},
-            optional={"after_sequence"},
+    def _subscribe_events(self, params: dict[str, Any]) -> dict[str, Any]:
+        self._check_params(params, optional={"session_ids", "after_sequences"})
+        raw_session_ids = params.get("session_ids")
+        session_ids: tuple[str, ...] | None = None
+        if raw_session_ids is not None:
+            if not isinstance(raw_session_ids, list) or not raw_session_ids:
+                raise ValueError("session_ids must be a non-empty array")
+            if any(not isinstance(value, str) or not value for value in raw_session_ids):
+                raise ValueError("session_ids must contain non-empty strings")
+            session_ids = tuple(raw_session_ids)
+
+        raw_sequences = params.get("after_sequences")
+        after_sequences: dict[str, int] | None = None
+        if raw_sequences is not None:
+            if not isinstance(raw_sequences, Mapping):
+                raise ValueError("after_sequences must be an object")
+            after_sequences = {}
+            for session_id, sequence in raw_sequences.items():
+                if not isinstance(session_id, str) or not session_id:
+                    raise ValueError("after_sequences keys must be session ids")
+                if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
+                    raise ValueError("after_sequences values must be non-negative integers")
+                after_sequences[session_id] = sequence
+
+        subscription_id, cursors = self.agent_service.subscribe_events(
+            session_ids=session_ids,
+            after_sequences=after_sequences,
         )
-        after_sequence = params.get("after_sequence", 0)
-        if isinstance(after_sequence, bool) or not isinstance(after_sequence, int):
-            raise ValueError("after_sequence must be an integer")
-        command = ReplayEventsCommand(
-            session_id=self._required_string(params, "session_id"),
-            after_sequence=after_sequence,
-        )
-        return self._dispatch_command(command)
+        return {"subscription_id": subscription_id, "cursors": cursors}
+
+    def _unsubscribe_events(self, params: dict[str, Any]) -> dict[str, Any]:
+        self._check_params(params, required={"subscription_id"})
+        subscription_id = self._required_string(params, "subscription_id")
+        return {
+            "subscription_id": subscription_id,
+            "unsubscribed": self.agent_service.unsubscribe_events(subscription_id),
+        }
 
     def _dispatch_command(self, command: AgentCommandType) -> dict[str, Any]:
         self._require_active_session(command.session_id)
@@ -393,7 +434,12 @@ class AppServer:
         return data
 
     @staticmethod
-    def _state_to_dict(state: SessionState, *, active: bool) -> dict[str, Any]:
+    def _state_to_dict(
+        state: SessionState,
+        *,
+        active: bool,
+        runtime_state: str = "inactive",
+    ) -> dict[str, Any]:
         plan = state.proposed_plan
         return {
             "session_id": state.session_id,
@@ -407,6 +453,7 @@ class AppServer:
             "provider_id": state.provider_id,
             "model_id": state.model_id,
             "mode_id": state.mode_id,
+            "runtime_state": runtime_state,
             "pending_turn_id": state.pending_turn.turn_id if state.pending_turn else None,
             "pending_turn_error": (
                 state.pending_turn.last_error if state.pending_turn else None

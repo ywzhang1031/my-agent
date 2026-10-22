@@ -142,7 +142,8 @@ DEEPSEEK_API_KEY=... .venv/bin/python cli.py ui --workspace . --open-browser
   `credentials.json`（`0600`）；保存后热重载当前 session 并自动重试 pending turn
 
 浏览器不直接调用 provider 或 tool。所有操作都通过 `POST /api/rpc` 进入 `AppServer`，异步状态通过
-`GET /api/events` long-poll 消费 typed events；历史消息仍以 `session.read` 的持久化投影为准。
+`GET /api/events` long-poll 消费 typed events；历史消息和未完成 turn 的物化视图都由
+`session.read` 返回。
 HTTP server 只允许 loopback bind/Host，启动时生成随机 token，RPC/event 请求必须携带
 `X-My-Agent-Token`。它不返回 CORS header，并设置 CSP、`frame-ancestors 'none'`、`no-store` 和
 `nosniff`。这个 token 是本地页面的 CSRF/跨站访问防线，不是远程部署的用户鉴权机制。
@@ -150,9 +151,9 @@ API key 只通过 loopback RPC 传给配置层，不进入 trace、session、eve
 key 写入 `localStorage`。环境变量仍是启动时的最高优先级，但通过页面保存的 key 会立即成为当前
 进程的有效凭据，并在后续启动未覆盖环境变量时从 `credentials.json` 加载。
 
-当前 HTTP event bridge 仍是一个进程内队列的单消费者适配器，只应打开一个 UI 页面；多个 tab 会争抢
-事件。下一阶段需要把它升级为 per-client subscription/fan-out，并把 answer、reasoning、tool 和 diff
-收敛为可重建的 `turn/item` 生命周期。
+每个页面先通过 `events.subscribe` 创建独立 subscription，再使用自己的 `subscription_id` long-poll。
+同一事件会 fan-out 到所有匹配的页面，多个 tab 不再争抢一个全局队列。subscription 只存在于当前
+进程并有空闲过期时间；页面收到 `410` 后会携带各 session 的最后 sequence 自动重建订阅。
 
 ## Multi-session JSONL AppServer
 
@@ -190,19 +191,39 @@ control plane 提供：
 - `model.list`、`mode.list`、`context.inspect`
 - `turn.start/retry/interrupt/abort`
 - `approval.resolve`、`model.switch`、`mode.switch`
-- `plan.execute/revise`、`events.replay`
+- `plan.execute/revise`、`events.subscribe/unsubscribe`
 
 `session.close` 只停止并卸载内存 runtime，不删除磁盘记录；`session.resume` 将它重新加载。AppServer
-保证同一 session 同时只有一个 active turn，不同 session 可以并发运行。客户端断线后先
-`session.resume`，再调用 `events.replay` 并传入最后确认的 `after_sequence`。service 会按原始
-`event_id` 和 `sequence` 重放事件，最后异步发送新的 `events.replay_completed`。
+保证同一 session 同时只有一个 active turn，不同 session 可以并发运行。客户端断线后调用
+`events.subscribe`，通过 `after_sequences` 提交各 session 最后确认的 sequence；service 先把遗漏的
+durable events 放入该 subscription，再开始 fan-out 新事件。`session.read` 同时返回服务端维护的
+`turn -> item` projection，用于刷新后恢复未完成视图。
 
-stdio transport 适合本地 UI 子进程；local Web transport 提供 loopback token 和单浏览器 long-poll，
-但两者都还不支持真正的多客户端订阅或远程鉴权。WebSocket/SSE fan-out 是同一 AppServer/RPC
-边界上的后续 transport。
+stdio transport 适合本地 UI 子进程并持有一个连接级 subscription；local Web transport 为每个页面
+提供独立 long-poll subscription。它们仍只服务本地进程，不提供远程用户鉴权；未来换成
+WebSocket/SSE 时可以继续复用同一 AppServer、subscription 和 projection 边界。
 
-`events.jsonl` 与 `trace.jsonl` 用途不同：前者是客户端 UI 可恢复的协议时间线，后者记录更详细的
-model request/response、tool call/result 和 plan lifecycle，供 trajectory 和调试使用。
+`events-v2.jsonl` 与 `trace.jsonl` 用途不同：前者只保存客户端 UI 恢复所需的 durable terminal facts，
+例如完整的 `item.completed` 和 turn 终态；`item.started` / `item.delta` 只实时 fan-out，不逐 token
+落盘。后者记录更详细的 model request/response、tool call/result 和 plan lifecycle，供 trajectory
+和调试使用。
+
+## Runtime Concepts
+
+这些概念不是同一层的枚举：
+
+- `thread/session`：长生命周期对话容器，持有历史、配置、计划和多个 turn。本项目代码使用 `session`；
+  产品界面也可以把它称为 thread。
+- `turn`：一次用户输入触发的一次执行，从 `turn.started` 到 completed/failed/interrupted/aborted。
+- `item`：turn 内具有稳定 identity 的内容或动作，例如 user message、reasoning、assistant message、
+  tool call 和 plan；经历 started/delta/completed/failed 生命周期。
+- `mode`：应用于运行时的协作策略预设，决定 system instructions、可见工具和完成协议。它不拥有独立
+  对话，也不是执行容器。
+- `plan`：`plan mode` 是一种 mode；模型产出的具体计划则是跨 turn 保存、可修改和审批的 artifact。
+- `subagent`：拥有独立 context、turn 和执行状态的子 runtime，通常通过父子关系和主 agent 协作；
+  它是一种执行拓扑，不是 mode。
+- `goal`：跨多个 turn 持续存在的目标与进度状态，可由不同 mode 或 subagent 推进；它是持久状态，
+  也不是 mode。
 
 ## Collaboration Modes
 
@@ -331,9 +352,11 @@ OpenAI reasoning 默认使用配置中的 `medium` effort 和 `auto` summary，�
 
 - `cli.py`：解析 `ask/chat/resume/serve/ui`，控制 REPL 或组装 AppServer transport，不参与 agent 决策
 - `terminal.py`：封装 command completion、context UI、history 和 typed event 流式渲染，不参与 agent 决策
-- `protocol.py`：定义 transport-neutral command/event 类型、协议版本、序号和 JSON 编解码
+- `protocol.py`：定义 transport-neutral command/event 类型、V2 turn/item 生命周期、序号和 JSON 编解码
 - `rpc.py`：定义同步 request/response envelope、`request_id` 和结构化 RPC error
-- `event_store.py`：按 session 追加 typed events，校验单调 sequence，并按 cursor 重放
+- `event_store.py`：按 session 追加 durable typed events，校验单调 sequence，并按 cursor 重放
+- `event_broker.py`：管理 per-client subscription、session filter、fan-out 和空闲过期
+- `projection.py`：把 typed events 物化为可供 UI 刷新恢复的 `session -> turn -> item` 视图
 - `service.py`：按 session 路由命令，编排 model/mode/plan/abort 状态转换，保存 session，并把内部
   runtime event 提升为客户端协议事件
 - `app_server.py`：管理多 session runtime 生命周期、catalog，并把 RPC 翻译为 typed command
@@ -382,9 +405,11 @@ CLI or AppServer loads SessionState
   -> ModelInvoker applies harness retry/cancellation policy
   -> selected ProviderAdapter performs one API attempt and maps its wire protocol
   -> typed ModelEvent deltas become internal AgentEvent / RuntimeEvent
-  -> AgentService converts them to versioned, sequenced protocol events
-     -> EventStore appends each event before publishing it to the client
-  -> CLI or remote client renders concrete types such as ContentDeltaEvent and ToolStartedEvent
+  -> AgentService converts them to versioned, sequenced turn/item protocol events
+     -> SessionProjection applies every live event by stable turn_id/item_id
+     -> EventStore appends durable terminal facts such as ItemCompletedEvent
+     -> EventBroker fans every live event out to matching client subscriptions
+  -> CLI or remote client renders ItemStarted/Delta/Completed/Failed lifecycle events
   -> ModelCompleted contains ordered text/reasoning/tool-call output plus usage/metadata
   -> AgentLoop either accepts a final answer
      -> in Plan mode, a complete proposed_plan block becomes persisted ProposedPlan state
@@ -415,9 +440,9 @@ Build execution -> final answer: completed
 应用边界。`StartTurnCommand`、
 `InterruptTurnCommand`、`ResolveApprovalCommand`、`SwitchModelCommand`、`SwitchModeCommand`、
 `ExecutePlanCommand`、`RevisePlanCommand` 和 `AbortTurnCommand` 都只包含可序列化字段。输出不再是
-`kind: str + data: dict`，而是 `ContentDeltaEvent`、`ApprovalRequestedEvent`、
-`TurnCompletedEvent` 等具体 dataclass；每个事件包含协议版本、event ID、session ID、单 session
-递增序号和显式状态，并可转换为 JSON object。
+`kind: str + data: dict`，而是 `ItemStartedEvent`、`ItemDeltaEvent`、`ItemCompletedEvent`、
+`ApprovalRequestedEvent`、`TurnCompletedEvent` 等具体 dataclass；每个事件包含协议版本、event ID、
+session ID、可选 turn ID、单 session 递增序号、durable 标记和显式状态，并可转换为 JSON object。
 
 `AgentRuntime` 降为 service 内部的单 session 执行器，状态机仍使用 `idle`、`running_model`、
 `waiting_approval`、`running_tool`、`completed`、`failed`、`interrupted`。`ask/chat/resume` 仍在进程

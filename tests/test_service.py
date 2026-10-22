@@ -11,10 +11,9 @@ from my_agent.control import ApprovalDecision
 from my_agent.modes import BUILD_MODE, PLAN_MODE
 from my_agent.protocol import (
     AgentState,
-    ContentDeltaEvent,
     ExecutePlanCommand,
-    ReplayCompletedEvent,
-    ReplayEventsCommand,
+    ItemCompletedEvent,
+    ItemDeltaEvent,
     ResolveApprovalCommand,
     StartTurnCommand,
     SwitchModeCommand,
@@ -101,12 +100,16 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(restored, command)
 
     def test_event_round_trip_preserves_typed_payload(self) -> None:
-        event = ContentDeltaEvent(
+        event = ItemDeltaEvent(
             session_id="session-1",
+            turn_id="session-1:1",
             sequence=3,
             state=AgentState.RUNNING_MODEL,
+            durable=False,
+            item_id="session-1:1:step:2:assistant_message",
+            item_type="assistant_message",
             step=2,
-            text="hello",
+            delta="hello",
         )
 
         restored = event_from_dict(event_to_dict(event))
@@ -115,6 +118,23 @@ class ProtocolTests(unittest.TestCase):
 
 
 class AgentServiceTests(unittest.TestCase):
+    @staticmethod
+    def _subscribe(service: AgentService, session_id: str) -> str:
+        subscription_id, _ = service.subscribe_events(session_ids=(session_id,))
+        return subscription_id
+
+    @staticmethod
+    def _next_terminal(
+        service: AgentService,
+        subscription_id: str,
+    ) -> tuple[list, TurnCompletedEvent]:
+        events = []
+        while True:
+            event = service.next_event(subscription_id, timeout=1)
+            events.append(event)
+            if isinstance(event, TurnCompletedEvent):
+                return events, event
+
     def _state(self, root: Path) -> SessionState:
         return SessionState(
             session_id="session-1",
@@ -133,10 +153,31 @@ class AgentServiceTests(unittest.TestCase):
             runtime = _Runtime(state)
             runtime.events.put(
                 RuntimeEvent(
+                    kind="turn_started",
+                    state=RuntimeState.RUNNING_MODEL,
+                    data={"turn_id": "session-1:1", "task": "hi"},
+                )
+            )
+            runtime.events.put(
+                RuntimeEvent(
                     kind="content_delta",
                     state=RuntimeState.RUNNING_MODEL,
                     text="hello",
                     data={"step": 1},
+                )
+            )
+            runtime.events.put(
+                RuntimeEvent(
+                    kind="model_completed",
+                    state=RuntimeState.RUNNING_MODEL,
+                    data={
+                        "step": 1,
+                        "content": "hello",
+                        "reasoning": "",
+                        "finish_reason": "stop",
+                        "usage": None,
+                        "metadata": {},
+                    },
                 )
             )
             runtime.events.put(
@@ -160,17 +201,22 @@ class AgentServiceTests(unittest.TestCase):
             )
             service = AgentService(tool_registry_factory=lambda mode: object())
             service.register(runtime)
+            subscription_id = self._subscribe(service, state.session_id)
 
             service.dispatch(StartTurnCommand(session_id=state.session_id, user_input="hi"))
-            first = service.next_event(timeout=1)
-            second = service.next_event(timeout=1)
+            events, terminal = self._next_terminal(service, subscription_id)
 
-            self.assertIsInstance(first, ContentDeltaEvent)
-            self.assertEqual(first.sequence, 1)
-            self.assertEqual(first.session_id, state.session_id)
-            self.assertIsInstance(second, TurnCompletedEvent)
-            self.assertEqual(second.sequence, 2)
-            self.assertEqual(second.answer, "hello")
+            delta = next(event for event in events if isinstance(event, ItemDeltaEvent))
+            completed = next(
+                event
+                for event in events
+                if isinstance(event, ItemCompletedEvent)
+                and event.item_type == "assistant_message"
+            )
+            self.assertEqual(delta.delta, "hello")
+            self.assertFalse(delta.durable)
+            self.assertEqual(completed.content, "hello")
+            self.assertEqual(terminal.answer, "hello")
             self.assertIsInstance(runtime.commands[0], StartTurn)
             service.close()
 
@@ -203,13 +249,14 @@ class AgentServiceTests(unittest.TestCase):
                 save_session=save_session,
             )
             service.register(runtime)
+            subscription_id = self._subscribe(service, state.session_id)
             service.dispatch(StartTurnCommand(session_id=state.session_id, user_input="hi"))
 
             self.assertTrue(save_started.wait(1))
             with self.assertRaises(queue.Empty):
-                service.next_event(timeout=0.05)
+                service.next_event(subscription_id, timeout=0.05)
             release_save.set()
-            completed = service.next_event(timeout=1)
+            completed = service.next_event(subscription_id, timeout=1)
 
             self.assertIsInstance(completed, TurnCompletedEvent)
             service.close()
@@ -312,10 +359,11 @@ class AgentServiceTests(unittest.TestCase):
                 save_session=lambda session: saved.append(session.mode_id),
             )
             service.register(runtime)
+            subscription_id = self._subscribe(service, state.session_id)
 
             service.dispatch(ExecutePlanCommand(session_id=state.session_id))
-            approved = service.next_event(timeout=1)
-            completed = service.next_event(timeout=1)
+            approved = service.next_event(subscription_id, timeout=1)
+            completed = service.next_event(subscription_id, timeout=1)
 
             self.assertEqual(approved.plan_id, "plan-1")
             self.assertEqual(approved.mode_id, BUILD_MODE.mode_id)
@@ -330,11 +378,32 @@ class AgentServiceTests(unittest.TestCase):
             self.assertTrue(saved)
             service.close()
 
-    def test_service_replays_persisted_events_after_cursor(self) -> None:
+    def test_service_fans_out_and_replays_durable_item_completion(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             state = self._state(root)
             runtime = _Runtime(state)
+            runtime.events.put(
+                RuntimeEvent(
+                    kind="turn_started",
+                    state=RuntimeState.RUNNING_MODEL,
+                    data={"turn_id": "session-1:1", "task": "hi"},
+                )
+            )
+            runtime.events.put(
+                RuntimeEvent(
+                    kind="model_completed",
+                    state=RuntimeState.RUNNING_MODEL,
+                    data={
+                        "step": 1,
+                        "content": "hello",
+                        "reasoning": "",
+                        "finish_reason": "stop",
+                        "usage": None,
+                        "metadata": {},
+                    },
+                )
+            )
             runtime.events.put(
                 RuntimeEvent(
                     kind="content_delta",
@@ -362,27 +431,50 @@ class AgentServiceTests(unittest.TestCase):
                     ),
                 )
             )
+            event_store = EventStore(root / ".my-agent" / "sessions")
             service = AgentService(
                 tool_registry_factory=lambda mode: object(),
-                event_store=EventStore(root / ".my-agent" / "sessions"),
+                event_store=event_store,
             )
             service.register(runtime)
+            first_subscription = self._subscribe(service, state.session_id)
+            second_subscription = self._subscribe(service, state.session_id)
             service.dispatch(StartTurnCommand(session_id=state.session_id, user_input="hi"))
-            service.next_event(timeout=1)
-            service.next_event(timeout=1)
+            first_events, _ = self._next_terminal(service, first_subscription)
+            second_events, _ = self._next_terminal(service, second_subscription)
 
-            service.dispatch(
-                ReplayEventsCommand(session_id=state.session_id, after_sequence=1)
+            self.assertEqual(
+                [event.event_id for event in first_events],
+                [event.event_id for event in second_events],
             )
-            replayed = service.next_event(timeout=1)
-            completed = service.next_event(timeout=1)
 
-            self.assertIsInstance(replayed, TurnCompletedEvent)
-            self.assertEqual(replayed.sequence, 2)
-            self.assertIsInstance(completed, ReplayCompletedEvent)
-            self.assertEqual(completed.replayed_events, 1)
-            self.assertEqual(completed.latest_sequence, 2)
-            self.assertEqual(completed.sequence, 3)
+            replay_subscription, _ = service.subscribe_events(
+                session_ids=(state.session_id,),
+                after_sequences={state.session_id: 0},
+            )
+            replayed_item = service.next_event(replay_subscription, timeout=1)
+            while not (
+                isinstance(replayed_item, ItemCompletedEvent)
+                and replayed_item.item_type == "assistant_message"
+            ):
+                replayed_item = service.next_event(replay_subscription, timeout=1)
+            replayed_terminal = service.next_event(replay_subscription, timeout=1)
+
+            self.assertEqual(replayed_item.content, "hello")
+            self.assertTrue(replayed_item.durable)
+            self.assertIsInstance(replayed_terminal, TurnCompletedEvent)
+            persisted = event_store.replay(state.session_id)
+            self.assertFalse(any(isinstance(event, ItemDeltaEvent) for event in persisted))
+            self.assertTrue(
+                any(
+                    isinstance(event, ItemCompletedEvent)
+                    and event.item_type == "assistant_message"
+                    and event.content == "hello"
+                    for event in persisted
+                )
+            )
+            projection = service.projection(state.session_id)
+            self.assertEqual(projection["turns"][-1]["status"], "completed")
             service.close()
 
 
