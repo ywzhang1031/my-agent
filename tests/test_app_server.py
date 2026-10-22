@@ -264,6 +264,7 @@ class AppServerTests(unittest.TestCase):
         self.assertEqual(listed.result["sessions"][0]["session_id"], session_id)
         self.assertTrue(listed.result["sessions"][0]["active"])
         self.assertEqual(read.result["session"]["mode_id"], "plan")
+        self.assertEqual(read.result["session"]["sandbox_mode"], "workspace-write")
         self.assertEqual(read.result["session"]["runtime_state"], "idle")
         self.assertEqual(read.result["messages"], [])
         self.assertEqual(read.result["projection"]["turns"], [])

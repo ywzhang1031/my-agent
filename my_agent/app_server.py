@@ -528,6 +528,7 @@ class AppServer:
             "model_id": state.model_id,
             "mode_id": state.mode_id,
             "permission_profile_id": state.permission_profile_id,
+            "sandbox_mode": state.sandbox_mode,
             "runtime_state": runtime_state,
             "pending_turn_id": state.pending_turn.turn_id if state.pending_turn else None,
             "pending_turn_error": (

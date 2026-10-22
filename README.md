@@ -34,6 +34,12 @@ Build mode 暴露这些工具：
 和文件操作命令。子进程不接收 stdin/TTY，只继承筛选后的基础环境变量；provider API key
 不会传入。超时会终止整个 process group，stdout/stderr observation 各自最多保留
 12,000 bytes。
+
+CLI 创建的新 session 默认使用 `--sandbox workspace-write`。在 macOS 上，`exec_command` 会由
+`/usr/bin/sandbox-exec` 以 Seatbelt profile 启动：允许读取宿主文件，写入只开放给当前 workspace
+和临时目录，并额外禁止写 `.git`、`.my-agent` 与网络访问。`--sandbox danger-full-access` 会显式
+关闭这层 OS 隔离；permission profile 只控制审批，`trusted` 不会自动关闭 sandbox。当前尚未实现
+Linux/Windows backend，请求 `workspace-write` 时会失败关闭而不是静默裸跑。
 `apply_patch` 每次只允许修改一个 workspace-relative 文件，支持 `Add File`、`Update File`
 和 `Delete File`。例如：
 
@@ -314,7 +320,7 @@ REPL 使用 `prompt_toolkit`，支持左右移动光标、行内插入和上下�
 默认高亮；用上下方向键移动并按 `Enter` 确认，不需要手动输入 model ID。`/mode` 和
 `/permissions` 使用相同交互。底部状态栏持续显示当前 `provider/model`、collaboration mode、
 permission profile、context 百分比、估算用量和 pending
-状态。历史保存在 `.my-agent/history`，权限设为 `0600`。
+状态，同时显示当前 sandbox mode。历史保存在 `.my-agent/history`，权限设为 `0600`。
 输入过程中按 `Ctrl-C` 只清空当前行；turn 运行或等待审批时按 `Ctrl-C` 会发送
 `InterruptTurn`。中断后的 pending turn 可以执行 `/retry` 继续，或用 `/abort` 丢弃。
 模型调用失败后同样可以执行 `/retry` 或 `/abort`。
@@ -403,6 +409,7 @@ OpenAI reasoning 默认使用配置中的 `medium` effort 和 `auto` summary，�
 - `providers/factory.py`：把 CLI provider 配置绑定为一个具体 adapter；它不是运行时全局插件注册表
 - `tools.py`：定义 tool schema、registry、执行入口和统一 `ToolResult`
 - `execution.py`：在清理后的环境中管理子进程、输出捕获、timeout 和 process group
+- `sandbox.py`：把 sandbox policy 映射为平台 execution backend；当前实现 macOS Seatbelt
 - `patches.py`：解析并提交单文件 patch，不依赖 shell 命令
 - `workspace.py` / `permissions.py`：限制路径范围、受保护目录和命令形态
 - `trace.py` / `trajectory.py`：分别保存 raw event log 和规范化 trajectory
@@ -442,6 +449,7 @@ CLI or AppServer loads SessionState
         or remote client sends approval.resolve RPC
      -> the same suspended tool call resumes; the model is not called again first
   -> approved call executes; denied call becomes a failed ToolResult
+     -> exec_command applies the persisted sandbox policy before spawning the process
   -> ToolResult becomes ToolResultMessage
   -> next model request sees the new observation
   -> after edits, git_diff exposes the actual working-tree delta
@@ -489,11 +497,11 @@ adapter 标记为 retryable 的错误。provider adapter 本身从不循环重�
 正在等待网络读取时无法立即强制关闭底层 socket，因此模型中断最坏仍可能等到当前 I/O 返回
 或请求 timeout。子进程中断会直接终止整个 process group。
 
-`exec_command` 的 allowlist 是 harness policy，不是安全 sandbox。被允许的 test/build
-命令仍会执行仓库中的代码，因此仍可能写文件、访问用户可读路径或尝试网络访问。
-交互 approval 和 permission profile 表达用户意图，也不改变这一安全边界。当前版本没有 OS
-级 filesystem、process 或 network isolation；在开放任意 shell、包安装、外部 MCP 或无人值守
-subagent 之前，应增加独立 sandbox execution plane。
+`exec_command` 的 allowlist 是 harness policy，macOS Seatbelt 是独立的 execution boundary。
+前者决定“哪类命令可被提出”，permission profile 决定“是否询问用户”，后者限制获准进程的实际
+写入和网络能力。当前 `workspace-write` 仍允许读取宿主可读文件，因此不是秘密隔离；也尚未限制
+CPU、内存、进程数或总运行时。开放任意 shell、包安装、外部 MCP 或无人值守 subagent 前仍需
+更完整的跨平台 sandbox 与资源治理。
 
 `final_answer` 仍然是 harness 的判断：当规范化后的 `ModelResponse.tool_calls` 为空时，这次 turn
 完成。Plan mode 在这个分支上进一步检查 completion protocol，区分普通回答与 `proposed_plan`；

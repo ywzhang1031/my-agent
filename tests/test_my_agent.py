@@ -23,6 +23,7 @@ from my_agent.cli import (
     _build_model,
     _restore_session_mode,
     _restore_session_model,
+    _restore_session_sandbox,
     build_parser,
     build_tool_registry,
     main,
@@ -72,6 +73,7 @@ from my_agent.runtime import (
     StartTurn,
 )
 from my_agent.session import PendingTurn, ProposedPlan, SessionStore
+from my_agent.sandbox import DANGER_FULL_ACCESS, WORKSPACE_WRITE, SandboxPolicy
 from my_agent.terminal import (
     LineEditor,
     SelectionCompleter,
@@ -364,6 +366,7 @@ class MyAgentTests(unittest.TestCase):
             state.model_id = "deepseek-v4-pro"
             state.mode_id = "build"
             state.permission_profile_id = "accept_edits"
+            state.sandbox_mode = DANGER_FULL_ACCESS
             state.proposed_plan = ProposedPlan(
                 plan_id=f"{state.session_id}:1:plan",
                 source_turn_id=f"{state.session_id}:1",
@@ -409,6 +412,7 @@ class MyAgentTests(unittest.TestCase):
             self.assertEqual(loaded.model_id, "deepseek-v4-pro")
             self.assertEqual(loaded.mode_id, "build")
             self.assertEqual(loaded.permission_profile_id, "accept_edits")
+            self.assertEqual(loaded.sandbox_mode, DANGER_FULL_ACCESS)
             self.assertEqual(loaded.proposed_plan, state.proposed_plan)
             self.assertEqual(loaded.pending_turn, state.pending_turn)
             self.assertTrue(loaded.metadata_path.exists())
@@ -1589,6 +1593,8 @@ class MyAgentTests(unittest.TestCase):
                 "200000",
                 "--max-output-tokens",
                 "16000",
+                "--sandbox",
+                "danger-full-access",
                 "inspect",
                 "this",
                 "repo",
@@ -1607,6 +1613,8 @@ class MyAgentTests(unittest.TestCase):
         self.assertTrue(ask.show_thinking)
         self.assertEqual(ask.context_window_tokens, 200000)
         self.assertEqual(ask.max_output_tokens, 16000)
+        self.assertEqual(ask.sandbox, DANGER_FULL_ACCESS)
+        self.assertIsNone(chat.sandbox)
         self.assertEqual(chat.command, "chat")
         self.assertEqual(resume.command, "resume")
         self.assertEqual(resume.session_id, "session-123")
@@ -1963,6 +1971,7 @@ class MyAgentTests(unittest.TestCase):
                     provider_id="deepseek",
                     model_id="deepseek-v4-flash",
                     mode_id="plan",
+                    sandbox_mode=WORKSPACE_WRITE,
                 )
             )
 
@@ -1975,6 +1984,7 @@ class MyAgentTests(unittest.TestCase):
             self.assertIn("Last provider input", panel)
             self.assertIn("model deepseek/deepseek-v4-flash", toolbar)
             self.assertIn("mode plan", toolbar)
+            self.assertIn("sandbox workspace-write", toolbar)
             self.assertIn("context", toolbar)
             self.assertIn("/ commands", toolbar)
             self.assertIn("Up/Down select", toolbar)
@@ -2312,6 +2322,24 @@ class MyAgentTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "pending turn requires mode plan"):
                 _restore_session_mode(args, state)
 
+    def test_pending_turn_requires_its_persisted_sandbox(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = build_parser().parse_args(
+                ["resume", "session-id", "--sandbox", DANGER_FULL_ACCESS]
+            )
+            state = SessionStore(Path(tmpdir, "sessions")).create(tmpdir)
+            state.pending_turn = PendingTurn(
+                turn_id=f"{state.session_id}:1",
+                task="Continue this change",
+                message_start=0,
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "pending turn requires sandbox workspace-write",
+            ):
+                _restore_session_sandbox(args, state)
+
     def test_resume_full_model_reference_overrides_session_provider(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             args = build_parser().parse_args(
@@ -2546,6 +2574,7 @@ class MyAgentTests(unittest.TestCase):
                 workspace=Workspace(tmpdir),
                 permissions=PermissionPolicy(),
                 timeout_seconds=10,
+                sandbox_policy=SandboxPolicy(DANGER_FULL_ACCESS, Path(tmpdir)),
             )
 
             passing = ExecCommandTool().run(
@@ -2637,7 +2666,11 @@ class MyAgentTests(unittest.TestCase):
             outside = Path(tmpdir, "outside")
             outside.mkdir()
             (root / "outside-link").symlink_to(outside, target_is_directory=True)
-            ctx = ToolContext(workspace=Workspace(root), permissions=PermissionPolicy())
+            ctx = ToolContext(
+                workspace=Workspace(root),
+                permissions=PermissionPolicy(),
+                sandbox_policy=SandboxPolicy(DANGER_FULL_ACCESS, root),
+            )
             tool = ExecCommandTool()
 
             nested_result = tool.run(
@@ -2657,6 +2690,11 @@ class MyAgentTests(unittest.TestCase):
 
             self.assertTrue(nested_result.ok, nested_result.stderr)
             self.assertEqual(nested_result.metadata["cwd"], "nested")
+            self.assertEqual(
+                nested_result.metadata["sandbox_mode"],
+                DANGER_FULL_ACCESS,
+            )
+            self.assertEqual(nested_result.metadata["sandbox_backend"], "none")
             self.assertFalse(invalid_argv.ok)
             self.assertEqual(invalid_argv.metadata["status"], "invalid_request")
             self.assertFalse(parent_escape.ok)
@@ -2675,7 +2713,11 @@ class MyAgentTests(unittest.TestCase):
                 "        self.assertNotIn('OPENAI_API_KEY', os.environ)\n",
                 encoding="utf-8",
             )
-            ctx = ToolContext(workspace=Workspace(tmpdir), permissions=PermissionPolicy())
+            ctx = ToolContext(
+                workspace=Workspace(tmpdir),
+                permissions=PermissionPolicy(),
+                sandbox_policy=SandboxPolicy(DANGER_FULL_ACCESS, Path(tmpdir)),
+            )
 
             with patch.dict(
                 os.environ,
@@ -2703,7 +2745,11 @@ class MyAgentTests(unittest.TestCase):
                 "        self.fail('expected failure')\n",
                 encoding="utf-8",
             )
-            ctx = ToolContext(workspace=Workspace(tmpdir), permissions=PermissionPolicy())
+            ctx = ToolContext(
+                workspace=Workspace(tmpdir),
+                permissions=PermissionPolicy(),
+                sandbox_policy=SandboxPolicy(DANGER_FULL_ACCESS, Path(tmpdir)),
+            )
 
             result = ExecCommandTool().run(
                 {"argv": ["python3", "-m", "unittest", "discover", "-s", "."]}, ctx
@@ -2717,7 +2763,11 @@ class MyAgentTests(unittest.TestCase):
 
     def test_exec_command_reports_spawn_error(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            ctx = ToolContext(workspace=Workspace(tmpdir), permissions=PermissionPolicy())
+            ctx = ToolContext(
+                workspace=Workspace(tmpdir),
+                permissions=PermissionPolicy(),
+                sandbox_policy=SandboxPolicy(DANGER_FULL_ACCESS, Path(tmpdir)),
+            )
 
             with patch.dict(os.environ, {"PATH": "/definitely-missing"}):
                 result = ExecCommandTool().run({"argv": ["ruff", "check", "."]}, ctx)
@@ -2745,6 +2795,7 @@ class MyAgentTests(unittest.TestCase):
                 workspace=Workspace(tmpdir),
                 permissions=PermissionPolicy(),
                 timeout_seconds=5,
+                sandbox_policy=SandboxPolicy(DANGER_FULL_ACCESS, Path(tmpdir)),
             )
 
             result = ExecCommandTool().run(
@@ -2777,6 +2828,7 @@ class MyAgentTests(unittest.TestCase):
                 permissions=PermissionPolicy(),
                 timeout_seconds=10,
                 cancel_event=cancel_event,
+                sandbox_policy=SandboxPolicy(DANGER_FULL_ACCESS, Path(tmpdir)),
             )
             timer = threading.Timer(0.2, cancel_event.set)
             timer.start()
@@ -3257,6 +3309,7 @@ class MyAgentTests(unittest.TestCase):
                 permissions=PermissionPolicy(),
                 trace=TraceRecorder(state.trace_path),
                 max_steps=4,
+                sandbox_policy=SandboxPolicy(DANGER_FULL_ACCESS, workspace_path),
             )
 
             result = loop.run_turn(state, "Run the tests.")

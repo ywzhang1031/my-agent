@@ -11,6 +11,7 @@ from typing import Any
 from .messages import AssistantMessage, Message, ToolCall, ToolResultMessage, UserMessage
 from .modes import BUILD_MODE
 from .permissions import DEFAULT_PERMISSION_PROFILE_ID, get_permission_profile
+from .sandbox import DEFAULT_SANDBOX_MODE, SANDBOX_MODES
 
 
 SESSION_TITLE_MAX_LENGTH = 80
@@ -58,6 +59,7 @@ class SessionState:
     model_id: str | None = None
     mode_id: str = BUILD_MODE.mode_id
     permission_profile_id: str = DEFAULT_PERMISSION_PROFILE_ID
+    sandbox_mode: str = DEFAULT_SANDBOX_MODE
     proposed_plan: ProposedPlan | None = None
     pending_turn: PendingTurn | None = None
 
@@ -168,6 +170,7 @@ class SessionStore:
                     )
                 )
             ).profile_id,
+            sandbox_mode=_sandbox_mode(metadata.get("sandbox_mode")),
             proposed_plan=_proposed_plan_from_dict(metadata.get("proposed_plan")),
             pending_turn=_pending_turn_from_dict(metadata.get("pending_turn")),
         )
@@ -190,6 +193,7 @@ class SessionStore:
             "model_id": state.model_id,
             "mode_id": state.mode_id,
             "permission_profile_id": state.permission_profile_id,
+            "sandbox_mode": state.sandbox_mode,
             "proposed_plan": _proposed_plan_to_dict(state.proposed_plan),
             "pending_turn": _pending_turn_to_dict(state.pending_turn),
         }
@@ -291,6 +295,13 @@ def message_from_dict(data: dict[str, Any]) -> Message:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _sandbox_mode(value: Any) -> str:
+    selected = str(value or DEFAULT_SANDBOX_MODE)
+    if selected not in SANDBOX_MODES:
+        raise ValueError(f"unknown sandbox mode: {selected}")
+    return selected
 
 
 def _pending_turn_to_dict(pending: PendingTurn | None) -> dict[str, Any] | None:

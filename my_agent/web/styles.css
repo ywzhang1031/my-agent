@@ -379,6 +379,17 @@ textarea:disabled {
   gap: 8px;
 }
 
+.sandbox-status {
+  flex: 0 0 auto;
+  padding: 4px 7px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--muted);
+  background: var(--surface-muted);
+  font-size: 11px;
+  line-height: 1;
+}
+
 .mode-selector {
   display: flex;
   height: 30px;
@@ -1208,6 +1219,7 @@ textarea:disabled {
   }
 
   .connection-status,
+  .sandbox-status,
   .session-title-edit,
   .choice-menu-kicker {
     display: none;

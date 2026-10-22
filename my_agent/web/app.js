@@ -15,6 +15,7 @@ const elements = {
   sessionContextMenu: document.querySelector("#session-context-menu"),
   sessionMenuRename: document.querySelector("#session-menu-rename"),
   connectionStatus: document.querySelector("#connection-status"),
+  sandboxStatus: document.querySelector("#sandbox-status"),
   conversation: document.querySelector("#conversation"),
   emptyState: document.querySelector("#empty-state"),
   newSession: document.querySelector("#new-session"),
@@ -526,6 +527,9 @@ function updateControls() {
   elements.stopTurn.hidden = !busy;
   elements.modelMenuTrigger.disabled = !enabled || busy || pending;
   elements.permissionMenuTrigger.disabled = !enabled || busy || pending;
+  elements.sandboxStatus.textContent = session?.sandbox_mode
+    ? `沙箱 ${session.sandbox_mode}`
+    : "沙箱 未选择";
 
   if (session?.provider_id && session?.model_id) {
     const modelRef = `${session.provider_id}/${session.model_id}`;

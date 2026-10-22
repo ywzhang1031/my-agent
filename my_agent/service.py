@@ -78,6 +78,7 @@ class ServiceSessionView:
     model_id: str
     mode_id: str
     permission_profile_id: str
+    sandbox_mode: str
     runtime_state: str
     pending_turn_id: str | None
     proposed_plan_id: str | None
@@ -305,6 +306,7 @@ class AgentService:
             model_id=runtime.loop.model.profile.model_id,
             mode_id=runtime.loop.mode.mode_id,
             permission_profile_id=state.permission_profile_id,
+            sandbox_mode=state.sandbox_mode,
             runtime_state=runtime.state.value,
             pending_turn_id=(state.pending_turn.turn_id if state.pending_turn else None),
             proposed_plan_id=(plan.plan_id if plan else None),

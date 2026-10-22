@@ -409,9 +409,11 @@ Web UI 支持多页面连接，但 session 存储目录不再允许多个 AppSer
 - `apply_patch` 可以自动修改 workspace 内的单个普通 UTF-8/LF 文件。
 - `git_diff` 只比较 `HEAD` 和当前工作树；untracked 文件只展示名称，不展示内容。
 - `chat/resume` 会为 `apply_patch` 和 `exec_command` 请求交互 approval；`ask` 自动批准静态
-  policy 已允许的操作。两种模式都没有操作系统级 sandbox。
-- `exec_command` 只执行 allowlisted test/check/build argv，但不是操作系统级 sandbox；
-  被允许的项目代码仍可能写文件、读取用户文件或访问网络。
+  policy 已允许的操作。审批策略与 sandbox policy 保持独立。
+- `exec_command` 默认在 macOS Seatbelt `workspace-write` sandbox 中执行：写入限于 workspace/
+  temp，`.git`、`.my-agent` 与网络被拒绝；它仍可读取宿主可读文件。
+- Linux/Windows backend 尚未实现；`workspace-write` 会失败关闭。`danger-full-access` 必须由 CLI
+  显式选择。
 - `exec_command` 不支持 shell command string、pipe/redirection、stdin、TTY、后台 session、
   package install。
 - context token 是字符启发式估算，不是 provider tokenizer 的精确结果；compaction 使用
@@ -434,9 +436,21 @@ Web UI 支持多页面连接，但 session 存储目录不再允许多个 AppSer
 
 - 为 subscription 增加连接 capability negotiation，并评估 WebSocket/SSE transport。
 - 为 durable event log 增加 retention/compaction；live-only delta 已不落盘，但 terminal facts 仍会持续增长。
-- 使用 macOS Seatbelt、Linux bubblewrap 或 container 将允许的进程放入 OS sandbox。
+- 增加 Linux/Windows sandbox backend，并收紧 macOS 的只读范围与资源限制。
 - 在确定性 compactor 之上增加可选的 provider semantic summary 和 summary 质量验证。
 - 增加更多 provider adapter，并对 streaming/tool-call edge cases 建立 contract tests。
 - 把 permission mode 独立建模为 manual/accept-edits/auto 等策略，不与 collaboration mode 枚举耦合。
 - 在有真实并发需求后增加 Explore/Review subagent 和父子 trajectory，而不是把它们当主 mode。
 - 为真实任务建立 eval cases，并使用 trajectory 分析失败类型。
+
+## Milestone 25: Sandbox Execution Boundary
+
+允许的测试和构建命令不再只依赖 argv allowlist。新 `sandbox.py` 将持久化 policy 与平台 backend
+分开，`AgentLoop` 把 policy 传给 `ToolContext`，`ProcessRunner` 在 spawn 前包装命令，并在 tool
+observation 中记录实际 `sandbox_mode` 和 `sandbox_backend`。
+
+- 默认 `workspace-write` 在 macOS 使用 Seatbelt：全盘只读，workspace/temp 可写，`.git`、
+  `.my-agent` 和网络显式拒绝。
+- `danger-full-access` 是显式逃生口；`trusted` permission profile 只跳过审批，不绕过 sandbox。
+- session、CLI toolbar、AppServer view 和 Web topbar 都显示同一持久化 sandbox mode。
+- 不支持的平台返回 `sandbox_error`，不静默降级为无隔离执行。

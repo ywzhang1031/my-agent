@@ -14,6 +14,7 @@ from .messages import ToolCall
 from .control import ApprovalBroker, AutoApproveBroker, PermissionRequest
 from .patches import MAX_PATCH_CHARS, apply_patch, parse_patch
 from .permissions import PermissionPolicy
+from .sandbox import DEFAULT_SANDBOX_MODE, SandboxPolicy
 from .workspace import Workspace, WorkspaceError
 
 
@@ -60,6 +61,7 @@ class ToolContext:
     timeout_seconds: int = 60
     approvals: ApprovalBroker = field(default_factory=AutoApproveBroker)
     cancel_event: threading.Event | None = None
+    sandbox_policy: SandboxPolicy | None = None
 
 
 class BaseTool(Protocol):
@@ -313,6 +315,13 @@ class ExecCommandTool(ToolBase):
             cwd=cwd,
             timeout_seconds=timeout,
             cancel_event=ctx.cancel_event,
+            sandbox_policy=(
+                ctx.sandbox_policy
+                or SandboxPolicy(
+                    mode=DEFAULT_SANDBOX_MODE,
+                    workspace=ctx.workspace.root,
+                )
+            ),
         )
         return ToolResult(
             ok=execution.status == "success",
@@ -330,6 +339,8 @@ class ExecCommandTool(ToolBase):
                 "interrupted": execution.interrupted,
                 "duration_ms": execution.duration_ms,
                 "environment_keys": list(execution.environment_keys),
+                "sandbox_mode": execution.sandbox_mode,
+                "sandbox_backend": execution.sandbox_backend,
             },
         )
 

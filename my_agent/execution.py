@@ -10,6 +10,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
+from .sandbox import (
+    DEFAULT_SANDBOX_MODE,
+    SandboxPolicy,
+    SandboxUnavailableError,
+    prepare_sandbox_command,
+)
+
 
 PASSTHROUGH_ENVIRONMENT_KEYS = {
     "COMSPEC",
@@ -37,6 +44,8 @@ class ProcessResult:
     interrupted: bool = False
     duration_ms: int = 0
     environment_keys: tuple[str, ...] = ()
+    sandbox_mode: str = DEFAULT_SANDBOX_MODE
+    sandbox_backend: str = "none"
 
 
 class ProcessRunner:
@@ -49,14 +58,30 @@ class ProcessRunner:
         cwd: Path,
         timeout_seconds: int,
         cancel_event: threading.Event | None = None,
+        sandbox_policy: SandboxPolicy | None = None,
     ) -> ProcessResult:
         environment = _subprocess_environment()
         started = time.monotonic()
+        policy = sandbox_policy or SandboxPolicy(
+            mode=DEFAULT_SANDBOX_MODE,
+            workspace=cwd,
+        )
+        try:
+            sandbox_command = prepare_sandbox_command(argv, policy)
+        except SandboxUnavailableError as exc:
+            return ProcessResult(
+                status="sandbox_error",
+                stderr=str(exc),
+                duration_ms=_duration_ms(started),
+                environment_keys=tuple(sorted(environment)),
+                sandbox_mode=policy.mode,
+                sandbox_backend="unavailable",
+            )
 
         with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
             try:
                 process = subprocess.Popen(
-                    argv,
+                    sandbox_command.argv,
                     cwd=cwd,
                     env=environment,
                     stdin=subprocess.DEVNULL,
@@ -70,6 +95,8 @@ class ProcessRunner:
                     stderr=str(exc),
                     duration_ms=_duration_ms(started),
                     environment_keys=tuple(sorted(environment)),
+                    sandbox_mode=sandbox_command.mode,
+                    sandbox_backend=sandbox_command.backend,
                 )
 
             timed_out = False
@@ -99,14 +126,12 @@ class ProcessRunner:
                 stderr = f"command timed out after {timeout_seconds}s"
 
         return ProcessResult(
-            status=(
-                "interrupted"
-                if interrupted
-                else "timed_out"
-                if timed_out
-                else "success"
-                if exit_code == 0
-                else "nonzero_exit"
+            status=_process_status(
+                exit_code=exit_code,
+                stderr=stderr,
+                timed_out=timed_out,
+                interrupted=interrupted,
+                sandbox_backend=sandbox_command.backend,
             ),
             stdout=stdout,
             stderr=stderr,
@@ -116,6 +141,8 @@ class ProcessRunner:
             interrupted=interrupted,
             duration_ms=_duration_ms(started),
             environment_keys=tuple(sorted(environment)),
+            sandbox_mode=sandbox_command.mode,
+            sandbox_backend=sandbox_command.backend,
         )
 
 
@@ -137,6 +164,28 @@ def _subprocess_environment() -> dict[str, str]:
         }
     )
     return environment
+
+
+def _process_status(
+    *,
+    exit_code: int,
+    stderr: str,
+    timed_out: bool,
+    interrupted: bool,
+    sandbox_backend: str,
+) -> str:
+    if interrupted:
+        return "interrupted"
+    if timed_out:
+        return "timed_out"
+    if exit_code == 0:
+        return "success"
+    if (
+        sandbox_backend == "macos-seatbelt"
+        and "sandbox-exec: sandbox_apply:" in stderr
+    ):
+        return "sandbox_error"
+    return "nonzero_exit"
 
 
 def _absolute_path_entries(value: str) -> str:

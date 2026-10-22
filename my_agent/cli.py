@@ -42,6 +42,7 @@ from .protocol import (
     TurnInterruptedEvent,
 )
 from .runtime import AgentRuntime
+from .sandbox import SANDBOX_MODES, SandboxPolicy
 from .service import AgentService
 from .session import SessionState, SessionStore
 from .terminal import (
@@ -195,6 +196,12 @@ def _add_runtime_options(
         default=None,
         help="Permission profile. New sessions default to supervised.",
     )
+    parser.add_argument(
+        "--sandbox",
+        choices=SANDBOX_MODES,
+        default=None,
+        help="Command sandbox. New sessions default to workspace-write.",
+    )
     if terminal_ui:
         parser.add_argument(
             "--stream",
@@ -268,11 +275,13 @@ def _run_ask(args: argparse.Namespace) -> int:
     state = store.create(workspace.root)
     _restore_session_mode(args, state)
     _restore_session_permission_profile(args, state)
+    _restore_session_sandbox(args, state)
     print(f"session: {state.session_id}", file=sys.stderr)
     loop, _ = _build_runtime(args, workspace, state.trace_path)
     _sync_session_model(state, loop)
     _sync_session_mode(state, loop)
     _sync_session_permission_profile(state, loop)
+    _sync_session_sandbox(state, loop)
     service = _build_agent_service(
         args,
         store,
@@ -402,11 +411,13 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
     _restore_session_model(args, state)
     _restore_session_mode(args, state)
     _restore_session_permission_profile(args, state)
+    _restore_session_sandbox(args, state)
     workspace = Workspace(state.workspace)
     loop, _ = _build_runtime(args, workspace, state.trace_path)
     _sync_session_model(state, loop)
     _sync_session_mode(state, loop)
     _sync_session_permission_profile(state, loop)
+    _sync_session_sandbox(state, loop)
     _save_session_artifacts(store, state)
     service = _build_agent_service(
         args,
@@ -438,6 +449,7 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                     model_id=view.model_id,
                     mode_id=view.mode_id,
                     permission_profile_id=view.permission_profile_id,
+                    sandbox_mode=view.sandbox_mode,
                     pending=view.pending_turn_id is not None,
                 )
                 try:
@@ -492,6 +504,7 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                         f"model={view.provider_id}/{view.model_id} "
                         f"mode={view.mode_id} "
                         f"permissions={view.permission_profile_id} "
+                        f"sandbox={view.sandbox_mode} "
                         f"messages={len(state.messages)} summarized="
                         f"{state.summarized_message_count} pending={pending} plan={plan}"
                     )
@@ -1020,6 +1033,7 @@ def _build_runtime(
         trace=TraceRecorder(trace_path),
         max_steps=args.max_steps,
         mode=mode,
+        sandbox_policy=SandboxPolicy(mode=args.sandbox, workspace=workspace.root),
     )
     return loop, registry
 
@@ -1044,11 +1058,13 @@ def _build_server_runtime(
     _restore_session_model(session_args, state)
     _restore_session_mode(session_args, state)
     _restore_session_permission_profile(session_args, state)
+    _restore_session_sandbox(session_args, state)
     workspace = Workspace(state.workspace)
     loop, _ = _build_runtime(session_args, workspace, state.trace_path)
     _sync_session_model(state, loop)
     _sync_session_mode(state, loop)
     _sync_session_permission_profile(state, loop)
+    _sync_session_sandbox(state, loop)
     return AgentRuntime(loop, state, interactive_approvals=True)
 
 
@@ -1152,6 +1168,21 @@ def _restore_session_permission_profile(
 
 def _sync_session_permission_profile(state: SessionState, loop: AgentLoop) -> None:
     state.permission_profile_id = loop.permissions.profile.profile_id
+
+
+def _restore_session_sandbox(args: argparse.Namespace, state: SessionState) -> None:
+    if state.pending_turn is not None and args.sandbox not in {None, state.sandbox_mode}:
+        raise ValueError(
+            f"pending turn requires sandbox {state.sandbox_mode}; "
+            f"requested sandbox is {args.sandbox}"
+        )
+    args.sandbox = args.sandbox or state.sandbox_mode
+    if args.sandbox not in SANDBOX_MODES:
+        raise ValueError(f"unknown sandbox mode: {args.sandbox}")
+
+
+def _sync_session_sandbox(state: SessionState, loop: AgentLoop) -> None:
+    state.sandbox_mode = loop.sandbox_policy.mode
 
 
 def _print_model_catalog(config: RuntimeConfig, current_model_ref: str) -> None:

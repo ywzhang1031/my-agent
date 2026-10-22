@@ -28,6 +28,7 @@ from .provider import (
     TextDelta,
 )
 from .session import PendingTurn, ProposedPlan, SessionState
+from .sandbox import DEFAULT_SANDBOX_MODE, SandboxPolicy
 from .tools import ToolContext, ToolRegistry, ToolResult
 from .trace import TraceRecorder
 from .workspace import Workspace
@@ -64,6 +65,7 @@ class AgentLoop:
         max_steps: int = 12,
         mode: CollaborationMode = BUILD_MODE,
         context_manager: ContextManager | None = None,
+        sandbox_policy: SandboxPolicy | None = None,
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be at least 1")
@@ -74,6 +76,10 @@ class AgentLoop:
         self.trace = trace
         self.max_steps = max_steps
         self.mode = mode
+        self.sandbox_policy = sandbox_policy or SandboxPolicy(
+            mode=DEFAULT_SANDBOX_MODE,
+            workspace=workspace.root,
+        )
         self.context_manager = context_manager or ContextManager(
             context_window_tokens=model.profile.context_window_tokens,
             reserve_output_tokens=model.profile.max_output_tokens,
@@ -263,6 +269,7 @@ class AgentLoop:
             permissions=self.permissions,
             approvals=approvals or AutoApproveBroker(),
             cancel_event=cancel_event,
+            sandbox_policy=self.sandbox_policy,
         )
         event_context = {
             "session_id": state.session_id,
