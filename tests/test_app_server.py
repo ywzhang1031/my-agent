@@ -10,6 +10,7 @@ from my_agent.app_server import AppServer
 from my_agent.config import ConfiguredModel
 from my_agent.event_store import EventStore
 from my_agent.modes import BUILD_MODE, COLLABORATION_MODES, get_mode
+from my_agent.permissions import PermissionPolicy
 from my_agent.rpc import (
     RequestEnvelope,
     ResponseEnvelope,
@@ -37,6 +38,7 @@ class _Loop:
         self.model = _Model()
         self.mode = get_mode(mode_id)
         self.tools = _Tools(self.mode.tool_names)
+        self.permissions = PermissionPolicy()
 
     def inspect_context(self, state):
         return _ContextSnapshot()
@@ -105,6 +107,9 @@ class _Runtime:
 
     def wait(self, timeout=5.0) -> None:
         return None
+
+    def switch_permission_profile(self, profile_id: str) -> None:
+        self.loop.permissions.switch_profile(profile_id)
 
 
 class AppServerTests(unittest.TestCase):
@@ -221,6 +226,7 @@ class AppServerTests(unittest.TestCase):
         read = self.rpc("session.read", session_id=session_id)
         models = self.rpc("model.list")
         modes = self.rpc("mode.list")
+        permissions = self.rpc("permission.list")
         context = self.rpc("context.inspect", session_id=session_id)
 
         self.assertEqual(listed.result["sessions"][0]["session_id"], session_id)
@@ -234,7 +240,29 @@ class AppServerTests(unittest.TestCase):
             [item["mode_id"] for item in modes.result["modes"]],
             ["build", "plan"],
         )
+        self.assertEqual(
+            [item["profile_id"] for item in permissions.result["profiles"]],
+            ["supervised", "accept_edits", "trusted"],
+        )
         self.assertEqual(context.result["context"]["estimated_tokens"], 125)
+
+        renamed = self.rpc(
+            "session.rename",
+            session_id=session_id,
+            title="Provider adapter work",
+        )
+        self.assertTrue(renamed.ok, renamed.error)
+        rename_event = self.app.next_event(self.subscription_id, timeout=1)
+        self.assertEqual(rename_event.title, "Provider adapter work")
+        self.assertEqual(
+            self.rpc("session.list").result["sessions"][0]["title"],
+            "Provider adapter work",
+        )
+        self.assertEqual(
+            self.rpc("session.read", session_id=session_id).result["session"]["title"],
+            "Provider adapter work",
+        )
+        self.assertEqual(self.store.load(session_id).title, "Provider adapter work")
 
         closed = self.rpc("session.close", session_id=session_id)
         closed_again = self.rpc("session.close", session_id=session_id)
@@ -244,6 +272,19 @@ class AppServerTests(unittest.TestCase):
         self.assertFalse(closed_again.result["closed"])
         self.assertTrue(resumed.result["session"]["active"])
         self.assertEqual(resumed.result["session"]["mode_id"], "plan")
+
+        switched = self.rpc(
+            "permission.switch",
+            session_id=session_id,
+            profile_id="accept_edits",
+        )
+        self.assertTrue(switched.ok, switched.error)
+        event = self.app.next_event(self.subscription_id, timeout=1)
+        self.assertEqual(event.profile_id, "accept_edits")
+        self.assertEqual(
+            self.store.load(session_id).permission_profile_id,
+            "accept_edits",
+        )
 
     def test_two_sessions_run_concurrently_but_one_session_rejects_overlap(self) -> None:
         first = self.create_session()

@@ -10,6 +10,10 @@ from typing import Any
 
 from .messages import AssistantMessage, Message, ToolCall, ToolResultMessage, UserMessage
 from .modes import BUILD_MODE
+from .permissions import DEFAULT_PERMISSION_PROFILE_ID, get_permission_profile
+
+
+SESSION_TITLE_MAX_LENGTH = 80
 
 
 @dataclass
@@ -42,6 +46,7 @@ class SessionState:
     session_dir: Path
     created_at: str
     updated_at: str
+    title: str = ""
     messages: list[Message] = field(default_factory=list)
     context_summary: str = ""
     summarized_message_count: int = 0
@@ -50,6 +55,7 @@ class SessionState:
     provider_id: str | None = None
     model_id: str | None = None
     mode_id: str = BUILD_MODE.mode_id
+    permission_profile_id: str = DEFAULT_PERMISSION_PROFILE_ID
     proposed_plan: ProposedPlan | None = None
     pending_turn: PendingTurn | None = None
 
@@ -83,6 +89,7 @@ class SessionState:
 @dataclass(frozen=True)
 class SessionSummary:
     session_id: str
+    title: str
     workspace: str
     updated_at: str
     message_count: int
@@ -142,6 +149,7 @@ class SessionStore:
             session_dir=session_dir,
             created_at=metadata["created_at"],
             updated_at=metadata["updated_at"],
+            title=str(metadata.get("title", "")),
             messages=messages,
             context_summary=metadata.get("context_summary", ""),
             summarized_message_count=int(metadata.get("summarized_message_count", 0)),
@@ -150,6 +158,14 @@ class SessionStore:
             provider_id=metadata.get("provider_id"),
             model_id=metadata.get("model_id"),
             mode_id=str(metadata.get("mode_id", BUILD_MODE.mode_id)),
+            permission_profile_id=get_permission_profile(
+                str(
+                    metadata.get(
+                        "permission_profile_id",
+                        DEFAULT_PERMISSION_PROFILE_ID,
+                    )
+                )
+            ).profile_id,
             proposed_plan=_proposed_plan_from_dict(metadata.get("proposed_plan")),
             pending_turn=_pending_turn_from_dict(metadata.get("pending_turn")),
         )
@@ -159,6 +175,7 @@ class SessionStore:
         state.updated_at = _now()
         metadata = {
             "session_id": state.session_id,
+            "title": state.title,
             "workspace": state.workspace,
             "created_at": state.created_at,
             "updated_at": state.updated_at,
@@ -170,6 +187,7 @@ class SessionStore:
             "provider_id": state.provider_id,
             "model_id": state.model_id,
             "mode_id": state.mode_id,
+            "permission_profile_id": state.permission_profile_id,
             "proposed_plan": _proposed_plan_to_dict(state.proposed_plan),
             "pending_turn": _pending_turn_to_dict(state.pending_turn),
         }
@@ -194,6 +212,7 @@ class SessionStore:
             sessions.append(
                 SessionSummary(
                     session_id=metadata["session_id"],
+                    title=str(metadata.get("title", "")),
                     workspace=metadata["workspace"],
                     updated_at=metadata["updated_at"],
                     message_count=int(metadata.get("message_count", 0)),
@@ -205,6 +224,19 @@ class SessionStore:
         if not re.fullmatch(r"[A-Za-z0-9._-]+", session_id):
             raise ValueError(f"invalid session id: {session_id}")
         return self.root / session_id
+
+
+def normalize_session_title(value: str) -> str:
+    title = value.strip()
+    if not title:
+        raise ValueError("title must be a non-empty string")
+    if len(title) > SESSION_TITLE_MAX_LENGTH:
+        raise ValueError(
+            f"title must be at most {SESSION_TITLE_MAX_LENGTH} characters"
+        )
+    if any(ord(character) < 32 or ord(character) == 127 for character in title):
+        raise ValueError("title must not contain control characters")
+    return title
 
 
 def message_to_dict(message: Message) -> dict[str, Any]:

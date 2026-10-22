@@ -8,17 +8,20 @@ from typing import Any, Callable, Iterable, Mapping
 from .config import ConfiguredModel
 from .control import ApprovalDecision
 from .modes import CollaborationMode
+from .permissions import PERMISSION_PROFILES, get_permission_profile
 from .protocol import (
     AbortTurnCommand,
     AgentCommandType,
     AgentEventType,
     ExecutePlanCommand,
     InterruptTurnCommand,
+    RenameSessionCommand,
     ResolveApprovalCommand,
     RevisePlanCommand,
     StartTurnCommand,
     SwitchModeCommand,
     SwitchModelCommand,
+    SwitchPermissionProfileCommand,
 )
 from .rpc import RequestEnvelope, ResponseEnvelope
 from .runtime import AgentRuntime
@@ -132,9 +135,11 @@ class AppServer:
             "session.read": self._read_session,
             "session.resume": self._resume_session,
             "session.close": self._close_session,
+            "session.rename": self._rename_session,
             "model.list": self._list_models,
             "provider.credential.set": self._set_provider_credential,
             "mode.list": self._list_modes,
+            "permission.list": self._list_permission_profiles,
             "context.inspect": self._inspect_context,
             "turn.start": self._start_turn,
             "turn.retry": self._retry_turn,
@@ -142,6 +147,7 @@ class AppServer:
             "approval.resolve": self._resolve_approval,
             "model.switch": self._switch_model,
             "mode.switch": self._switch_mode,
+            "permission.switch": self._switch_permission_profile,
             "plan.execute": self._execute_plan,
             "plan.revise": self._revise_plan,
             "turn.abort": self._abort_turn,
@@ -157,15 +163,26 @@ class AppServer:
         return handler(request.params)
 
     def _create_session(self, params: dict[str, Any]) -> dict[str, Any]:
-        self._check_params(params, optional={"model_ref", "mode_id"})
+        self._check_params(
+            params,
+            optional={"model_ref", "mode_id", "permission_profile_id"},
+        )
         model_ref = self._optional_string(params, "model_ref")
         mode_id = self._optional_string(params, "mode_id")
+        permission_profile_id = self._optional_string(
+            params,
+            "permission_profile_id",
+        )
         if model_ref is not None and model_ref not in {model.ref for model in self._models}:
             raise ValueError(f"unknown model: {model_ref}")
         if mode_id is not None and mode_id not in {mode.mode_id for mode in self._modes}:
             raise ValueError(f"unknown collaboration mode: {mode_id}")
+        if permission_profile_id is not None:
+            get_permission_profile(permission_profile_id)
         with self._lifecycle_lock:
             state = self.session_store.create(self.workspace)
+            if permission_profile_id is not None:
+                state.permission_profile_id = permission_profile_id
             self._attach(state, model_ref=model_ref, mode_id=mode_id)
         return {"session": self._active_session_to_dict(state.session_id)}
 
@@ -217,6 +234,15 @@ class AppServer:
             if active:
                 self.agent_service.unregister(session_id)
         return {"session_id": session_id, "closed": active}
+
+    def _rename_session(self, params: dict[str, Any]) -> dict[str, Any]:
+        self._check_params(params, required={"session_id", "title"})
+        return self._dispatch_command(
+            RenameSessionCommand(
+                session_id=self._required_string(params, "session_id"),
+                title=self._required_string(params, "title"),
+            )
+        )
 
     def _list_models(self, params: dict[str, Any]) -> dict[str, Any]:
         self._check_params(params)
@@ -285,6 +311,26 @@ class AppServer:
             ]
         }
 
+    def _list_permission_profiles(self, params: dict[str, Any]) -> dict[str, Any]:
+        self._check_params(params)
+        return {
+            "profiles": [
+                {
+                    "profile_id": profile.profile_id,
+                    "description": profile.description,
+                    "rules": [
+                        {
+                            "action": rule.action,
+                            "resource_pattern": rule.resource_pattern,
+                            "effect": rule.effect.value,
+                        }
+                        for rule in profile.rules
+                    ],
+                }
+                for profile in PERMISSION_PROFILES
+            ]
+        }
+
     def _inspect_context(self, params: dict[str, Any]) -> dict[str, Any]:
         session_id = self._session_id(params)
         self._require_active_session(session_id)
@@ -334,6 +380,17 @@ class AppServer:
             mode_id=self._required_string(params, "mode_id"),
         )
         return self._dispatch_command(command)
+
+    def _switch_permission_profile(self, params: dict[str, Any]) -> dict[str, Any]:
+        self._check_params(params, required={"session_id", "profile_id"})
+        profile_id = self._required_string(params, "profile_id")
+        get_permission_profile(profile_id)
+        return self._dispatch_command(
+            SwitchPermissionProfileCommand(
+                session_id=self._required_string(params, "session_id"),
+                profile_id=profile_id,
+            )
+        )
 
     def _execute_plan(self, params: dict[str, Any]) -> dict[str, Any]:
         return self._dispatch_command(
@@ -443,6 +500,7 @@ class AppServer:
         plan = state.proposed_plan
         return {
             "session_id": state.session_id,
+            "title": state.title,
             "workspace": state.workspace,
             "created_at": state.created_at,
             "updated_at": state.updated_at,
@@ -453,6 +511,7 @@ class AppServer:
             "provider_id": state.provider_id,
             "model_id": state.model_id,
             "mode_id": state.mode_id,
+            "permission_profile_id": state.permission_profile_id,
             "runtime_state": runtime_state,
             "pending_turn_id": state.pending_turn.turn_id if state.pending_turn else None,
             "pending_turn_error": (

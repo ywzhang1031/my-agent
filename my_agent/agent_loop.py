@@ -17,7 +17,7 @@ from .control import (
 from .messages import AssistantMessage, Message, ToolCall, ToolResultMessage, UserMessage
 from .model_invoker import ModelInvoker, RetryScheduled
 from .modes import BUILD_MODE, CollaborationMode, extract_proposed_plan
-from .permissions import PermissionPolicy
+from .permissions import PermissionEffect, PermissionPolicy
 from .provider import (
     ModelCompleted,
     ModelError,
@@ -673,11 +673,24 @@ class AgentLoop:
                 AgentEvent(kind="approval_requested", data=payload),
             )
 
-        decision = ctx.approvals.authorize(
-            request,
-            cancel_event=ctx.cancel_event,
-            on_waiting=on_waiting,
+        policy_effect = ctx.permissions.decide_permission(
+            request.action,
+            request.resource,
         )
+        if policy_effect == PermissionEffect.ALLOW:
+            decision = ApprovalDecision.ALLOW_ONCE
+            source = f"profile:{ctx.permissions.profile.profile_id}"
+        elif policy_effect == PermissionEffect.DENY:
+            decision = ApprovalDecision.DENY
+            source = f"profile:{ctx.permissions.profile.profile_id}"
+        else:
+            approval = ctx.approvals.authorize(
+                request,
+                cancel_event=ctx.cancel_event,
+                on_waiting=on_waiting,
+            )
+            decision = approval.decision
+            source = approval.source
         payload = {
             **event_context,
             "step": step,
@@ -690,13 +703,7 @@ class AgentLoop:
             "details": request.details,
             "decision": decision.value,
             "prompted": waited,
-            "source": (
-                "prompt"
-                if waited
-                else "session"
-                if decision == ApprovalDecision.ALLOW_SESSION
-                else "automatic"
-            ),
+            "source": source,
         }
         self.trace.write("approval_resolved", payload)
         self._emit(
@@ -706,7 +713,14 @@ class AgentLoop:
         if decision == ApprovalDecision.DENY:
             return ToolResult(
                 ok=False,
-                stderr=f"user denied {request.description}",
+                stderr=(
+                    f"permission profile {ctx.permissions.profile.profile_id} denied "
+                    f"{request.description}"
+                    if policy_effect == PermissionEffect.DENY
+                    else f"approval unavailable for {request.description}"
+                    if source == "unavailable"
+                    else f"user denied {request.description}"
+                ),
                 metadata={
                     "status": "denied",
                     "request_id": request.request_id,

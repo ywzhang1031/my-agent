@@ -9,14 +9,19 @@ from pathlib import Path
 from my_agent.agent_loop import TurnResult
 from my_agent.control import ApprovalDecision
 from my_agent.modes import BUILD_MODE, PLAN_MODE
+from my_agent.permissions import PermissionPolicy
 from my_agent.protocol import (
     AgentState,
     ExecutePlanCommand,
     ItemCompletedEvent,
     ItemDeltaEvent,
+    RenameSessionCommand,
     ResolveApprovalCommand,
+    SessionRenamedEvent,
     StartTurnCommand,
     SwitchModeCommand,
+    SwitchPermissionProfileCommand,
+    PermissionProfileChangedEvent,
     TurnCompletedEvent,
     command_from_dict,
     command_to_dict,
@@ -50,6 +55,7 @@ class _Loop:
         self.model = _Model()
         self.mode = PLAN_MODE
         self.tools = object()
+        self.permissions = PermissionPolicy()
 
     def switch_mode(self, mode, tools) -> None:
         self.mode = mode
@@ -80,6 +86,9 @@ class _Runtime:
     def switch_mode(self, mode, tools) -> None:
         self.loop.switch_mode(mode, tools)
 
+    def switch_permission_profile(self, profile_id: str) -> None:
+        self.loop.permissions.switch_profile(profile_id)
+
     def wait(self, timeout=5.0) -> None:
         return None
 
@@ -98,6 +107,24 @@ class ProtocolTests(unittest.TestCase):
         restored = command_from_dict(command_to_dict(command))
 
         self.assertEqual(restored, command)
+
+    def test_session_rename_protocol_round_trip(self) -> None:
+        command = RenameSessionCommand(
+            session_id="session-1",
+            command_id="command-1",
+            title="Provider adapter work",
+        )
+        event = SessionRenamedEvent(
+            session_id="session-1",
+            turn_id=None,
+            sequence=4,
+            state=AgentState.IDLE,
+            event_id="event-1",
+            title="Provider adapter work",
+        )
+
+        self.assertEqual(command_from_dict(command_to_dict(command)), command)
+        self.assertEqual(event_from_dict(event_to_dict(event)), event)
 
     def test_event_round_trip_preserves_typed_payload(self) -> None:
         event = ItemDeltaEvent(
@@ -218,6 +245,59 @@ class AgentServiceTests(unittest.TestCase):
             self.assertEqual(completed.content, "hello")
             self.assertEqual(terminal.answer, "hello")
             self.assertIsInstance(runtime.commands[0], StartTurn)
+            service.close()
+
+    def test_permission_profile_switch_is_persisted_and_emits_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._state(Path(tmp))
+            runtime = _Runtime(state)
+            saved = []
+            service = AgentService(
+                tool_registry_factory=lambda mode: object(),
+                save_session=lambda session: saved.append(session.permission_profile_id),
+            )
+            service.register(runtime)
+            subscription_id = self._subscribe(service, state.session_id)
+
+            service.dispatch(
+                SwitchPermissionProfileCommand(
+                    session_id=state.session_id,
+                    profile_id="accept_edits",
+                )
+            )
+            event = service.next_event(subscription_id, timeout=1)
+
+            self.assertIsInstance(event, PermissionProfileChangedEvent)
+            self.assertEqual(event.profile_id, "accept_edits")
+            self.assertEqual(state.permission_profile_id, "accept_edits")
+            self.assertEqual(runtime.loop.permissions.profile.profile_id, "accept_edits")
+            self.assertEqual(saved, ["accept_edits"])
+            service.close()
+
+    def test_session_rename_is_persisted_and_emits_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._state(Path(tmp))
+            runtime = _Runtime(state)
+            saved = []
+            service = AgentService(
+                tool_registry_factory=lambda mode: object(),
+                save_session=lambda session: saved.append(session.title),
+            )
+            service.register(runtime)
+            subscription_id = self._subscribe(service, state.session_id)
+
+            service.dispatch(
+                RenameSessionCommand(
+                    session_id=state.session_id,
+                    title="  Context window audit  ",
+                )
+            )
+            event = service.next_event(subscription_id, timeout=1)
+
+            self.assertIsInstance(event, SessionRenamedEvent)
+            self.assertEqual(event.title, "Context window audit")
+            self.assertEqual(state.title, "Context window audit")
+            self.assertEqual(saved, ["Context window audit"])
             service.close()
 
     def test_terminal_state_is_saved_before_terminal_event_is_published(self) -> None:

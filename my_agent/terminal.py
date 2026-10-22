@@ -220,6 +220,7 @@ def format_context_status(
     provider_id: str | None = None,
     model_id: str | None = None,
     mode_id: str | None = None,
+    permission_profile_id: str | None = None,
     pending: bool = False,
 ) -> list[tuple[str, str]]:
     percent = _format_percent(snapshot.estimated_tokens, snapshot.context_window_tokens)
@@ -238,6 +239,14 @@ def format_context_status(
             [
                 ("class:bottom-toolbar.label", "mode "),
                 ("class:bottom-toolbar.mode", mode_id),
+                ("class:bottom-toolbar.hint", "  |  "),
+            ]
+        )
+    if permission_profile_id:
+        fragments.extend(
+            [
+                ("class:bottom-toolbar.label", "permissions "),
+                ("class:bottom-toolbar.mode", permission_profile_id),
                 ("class:bottom-toolbar.hint", "  |  "),
             ]
         )

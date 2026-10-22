@@ -37,7 +37,7 @@ body {
 }
 
 button,
-select,
+input,
 textarea {
   color: inherit;
   font: inherit;
@@ -45,14 +45,14 @@ textarea {
 }
 
 button:focus-visible,
-select:focus-visible,
+input:focus-visible,
 textarea:focus-visible {
   outline: 2px solid var(--focus);
   outline-offset: 2px;
 }
 
 button:disabled,
-select:disabled,
+input:disabled,
 textarea:disabled {
   cursor: not-allowed;
   opacity: 0.5;
@@ -141,8 +141,7 @@ textarea:disabled {
 }
 
 .session-name {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 12px;
+  font-size: 12.5px;
   font-weight: 600;
 }
 
@@ -187,6 +186,7 @@ textarea:disabled {
 }
 
 .session-heading {
+  position: relative;
   display: flex;
   min-width: 120px;
   flex: 1;
@@ -194,12 +194,75 @@ textarea:disabled {
   gap: 9px;
 }
 
-.session-heading strong {
+.session-title-button {
+  display: flex;
+  min-width: 0;
+  max-width: min(360px, 100%);
+  align-items: center;
+  gap: 6px;
+  padding: 4px 5px;
   overflow: hidden;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 12px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+
+.session-title-button:hover:not(:disabled) {
+  border-color: var(--border);
+  background: var(--surface-muted);
+}
+
+.session-title-button span:first-child {
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 650;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.session-title-edit {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.session-rename-form {
+  display: flex;
+  width: min(360px, 100%);
+  min-width: 0;
+  align-items: center;
+  gap: 3px;
+}
+
+.session-rename-form input {
+  width: 100%;
+  min-width: 0;
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid var(--focus);
+  border-radius: 5px;
+  background: var(--surface);
+  font-size: 13px;
+}
+
+.session-rename-form button {
+  display: inline-grid;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  cursor: pointer;
+  font-size: 16px;
+}
+
+.session-rename-form button:hover {
+  background: var(--surface-muted);
 }
 
 .connection-status {
@@ -260,15 +323,125 @@ textarea:disabled {
   font-weight: 600;
 }
 
-.model-control select {
-  width: 190px;
-  max-width: 28vw;
+.choice-menu {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.choice-menu-trigger {
+  display: grid;
+  width: 184px;
   height: 30px;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--surface);
-  padding: 0 28px 0 8px;
+  cursor: pointer;
   font-size: 12px;
+  text-align: left;
+}
+
+.choice-menu-trigger:hover:not(:disabled),
+.choice-menu-trigger[aria-expanded="true"] {
+  border-color: var(--border-strong);
+  background: var(--surface-muted);
+}
+
+.choice-menu-kicker {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.choice-menu-value {
+  overflow: hidden;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.choice-menu-chevron {
+  color: var(--muted);
+  font-size: 14px;
+  transform: translateY(-1px);
+}
+
+.permission-menu .choice-menu-trigger {
+  width: 132px;
+}
+
+.choice-menu-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 40;
+  width: 286px;
+  max-width: calc(100vw - 24px);
+  max-height: 248px;
+  overflow-y: auto;
+  padding: 5px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface);
+  box-shadow: 0 10px 28px rgb(20 28 31 / 16%);
+}
+
+.permission-menu .choice-menu-popover {
+  width: 252px;
+}
+
+.choice-menu-option {
+  display: grid;
+  width: 100%;
+  grid-template-columns: minmax(0, 1fr) 18px;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 9px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+
+.choice-menu-option:hover,
+.choice-menu-option:focus-visible {
+  background: var(--surface-muted);
+}
+
+.choice-menu-option-copy {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.choice-menu-option-copy strong,
+.choice-menu-option-copy span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.choice-menu-option-copy strong {
+  font-size: 12px;
+}
+
+.choice-menu-option-copy span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.choice-menu-check {
+  visibility: hidden;
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.choice-menu-option[aria-selected="true"] .choice-menu-check {
+  visibility: visible;
 }
 
 .icon-button,
@@ -897,9 +1070,65 @@ textarea:disabled {
     display: none;
   }
 
-  .model-control select {
-    width: 132px;
-    max-width: 32vw;
+  .topbar {
+    gap: 6px;
+    padding: 0 8px;
+  }
+
+  .session-heading {
+    min-width: 0;
+  }
+
+  .topbar-controls {
+    gap: 4px;
+    margin-left: auto;
+  }
+
+  .connection-status,
+  .session-title-edit,
+  .choice-menu-kicker {
+    display: none;
+  }
+
+  .session-title-button {
+    max-width: 100%;
+    padding-inline: 3px;
+  }
+
+  .session-title-button span:first-child {
+    font-size: 12px;
+  }
+
+  .session-rename-form {
+    position: absolute;
+    top: 36px;
+    left: 0;
+    z-index: 45;
+    width: min(270px, calc(100vw - 20px));
+    padding: 5px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: var(--surface);
+    box-shadow: 0 10px 28px rgb(20 28 31 / 16%);
+  }
+
+  .choice-menu-trigger {
+    width: 84px;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 3px;
+    padding: 0 6px;
+  }
+
+  .permission-menu .choice-menu-trigger {
+    width: 76px;
+  }
+
+  .choice-menu-popover,
+  .permission-menu .choice-menu-popover {
+    position: fixed;
+    top: 47px;
+    right: 8px;
+    width: min(286px, calc(100vw - 16px));
   }
 
   .conversation-inner {

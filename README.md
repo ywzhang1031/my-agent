@@ -1,7 +1,7 @@
 # My Agent
 
 一个从只读诊断 loop 逐步生长出来的最小 coding agent。它现在具备 Plan/Build collaboration
-mode、流式模型输出、tool 进度、交互审批、可中断/恢复 turn、命令行历史和自动 context
+mode、可持久化 permission profile、流式模型输出、tool 进度、交互审批、可中断/恢复 turn、命令行历史和自动 context
 compaction。Build 主循环是：
 
 ```text
@@ -132,11 +132,12 @@ DEEPSEEK_API_KEY=... .venv/bin/python cli.py ui --workspace . --open-browser
 默认地址是 `http://127.0.0.1:8765/`；端口被占用时可以传 `--port 0` 让操作系统选择可用端口，
 实际 URL 会打印到 stderr。页面支持：
 
-- 创建、恢复和切换持久化 session
+- 创建、恢复、重命名和切换持久化 session；名称保存在 `session.json`
 - 流式 answer/thinking、provider retry 和 tool activity
 - `apply_patch` / `exec_command` 的 once/session/deny 审批
 - Plan mode 计划正文、执行或修改操作
-- provider/model 与 Build/Plan mode 切换
+- provider/model 与 Build/Plan mode 切换；模型和权限使用紧凑、可键盘导航的弹出菜单
+- `supervised` / `accept_edits` / `trusted` 权限策略切换
 - 分类 context 使用量、pending turn 的 retry/abort 和运行中 turn 的 interrupt
 - provider 报告 API key 缺失或认证失败时，显示凭据面板并将 key 原子写入
   `credentials.json`（`0600`）；保存后热重载当前 session 并自动重试 pending turn
@@ -187,10 +188,10 @@ DEEPSEEK_API_KEY=... .venv/bin/python cli.py serve --workspace .
 
 control plane 提供：
 
-- `session.create/list/read/resume/close`
-- `model.list`、`mode.list`、`context.inspect`
+- `session.create/list/read/resume/close/rename`
+- `model.list`、`mode.list`、`permission.list`、`context.inspect`
 - `turn.start/retry/interrupt/abort`
-- `approval.resolve`、`model.switch`、`mode.switch`
+- `approval.resolve`、`model.switch`、`mode.switch`、`permission.switch`
 - `plan.execute/revise`、`events.subscribe/unsubscribe`
 
 `session.close` 只停止并卸载内存 runtime，不删除磁盘记录；`session.resume` 将它重新加载。AppServer
@@ -256,9 +257,17 @@ terminal 使用增量过滤器隐藏可能跨多个 chunk 的协议标签，同�
 只有关联的 Build turn 返回真正的 final answer，计划才变为 `completed`；model error 保留 pending
 turn 供 `/retry`，`/abort`、输出截断或 `max_steps` 会把计划恢复为 `proposed`，允许再次审批。
 
-collaboration mode 与 permission mode 是两个不同维度。本版 `/mode` 只选择任务协作方式；
-`allow_once`、`allow_session` 和 `deny` 仍由独立 approval policy 控制。类似 `acceptEdits`、
-`dontAsk`、`bypassPermissions` 的权限模式，以及 Explore/Review/subagent，都没有混入这两个 mode。
+collaboration mode 与 permission profile 是两个不同维度。`/mode` 选择任务协作方式；
+`/permissions` 选择敏感工具的审批策略：
+
+- `supervised`：`apply_patch` 和通过硬限制的 `exec_command` 都询问，默认值
+- `accept_edits`：自动允许 workspace 内 patch，命令仍询问
+- `trusted`：自动允许通过硬限制的 patch 和命令
+
+Profile 使用有序的 `action + resource pattern -> allow/ask/deny` 规则，未匹配的新 action 默认拒绝。
+Profile 选择保存在 `session.json`，可以按 session 独立切换；running 或 pending turn 存在时拒绝
+切换。它只决定是否进入人工审批，不会覆盖 workspace/path 检查、`.git` / `.my-agent` 保护、
+结构化 argv 要求或命令白名单。
 
 `chat` 和 `resume` 中，`apply_patch` 与 `exec_command` 在执行前会暂停当前 turn 并要求审批：
 
@@ -267,9 +276,9 @@ collaboration mode 与 permission mode 是两个不同维度。本版 `/mode` �
 - `n` / `deny`：不执行工具，将拒绝作为 tool observation 返回给模型
 
 `apply_patch` 的 session resource 是同一 workspace-relative path；`exec_command` 是同一组
-normalized `argv` 与 `cwd`。`/new` 会创建新 runtime，因此也会清空 session approvals。
-非交互 `ask` 不会等待 stdin 审批：它会自动批准已经通过静态 file/command policy 的操作，
-适合明确受信任的任务，不应作为无人值守安全边界。
+normalized `argv`。`/new` 会创建新 runtime，因此也会清空 session approvals。
+非交互 `ask` 无法展示审批 UI，因此 `supervised` / `accept_edits` 中需要询问的操作会被拒绝；
+只有显式选择 `--permission-profile trusted` 才会自动执行通过硬限制的敏感工具。
 
 REPL 支持这些本地命令：
 
@@ -282,6 +291,7 @@ REPL 支持这些本地命令：
 - `/context`：查看估算的 context 使用量和 compaction 状态
 - `/model`：打开模型选择器，用上下方向键选择、`Enter` 切换、`Esc` 取消
 - `/mode`：用同样的选择器切换 Build/Plan；running 或 pending turn 存在时拒绝切换
+- `/permissions`：切换 `supervised`、`accept_edits` 或 `trusted` 权限策略
 - `/approve`：执行保留的 proposed plan，主要用于取消 selector、恢复 session 或非 TTY 场景
 - `/config`：显示实际配置/凭据路径、默认模型和已解析 provider，不显示 API key
 - `/retry`：从失败的 model step 恢复，不重复用户消息或已完成 tool
@@ -291,8 +301,9 @@ REPL 支持这些本地命令：
 REPL 使用 `prompt_toolkit`，支持左右移动光标、行内插入和上下方向键历史。输入 `/` 会显示
 全部 slash commands 及说明；菜单打开时用上下方向键移动，按 `Enter` 直接执行选中的命令。
 `Tab`/`Shift-Tab` 仍可用于正向或反向补全。执行 `/model` 后会直接打开模型选择器，当前模型
-默认高亮；用上下方向键移动并按 `Enter` 确认，不需要手动输入 model ID。`/mode` 使用相同交互。
-底部状态栏持续显示当前 `provider/model`、collaboration mode、context 百分比、估算用量和 pending
+默认高亮；用上下方向键移动并按 `Enter` 确认，不需要手动输入 model ID。`/mode` 和
+`/permissions` 使用相同交互。底部状态栏持续显示当前 `provider/model`、collaboration mode、
+permission profile、context 百分比、估算用量和 pending
 状态。历史保存在 `.my-agent/history`，权限设为 `0600`。
 输入过程中按 `Ctrl-C` 只清空当前行；turn 运行或等待审批时按 `Ctrl-C` 会发送
 `InterruptTurn`。中断后的 pending turn 可以执行 `/retry` 继续，或用 `/abort` 丢弃。
@@ -467,7 +478,9 @@ adapter 标记为 retryable 的错误。provider adapter 本身从不循环重�
 
 `exec_command` 的 allowlist 是 harness policy，不是安全 sandbox。被允许的 test/build
 命令仍会执行仓库中的代码，因此仍可能写文件、访问用户可读路径或尝试网络访问。
-交互 approval 表达用户意图，也不改变这一安全边界。
+交互 approval 和 permission profile 表达用户意图，也不改变这一安全边界。当前版本没有 OS
+级 filesystem、process 或 network isolation；在开放任意 shell、包安装、外部 MCP 或无人值守
+subagent 之前，应增加独立 sandbox execution plane。
 
 `final_answer` 仍然是 harness 的判断：当规范化后的 `ModelResponse.tool_calls` 为空时，这次 turn
 完成。Plan mode 在这个分支上进一步检查 completion protocol，区分普通回答与 `proposed_plan`；

@@ -13,7 +13,7 @@ from .control import ApprovalDecision
 from .event_store import EventStore
 from .model_invoker import ModelInvoker
 from .modes import BUILD_MODE, COLLABORATION_MODES, CollaborationMode, get_mode
-from .permissions import PermissionPolicy
+from .permissions import PERMISSION_PROFILES, PermissionPolicy, get_permission_profile
 from .providers.factory import (
     SUPPORTED_PROVIDER_IDS,
     ProviderConfig,
@@ -28,11 +28,13 @@ from .protocol import (
     ModelChangedEvent,
     PlanApprovedEvent,
     PlanRevisionRequestedEvent,
+    PermissionProfileChangedEvent,
     ResolveApprovalCommand,
     RevisePlanCommand,
     StartTurnCommand,
     SwitchModeCommand,
     SwitchModelCommand,
+    SwitchPermissionProfileCommand,
     TurnAbortedEvent,
     TurnCompletedEvent,
     TurnFailedEvent,
@@ -72,6 +74,7 @@ SLASH_COMMANDS = (
     SlashCommand("/context", "Show detailed context usage"),
     SlashCommand("/model", "Choose the model"),
     SlashCommand("/mode", "Choose Build or Plan mode"),
+    SlashCommand("/permissions", "Choose the permission profile"),
     SlashCommand("/approve", "Approve the proposed plan and execute it"),
     SlashCommand("/config", "Show provider configuration"),
     SlashCommand("/retry", "Resume the pending model step"),
@@ -169,6 +172,12 @@ def _add_runtime_options(
         default=None,
         help="Collaboration mode. New sessions default to build.",
     )
+    parser.add_argument(
+        "--permission-profile",
+        choices=[profile.profile_id for profile in PERMISSION_PROFILES],
+        default=None,
+        help="Permission profile. New sessions default to supervised.",
+    )
     if terminal_ui:
         parser.add_argument(
             "--stream",
@@ -241,10 +250,12 @@ def _run_ask(args: argparse.Namespace) -> int:
     store = _session_store(args, workspace)
     state = store.create(workspace.root)
     _restore_session_mode(args, state)
+    _restore_session_permission_profile(args, state)
     print(f"session: {state.session_id}", file=sys.stderr)
     loop, _ = _build_runtime(args, workspace, state.trace_path)
     _sync_session_model(state, loop)
     _sync_session_mode(state, loop)
+    _sync_session_permission_profile(state, loop)
     service = _build_agent_service(
         args,
         store,
@@ -365,10 +376,12 @@ def _store_provider_credential(
 def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) -> int:
     _restore_session_model(args, state)
     _restore_session_mode(args, state)
+    _restore_session_permission_profile(args, state)
     workspace = Workspace(state.workspace)
     loop, _ = _build_runtime(args, workspace, state.trace_path)
     _sync_session_model(state, loop)
     _sync_session_mode(state, loop)
+    _sync_session_permission_profile(state, loop)
     _save_session_artifacts(store, state)
     service = _build_agent_service(
         args,
@@ -399,6 +412,7 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                     provider_id=view.provider_id,
                     model_id=view.model_id,
                     mode_id=view.mode_id,
+                    permission_profile_id=view.permission_profile_id,
                     pending=view.pending_turn_id is not None,
                 )
                 try:
@@ -430,6 +444,7 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                     )
                     _sync_session_model(state, loop)
                     _sync_session_mode(state, loop)
+                    _sync_session_permission_profile(state, loop)
                     _save_session_artifacts(store, state)
                     print(f"session: {state.session_id}")
                     continue
@@ -451,6 +466,7 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                         f"session={state.session_id} workspace={state.workspace} "
                         f"model={view.provider_id}/{view.model_id} "
                         f"mode={view.mode_id} "
+                        f"permissions={view.permission_profile_id} "
                         f"messages={len(state.messages)} summarized="
                         f"{state.summarized_message_count} pending={pending} plan={plan}"
                     )
@@ -544,6 +560,44 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                     args.mode = changed.mode_id
                     print(f"mode: {changed.mode_id}")
                     continue
+                if user_input == "/permissions":
+                    if state.pending_turn is not None:
+                        print(
+                            "pending turn exists; use /retry or /abort before switching permissions"
+                        )
+                        continue
+                    if not editor.supports_interactive_selection:
+                        _print_permission_catalog(view.permission_profile_id)
+                        print("interactive permission selection requires a TTY")
+                        continue
+                    requested_profile = editor.select(
+                        "permissions> ",
+                        (
+                            SelectionOption(profile.profile_id, profile.description)
+                            for profile in PERMISSION_PROFILES
+                        ),
+                        current_value=view.permission_profile_id,
+                    )
+                    if requested_profile is None:
+                        print("permission selection cancelled")
+                        continue
+                    if requested_profile == view.permission_profile_id:
+                        print(f"already using permissions: {requested_profile}")
+                        continue
+                    service.dispatch(
+                        SwitchPermissionProfileCommand(
+                            session_id=state.session_id,
+                            profile_id=requested_profile,
+                        )
+                    )
+                    changed = service.next_event(timeout=1)
+                    if not isinstance(changed, PermissionProfileChangedEvent):
+                        raise RuntimeError(
+                            f"expected permission.changed, got {changed.event_type.value}"
+                        )
+                    args.permission_profile = changed.profile_id
+                    print(f"permissions: {changed.profile_id}")
+                    continue
                 if user_input == "/approve":
                     if state.pending_turn is not None:
                         print("pending turn exists; use /retry or /abort before approving a plan")
@@ -614,6 +668,7 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                     print("Tab remains available for completion and quick execution.")
                     print("/model uses Up/Down to choose, Enter to switch, and Esc to cancel.")
                     print("/mode uses the same selector.")
+                    print("/permissions selects supervised, accept_edits, or trusted.")
                     print("Completed plans open Execute/Revise; /approve runs a saved proposal.")
                     continue
                 if user_input.startswith("/"):
@@ -865,7 +920,7 @@ def _build_runtime(
         workspace=workspace,
         model=model,
         tools=registry,
-        permissions=PermissionPolicy(),
+        permissions=PermissionPolicy(args.permission_profile),
         trace=TraceRecorder(trace_path),
         max_steps=args.max_steps,
         mode=mode,
@@ -892,10 +947,12 @@ def _build_server_runtime(
         session_args.mode = mode_id
     _restore_session_model(session_args, state)
     _restore_session_mode(session_args, state)
+    _restore_session_permission_profile(session_args, state)
     workspace = Workspace(state.workspace)
     loop, _ = _build_runtime(session_args, workspace, state.trace_path)
     _sync_session_model(state, loop)
     _sync_session_mode(state, loop)
+    _sync_session_permission_profile(state, loop)
     return AgentRuntime(loop, state, interactive_approvals=True)
 
 
@@ -989,6 +1046,18 @@ def _sync_session_mode(state: SessionState, loop: AgentLoop) -> None:
     state.mode_id = loop.mode.mode_id
 
 
+def _restore_session_permission_profile(
+    args: argparse.Namespace,
+    state: SessionState,
+) -> None:
+    selected = args.permission_profile or state.permission_profile_id
+    args.permission_profile = get_permission_profile(selected).profile_id
+
+
+def _sync_session_permission_profile(state: SessionState, loop: AgentLoop) -> None:
+    state.permission_profile_id = loop.permissions.profile.profile_id
+
+
 def _print_model_catalog(config: RuntimeConfig, current_model_ref: str) -> None:
     print(f"Current model: {current_model_ref}")
     print("Available models")
@@ -1005,6 +1074,14 @@ def _print_mode_catalog(current_mode_id: str) -> None:
     for mode in COLLABORATION_MODES:
         marker = "*" if mode.mode_id == current_mode_id else " "
         print(f"  {marker} {mode.mode_id:<12}{mode.description}")
+
+
+def _print_permission_catalog(current_profile_id: str) -> None:
+    print(f"Current permissions: {current_profile_id}")
+    print("Available permission profiles")
+    for profile in PERMISSION_PROFILES:
+        marker = "*" if profile.profile_id == current_profile_id else " "
+        print(f"  {marker} {profile.profile_id:<16}{profile.description}")
 
 
 def _print_runtime_config(config: RuntimeConfig) -> None:

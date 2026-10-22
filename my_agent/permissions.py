@@ -1,12 +1,92 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
+from fnmatch import fnmatchcase
 from pathlib import PurePosixPath
 from typing import Any
 
 
 MAX_COMMAND_ARGUMENTS = 128
 MAX_COMMAND_ARGUMENT_CHARS = 4096
+
+
+class PermissionEffect(str, Enum):
+    ALLOW = "allow"
+    ASK = "ask"
+    DENY = "deny"
+
+
+@dataclass(frozen=True)
+class PermissionRule:
+    action: str
+    resource_pattern: str
+    effect: PermissionEffect
+
+    def matches(self, action: str, resource: str) -> bool:
+        return fnmatchcase(action, self.action) and fnmatchcase(
+            resource,
+            self.resource_pattern,
+        )
+
+
+@dataclass(frozen=True)
+class PermissionProfile:
+    profile_id: str
+    description: str
+    rules: tuple[PermissionRule, ...]
+    default_effect: PermissionEffect = PermissionEffect.DENY
+
+    def decide(self, action: str, resource: str) -> PermissionEffect:
+        effect = self.default_effect
+        for rule in self.rules:
+            if rule.matches(action, resource):
+                effect = rule.effect
+        return effect
+
+
+SUPERVISED_PROFILE = PermissionProfile(
+    profile_id="supervised",
+    description="Ask before workspace edits and allowlisted commands",
+    rules=(
+        PermissionRule("apply_patch", "*", PermissionEffect.ASK),
+        PermissionRule("exec_command", "*", PermissionEffect.ASK),
+    ),
+)
+
+ACCEPT_EDITS_PROFILE = PermissionProfile(
+    profile_id="accept_edits",
+    description="Allow workspace edits; ask before allowlisted commands",
+    rules=(
+        PermissionRule("apply_patch", "*", PermissionEffect.ALLOW),
+        PermissionRule("exec_command", "*", PermissionEffect.ASK),
+    ),
+)
+
+TRUSTED_PROFILE = PermissionProfile(
+    profile_id="trusted",
+    description="Allow edits and commands that pass the hard safety policy",
+    rules=(
+        PermissionRule("apply_patch", "*", PermissionEffect.ALLOW),
+        PermissionRule("exec_command", "*", PermissionEffect.ALLOW),
+    ),
+)
+
+PERMISSION_PROFILES = (
+    SUPERVISED_PROFILE,
+    ACCEPT_EDITS_PROFILE,
+    TRUSTED_PROFILE,
+)
+DEFAULT_PERMISSION_PROFILE_ID = SUPERVISED_PROFILE.profile_id
+_PROFILES_BY_ID = {profile.profile_id: profile for profile in PERMISSION_PROFILES}
+
+
+def get_permission_profile(profile_id: str | None) -> PermissionProfile:
+    selected = profile_id or DEFAULT_PERMISSION_PROFILE_ID
+    try:
+        return _PROFILES_BY_ID[selected]
+    except KeyError as exc:
+        raise ValueError(f"unknown permission profile: {selected}") from exc
 
 
 @dataclass(frozen=True)
@@ -24,6 +104,20 @@ class CommandDecision:
 class PermissionPolicy:
     blocked_shell_tokens = {";", "&&", "||", "|", "|&", "&", ">", ">>", "<"}
     protected_path_parts = {".git", ".my-agent"}
+
+    def __init__(self, profile_id: str | None = None) -> None:
+        self._profile = get_permission_profile(profile_id)
+
+    @property
+    def profile(self) -> PermissionProfile:
+        return self._profile
+
+    def switch_profile(self, profile_id: str) -> PermissionProfile:
+        self._profile = get_permission_profile(profile_id)
+        return self._profile
+
+    def decide_permission(self, action: str, resource: str) -> PermissionEffect:
+        return self._profile.decide(action, resource)
 
     def allow_file_change(self, operation: str, path: str) -> tuple[bool, str]:
         if operation not in {"add", "update", "delete"}:

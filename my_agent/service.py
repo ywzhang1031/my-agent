@@ -28,12 +28,16 @@ from .protocol import (
     ModelStartedEvent,
     PlanApprovedEvent,
     PlanRevisionRequestedEvent,
+    PermissionProfileChangedEvent,
     ProviderRetryEvent,
+    RenameSessionCommand,
     ResolveApprovalCommand,
     RevisePlanCommand,
     StartTurnCommand,
+    SessionRenamedEvent,
     SwitchModeCommand,
     SwitchModelCommand,
+    SwitchPermissionProfileCommand,
     TurnAbortedEvent,
     TurnCompletedEvent,
     TurnErrorEvent,
@@ -50,7 +54,7 @@ from .runtime import (
     RuntimeEvent,
     StartTurn,
 )
-from .session import SessionState
+from .session import SessionState, normalize_session_title
 from .tools import ToolRegistry
 
 
@@ -67,10 +71,12 @@ SessionSaver = Callable[[SessionState], None]
 @dataclass(frozen=True)
 class ServiceSessionView:
     session_id: str
+    title: str
     workspace: str
     provider_id: str
     model_id: str
     mode_id: str
+    permission_profile_id: str
     runtime_state: str
     pending_turn_id: str | None
     proposed_plan_id: str | None
@@ -162,6 +168,9 @@ class AgentService:
         command: AgentCommandType,
     ) -> None:
         runtime = handle.runtime
+        if isinstance(command, RenameSessionCommand):
+            self._rename_session(handle, command.title)
+            return
         if isinstance(command, StartTurnCommand):
             self._start_turn(
                 handle,
@@ -188,6 +197,9 @@ class AgentService:
             return
         if isinstance(command, SwitchModeCommand):
             self._switch_mode(handle, command.mode_id)
+            return
+        if isinstance(command, SwitchPermissionProfileCommand):
+            self._switch_permission_profile(handle, command.profile_id)
             return
         if isinstance(command, ExecutePlanCommand):
             self._execute_plan(handle)
@@ -286,10 +298,12 @@ class AgentService:
         plan = state.proposed_plan
         return ServiceSessionView(
             session_id=state.session_id,
+            title=state.title,
             workspace=state.workspace,
             provider_id=runtime.loop.model.profile.provider_id,
             model_id=runtime.loop.model.profile.model_id,
             mode_id=runtime.loop.mode.mode_id,
+            permission_profile_id=state.permission_profile_id,
             runtime_state=runtime.state.value,
             pending_turn_id=(state.pending_turn.turn_id if state.pending_turn else None),
             proposed_plan_id=(plan.plan_id if plan else None),
@@ -401,6 +415,18 @@ class AgentService:
             model_id=model.profile.model_id,
         )
 
+    def _rename_session(self, handle: _SessionHandle, title: str) -> None:
+        state = handle.runtime.session
+        state.title = normalize_session_title(title)
+        self._save_session(state)
+        self._publish(
+            handle,
+            SessionRenamedEvent,
+            AgentState.IDLE,
+            turn_id=None,
+            title=state.title,
+        )
+
     def _switch_mode(self, handle: _SessionHandle, mode_id: str) -> None:
         mode = get_mode(mode_id)
         tools = self._tool_registry_factory(mode)
@@ -413,6 +439,23 @@ class AgentService:
             AgentState.IDLE,
             turn_id=None,
             mode_id=mode.mode_id,
+        )
+
+    def _switch_permission_profile(
+        self,
+        handle: _SessionHandle,
+        profile_id: str,
+    ) -> None:
+        handle.runtime.switch_permission_profile(profile_id)
+        profile = handle.runtime.loop.permissions.profile
+        handle.runtime.session.permission_profile_id = profile.profile_id
+        self._save_session(handle.runtime.session)
+        self._publish(
+            handle,
+            PermissionProfileChangedEvent,
+            AgentState.IDLE,
+            turn_id=None,
+            profile_id=profile.profile_id,
         )
 
     def _execute_plan(self, handle: _SessionHandle) -> None:

@@ -10,7 +10,8 @@ from .agent_loop import AgentEvent, AgentLoop, TurnResult
 from .control import (
     ApprovalDecision,
     ApprovalNotifier,
-    AutoApproveBroker,
+    ApprovalOutcome,
+    DenyApprovalBroker,
     PermissionRequest,
     TurnInterrupted,
     raise_if_cancelled,
@@ -80,11 +81,11 @@ class RuntimeApprovalBroker:
         *,
         cancel_event: threading.Event | None,
         on_waiting: ApprovalNotifier,
-    ) -> ApprovalDecision:
+    ) -> ApprovalOutcome:
         raise_if_cancelled(cancel_event)
         with self._lock:
             if request.scope_key in self._session_approvals:
-                return ApprovalDecision.ALLOW_SESSION
+                return ApprovalOutcome(ApprovalDecision.ALLOW_SESSION, "session")
             if self._pending is not None:
                 raise RuntimeError("another approval request is already pending")
             pending = _PendingApproval(request=request)
@@ -109,7 +110,7 @@ class RuntimeApprovalBroker:
                 self._session_approvals.add(request.scope_key)
         if decision is None:
             raise RuntimeError("approval resolved without a decision")
-        return decision
+        return ApprovalOutcome(decision, "prompt")
 
     def resolve(self, request_id: str, decision: ApprovalDecision) -> None:
         if not isinstance(decision, ApprovalDecision):
@@ -138,7 +139,7 @@ class AgentRuntime:
         self._worker: threading.Thread | None = None
         self._cancel_event: threading.Event | None = None
         self._approvals = (
-            RuntimeApprovalBroker() if interactive_approvals else AutoApproveBroker()
+            RuntimeApprovalBroker() if interactive_approvals else DenyApprovalBroker()
         )
 
     @property
@@ -181,6 +182,14 @@ class AgentRuntime:
         if self.session.pending_turn is not None:
             raise RuntimeError("cannot switch mode while a turn is pending")
         self.loop.switch_mode(mode, tools)
+
+    def switch_permission_profile(self, profile_id: str) -> None:
+        with self._lock:
+            if self._worker is not None and self._worker.is_alive():
+                raise RuntimeError("cannot switch permissions while a turn is running")
+        if self.session.pending_turn is not None:
+            raise RuntimeError("cannot switch permissions while a turn is pending")
+        self.loop.permissions.switch_profile(profile_id)
 
     def wait(self, timeout: float = 5.0) -> None:
         with self._lock:

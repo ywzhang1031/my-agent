@@ -23,6 +23,12 @@ class ApprovalDecision(str, Enum):
 
 
 @dataclass(frozen=True)
+class ApprovalOutcome:
+    decision: ApprovalDecision
+    source: str
+
+
+@dataclass(frozen=True)
 class PermissionRequest:
     action: str
     resource: str
@@ -54,7 +60,7 @@ class ApprovalBroker(Protocol):
         *,
         cancel_event: threading.Event | None,
         on_waiting: ApprovalNotifier,
-    ) -> ApprovalDecision:
+    ) -> ApprovalOutcome:
         ...
 
 
@@ -65,6 +71,18 @@ class AutoApproveBroker:
         *,
         cancel_event: threading.Event | None,
         on_waiting: ApprovalNotifier,
-    ) -> ApprovalDecision:
+    ) -> ApprovalOutcome:
         raise_if_cancelled(cancel_event)
-        return ApprovalDecision.ALLOW_ONCE
+        return ApprovalOutcome(ApprovalDecision.ALLOW_ONCE, "automatic")
+
+
+class DenyApprovalBroker:
+    def authorize(
+        self,
+        request: PermissionRequest,
+        *,
+        cancel_event: threading.Event | None,
+        on_waiting: ApprovalNotifier,
+    ) -> ApprovalOutcome:
+        raise_if_cancelled(cancel_event)
+        return ApprovalOutcome(ApprovalDecision.DENY, "unavailable")

@@ -22,17 +22,20 @@ class AgentState(str, Enum):
 
 
 class CommandType(str, Enum):
+    RENAME_SESSION = "session.rename"
     START_TURN = "turn.start"
     INTERRUPT_TURN = "turn.interrupt"
     RESOLVE_APPROVAL = "approval.resolve"
     SWITCH_MODEL = "model.switch"
     SWITCH_MODE = "mode.switch"
+    SWITCH_PERMISSION_PROFILE = "permission.switch"
     EXECUTE_PLAN = "plan.execute"
     REVISE_PLAN = "plan.revise"
     ABORT_TURN = "turn.abort"
 
 
 class EventType(str, Enum):
+    SESSION_RENAMED = "session.renamed"
     TURN_STARTED = "turn.started"
     TURN_RESUMED = "turn.resumed"
     CONTEXT_COMPACTED = "context.compacted"
@@ -50,6 +53,7 @@ class EventType(str, Enum):
     TURN_INTERRUPTED = "turn.interrupted"
     MODEL_CHANGED = "model.changed"
     MODE_CHANGED = "mode.changed"
+    PERMISSION_PROFILE_CHANGED = "permission.changed"
     PLAN_APPROVED = "plan.approved"
     PLAN_REVISION_REQUESTED = "plan.revision_requested"
     TURN_ABORTED = "turn.aborted"
@@ -60,6 +64,12 @@ class AgentCommand:
     session_id: str
     command_id: str = field(default_factory=lambda: uuid4().hex)
     command_type: ClassVar[CommandType]
+
+
+@dataclass(frozen=True, kw_only=True)
+class RenameSessionCommand(AgentCommand):
+    title: str
+    command_type: ClassVar[CommandType] = CommandType.RENAME_SESSION
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -95,6 +105,12 @@ class SwitchModeCommand(AgentCommand):
 
 
 @dataclass(frozen=True, kw_only=True)
+class SwitchPermissionProfileCommand(AgentCommand):
+    profile_id: str
+    command_type: ClassVar[CommandType] = CommandType.SWITCH_PERMISSION_PROFILE
+
+
+@dataclass(frozen=True, kw_only=True)
 class ExecutePlanCommand(AgentCommand):
     command_type: ClassVar[CommandType] = CommandType.EXECUTE_PLAN
 
@@ -110,11 +126,13 @@ class AbortTurnCommand(AgentCommand):
 
 
 AgentCommandType: TypeAlias = (
-    StartTurnCommand
+    RenameSessionCommand
+    | StartTurnCommand
     | InterruptTurnCommand
     | ResolveApprovalCommand
     | SwitchModelCommand
     | SwitchModeCommand
+    | SwitchPermissionProfileCommand
     | ExecutePlanCommand
     | RevisePlanCommand
     | AbortTurnCommand
@@ -130,6 +148,12 @@ class AgentEvent:
     durable: bool = True
     event_id: str = field(default_factory=lambda: uuid4().hex)
     event_type: ClassVar[EventType]
+
+
+@dataclass(frozen=True, kw_only=True)
+class SessionRenamedEvent(AgentEvent):
+    title: str
+    event_type: ClassVar[EventType] = EventType.SESSION_RENAMED
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -277,6 +301,12 @@ class ModeChangedEvent(AgentEvent):
 
 
 @dataclass(frozen=True, kw_only=True)
+class PermissionProfileChangedEvent(AgentEvent):
+    profile_id: str
+    event_type: ClassVar[EventType] = EventType.PERMISSION_PROFILE_CHANGED
+
+
+@dataclass(frozen=True, kw_only=True)
 class PlanApprovedEvent(AgentEvent):
     plan_id: str
     mode_id: str
@@ -296,7 +326,8 @@ class TurnAbortedEvent(AgentEvent):
 
 
 AgentEventType: TypeAlias = (
-    TurnStartedEvent
+    SessionRenamedEvent
+    | TurnStartedEvent
     | TurnResumedEvent
     | ContextCompactedEvent
     | ModelStartedEvent
@@ -313,6 +344,7 @@ AgentEventType: TypeAlias = (
     | TurnInterruptedEvent
     | ModelChangedEvent
     | ModeChangedEvent
+    | PermissionProfileChangedEvent
     | PlanApprovedEvent
     | PlanRevisionRequestedEvent
     | TurnAbortedEvent
@@ -322,11 +354,13 @@ AgentEventType: TypeAlias = (
 _COMMAND_TYPES = {
     command_type.command_type.value: command_type
     for command_type in (
+        RenameSessionCommand,
         StartTurnCommand,
         InterruptTurnCommand,
         ResolveApprovalCommand,
         SwitchModelCommand,
         SwitchModeCommand,
+        SwitchPermissionProfileCommand,
         ExecutePlanCommand,
         RevisePlanCommand,
         AbortTurnCommand,
@@ -336,6 +370,7 @@ _COMMAND_TYPES = {
 _EVENT_TYPES = {
     event_type.event_type.value: event_type
     for event_type in (
+        SessionRenamedEvent,
         TurnStartedEvent,
         TurnResumedEvent,
         ContextCompactedEvent,
@@ -353,6 +388,7 @@ _EVENT_TYPES = {
         TurnInterruptedEvent,
         ModelChangedEvent,
         ModeChangedEvent,
+        PermissionProfileChangedEvent,
         PlanApprovedEvent,
         PlanRevisionRequestedEvent,
         TurnAbortedEvent,

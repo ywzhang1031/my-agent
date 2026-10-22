@@ -7,6 +7,11 @@ const elements = {
   workspacePath: document.querySelector("#workspace-path"),
   sessionList: document.querySelector("#session-list"),
   sessionTitle: document.querySelector("#session-title"),
+  sessionTitleText: document.querySelector("#session-title-text"),
+  sessionRenameForm: document.querySelector("#session-rename-form"),
+  sessionTitleInput: document.querySelector("#session-title-input"),
+  sessionRenameCancel: document.querySelector("#session-rename-cancel"),
+  sessionRenameSave: document.querySelector("#session-rename-save"),
   connectionStatus: document.querySelector("#connection-status"),
   conversation: document.querySelector("#conversation"),
   emptyState: document.querySelector("#empty-state"),
@@ -16,7 +21,12 @@ const elements = {
   inspectorClose: document.querySelector("#inspector-close"),
   backdrop: document.querySelector("#backdrop"),
   modeSelector: document.querySelector("#mode-selector"),
-  modelSelect: document.querySelector("#model-select"),
+  modelMenuTrigger: document.querySelector("#model-menu-trigger"),
+  modelMenuValue: document.querySelector("#model-menu-value"),
+  modelMenu: document.querySelector("#model-menu"),
+  permissionMenuTrigger: document.querySelector("#permission-menu-trigger"),
+  permissionMenuValue: document.querySelector("#permission-menu-value"),
+  permissionMenu: document.querySelector("#permission-menu"),
   composer: document.querySelector("#composer"),
   promptInput: document.querySelector("#prompt-input"),
   sendPrompt: document.querySelector("#send-prompt"),
@@ -52,6 +62,7 @@ const state = {
   sessions: [],
   models: [],
   modes: [],
+  permissionProfiles: [],
   selectedSession: null,
   busySessions: new Set(),
   attentionSessions: new Set(),
@@ -68,6 +79,12 @@ const state = {
 };
 
 let toastTimer = null;
+
+const permissionLabels = {
+  supervised: "监督",
+  accept_edits: "自动编辑",
+  trusted: "可信",
+};
 
 function requestID() {
   if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
@@ -123,6 +140,10 @@ function shortSessionID(sessionID) {
   return parts.length > 2 ? parts.slice(-2).join("-") : sessionID;
 }
 
+function sessionDisplayName(session) {
+  return session?.title?.trim() || shortSessionID(session?.session_id || "");
+}
+
 function formatTime(value) {
   if (!value) return "";
   const date = new Date(value);
@@ -169,7 +190,8 @@ function renderSessionList() {
 
     const name = document.createElement("span");
     name.className = "session-name";
-    name.textContent = shortSessionID(session.session_id);
+    name.textContent = sessionDisplayName(session);
+    name.title = session.title || session.session_id;
 
     const indicator = document.createElement("span");
     indicator.className = "session-indicator";
@@ -195,12 +217,25 @@ function renderSessionList() {
 function renderModelCatalog() {
   const fragment = document.createDocumentFragment();
   for (const model of state.models) {
-    const option = document.createElement("option");
-    option.value = model.ref;
-    option.textContent = model.description ? `${model.ref} · ${model.description}` : model.ref;
-    fragment.append(option);
+    fragment.append(
+      createChoiceOption({
+        value: model.ref,
+        label: model.ref,
+        description: model.description,
+        onSelect: switchModel,
+      }),
+    );
   }
-  elements.modelSelect.replaceChildren(fragment);
+  elements.modelMenu.replaceChildren(fragment);
+  if (!elements.modelMenuTrigger.dataset.value && state.models[0]) {
+    setChoiceMenuValue(
+      elements.modelMenuTrigger,
+      elements.modelMenuValue,
+      elements.modelMenu,
+      state.models[0].ref,
+      state.models[0].model_id || state.models[0].ref,
+    );
+  }
 }
 
 function renderModeCatalog() {
@@ -219,6 +254,122 @@ function renderModeCatalog() {
   elements.modeSelector.replaceChildren(fragment);
 }
 
+function renderPermissionCatalog() {
+  const fragment = document.createDocumentFragment();
+  for (const profile of state.permissionProfiles) {
+    fragment.append(
+      createChoiceOption({
+        value: profile.profile_id,
+        label: permissionLabels[profile.profile_id] || profile.profile_id,
+        description: profile.description,
+        onSelect: switchPermissionProfile,
+      }),
+    );
+  }
+  elements.permissionMenu.replaceChildren(fragment);
+  if (!elements.permissionMenuTrigger.dataset.value && state.permissionProfiles[0]) {
+    const profile = state.permissionProfiles[0];
+    setChoiceMenuValue(
+      elements.permissionMenuTrigger,
+      elements.permissionMenuValue,
+      elements.permissionMenu,
+      profile.profile_id,
+      permissionLabels[profile.profile_id] || profile.profile_id,
+    );
+  }
+}
+
+function createChoiceOption({ value, label, description, onSelect }) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "choice-menu-option";
+  button.dataset.value = value;
+  button.setAttribute("role", "option");
+  button.setAttribute("aria-selected", "false");
+
+  const copy = document.createElement("span");
+  copy.className = "choice-menu-option-copy";
+  const primary = document.createElement("strong");
+  primary.textContent = label;
+  copy.append(primary);
+  if (description) {
+    const secondary = document.createElement("span");
+    secondary.textContent = description;
+    copy.append(secondary);
+  }
+  const check = document.createElement("span");
+  check.className = "choice-menu-check";
+  check.textContent = "✓";
+  check.setAttribute("aria-hidden", "true");
+  button.append(copy, check);
+  button.addEventListener("click", () => {
+    closeChoiceMenus();
+    onSelect(value);
+  });
+  return button;
+}
+
+function setChoiceMenuValue(trigger, valueElement, menu, value, label) {
+  trigger.dataset.value = value || "";
+  valueElement.textContent = label || "未选择";
+  valueElement.title = value || "";
+  for (const option of menu.querySelectorAll(".choice-menu-option")) {
+    const selected = option.dataset.value === value;
+    option.setAttribute("aria-selected", String(selected));
+  }
+}
+
+function closeChoiceMenus(except = null) {
+  for (const [trigger, menu] of [
+    [elements.modelMenuTrigger, elements.modelMenu],
+    [elements.permissionMenuTrigger, elements.permissionMenu],
+  ]) {
+    if (menu === except) continue;
+    menu.hidden = true;
+    trigger.setAttribute("aria-expanded", "false");
+  }
+}
+
+function openChoiceMenu(trigger, menu, direction = 1) {
+  if (trigger.disabled) return;
+  closeChoiceMenus(menu);
+  menu.hidden = false;
+  trigger.setAttribute("aria-expanded", "true");
+  const options = [...menu.querySelectorAll(".choice-menu-option")];
+  const selected = options.find((option) => option.getAttribute("aria-selected") === "true");
+  const target = selected || (direction < 0 ? options.at(-1) : options[0]);
+  target?.focus();
+}
+
+function bindChoiceMenu(trigger, menu) {
+  trigger.addEventListener("click", () => {
+    if (menu.hidden) openChoiceMenu(trigger, menu);
+    else closeChoiceMenus();
+  });
+  trigger.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      openChoiceMenu(trigger, menu, event.key === "ArrowUp" ? -1 : 1);
+    }
+  });
+  menu.addEventListener("keydown", (event) => {
+    const options = [...menu.querySelectorAll(".choice-menu-option")];
+    const index = options.indexOf(document.activeElement);
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeChoiceMenus();
+      trigger.focus();
+    } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      const offset = event.key === "ArrowDown" ? 1 : -1;
+      options[(index + offset + options.length) % options.length]?.focus();
+    } else if (event.key === "Home" || event.key === "End") {
+      event.preventDefault();
+      options[event.key === "Home" ? 0 : options.length - 1]?.focus();
+    }
+  });
+}
+
 function updateControls() {
   const session = state.selectedSession;
   const sessionID = selectedSessionID();
@@ -229,14 +380,34 @@ function updateControls() {
   );
   const enabled = Boolean(session);
 
-  elements.sessionTitle.textContent = sessionID || "未选择会话";
+  elements.sessionTitleText.textContent = session ? sessionDisplayName(session) : "未选择会话";
+  elements.sessionTitle.title = session ? `重命名“${sessionDisplayName(session)}”` : "重命名会话";
+  elements.sessionTitle.disabled = !enabled;
   elements.promptInput.disabled = !enabled || busy || pending;
   elements.sendPrompt.disabled = !enabled || busy || pending;
   elements.stopTurn.hidden = !busy;
-  elements.modelSelect.disabled = !enabled || busy || pending;
+  elements.modelMenuTrigger.disabled = !enabled || busy || pending;
+  elements.permissionMenuTrigger.disabled = !enabled || busy || pending;
 
   if (session?.provider_id && session?.model_id) {
-    elements.modelSelect.value = `${session.provider_id}/${session.model_id}`;
+    const modelRef = `${session.provider_id}/${session.model_id}`;
+    const model = state.models.find((item) => item.ref === modelRef);
+    setChoiceMenuValue(
+      elements.modelMenuTrigger,
+      elements.modelMenuValue,
+      elements.modelMenu,
+      modelRef,
+      model?.model_id || session.model_id,
+    );
+  }
+  if (session?.permission_profile_id) {
+    setChoiceMenuValue(
+      elements.permissionMenuTrigger,
+      elements.permissionMenuValue,
+      elements.permissionMenu,
+      session.permission_profile_id,
+      permissionLabels[session.permission_profile_id] || session.permission_profile_id,
+    );
   }
   for (const button of elements.modeSelector.querySelectorAll("button")) {
     button.setAttribute("aria-pressed", String(button.dataset.modeId === session?.mode_id));
@@ -707,6 +878,7 @@ async function refreshSessions() {
 async function selectSession(sessionID) {
   const summary = sessionSummary(sessionID);
   if (!summary) return;
+  cancelSessionRename();
   try {
     if (!summary.active) {
       await rpc("session.resume", { session_id: sessionID });
@@ -731,7 +903,12 @@ async function selectSession(sessionID) {
 
 async function createSession() {
   const params = {};
-  if (elements.modelSelect.value) params.model_ref = elements.modelSelect.value;
+  if (elements.modelMenuTrigger.dataset.value) {
+    params.model_ref = elements.modelMenuTrigger.dataset.value;
+  }
+  if (elements.permissionMenuTrigger.dataset.value) {
+    params.permission_profile_id = elements.permissionMenuTrigger.dataset.value;
+  }
   const selectedMode = elements.modeSelector.querySelector('[aria-pressed="true"]');
   if (selectedMode?.dataset.modeId) params.mode_id = selectedMode.dataset.modeId;
   try {
@@ -741,6 +918,61 @@ async function createSession() {
     elements.promptInput.focus();
   } catch (error) {
     showToast(`无法新建会话：${error.message}`);
+  }
+}
+
+function beginSessionRename() {
+  const session = state.selectedSession;
+  if (!session) return;
+  closeChoiceMenus();
+  elements.sessionTitleInput.value = session.title || sessionDisplayName(session);
+  elements.sessionTitle.hidden = true;
+  elements.sessionRenameForm.hidden = false;
+  elements.sessionTitleInput.focus();
+  elements.sessionTitleInput.select();
+}
+
+function cancelSessionRename() {
+  elements.sessionRenameForm.hidden = true;
+  elements.sessionTitle.hidden = false;
+  elements.sessionTitleInput.disabled = false;
+  elements.sessionRenameSave.disabled = false;
+}
+
+async function renameSession(event) {
+  event.preventDefault();
+  const sessionID = selectedSessionID();
+  const title = elements.sessionTitleInput.value.trim();
+  if (!sessionID || !title) {
+    showToast("会话名称不能为空");
+    elements.sessionTitleInput.focus();
+    return;
+  }
+  if (title.length > 80) {
+    showToast("会话名称最多 80 个字符");
+    elements.sessionTitleInput.focus();
+    return;
+  }
+  if (title === state.selectedSession.title) {
+    cancelSessionRename();
+    return;
+  }
+
+  elements.sessionTitleInput.disabled = true;
+  elements.sessionRenameSave.disabled = true;
+  try {
+    await rpc("session.rename", { session_id: sessionID, title });
+    if (sessionID === selectedSessionID()) {
+      state.selectedSession.title = title;
+      updateSessionSummary(sessionID, { title });
+      updateControls();
+    }
+    cancelSessionRename();
+  } catch (error) {
+    elements.sessionTitleInput.disabled = false;
+    elements.sessionRenameSave.disabled = false;
+    elements.sessionTitleInput.focus();
+    showToast(`重命名失败：${error.message}`);
   }
 }
 
@@ -800,6 +1032,17 @@ async function switchModel(modelRef) {
   } catch (error) {
     updateControls();
     showToast(`模型切换失败：${error.message}`);
+  }
+}
+
+async function switchPermissionProfile(profileID) {
+  const sessionID = selectedSessionID();
+  if (!sessionID || profileID === state.selectedSession.permission_profile_id) return;
+  try {
+    await rpc("permission.switch", { session_id: sessionID, profile_id: profileID });
+  } catch (error) {
+    updateControls();
+    showToast(`权限切换失败：${error.message}`);
   }
 }
 
@@ -1094,6 +1337,14 @@ async function handleEvent(event) {
     case "turn.interrupted":
       await handleTerminalEvent(event, "warning", `Turn 已中断：${payload.reason}`);
       break;
+    case "session.renamed":
+      updateSessionSummary(sessionID, { title: payload.title });
+      if (sessionID === selectedSessionID()) {
+        state.selectedSession.title = payload.title;
+        updateControls();
+      }
+      addActivity(eventLabel(sessionID, "会话已重命名"), payload.title, "success");
+      break;
     case "model.changed":
       if (sessionID === selectedSessionID()) {
         state.selectedSession.provider_id = payload.provider_id;
@@ -1109,6 +1360,13 @@ async function handleEvent(event) {
         refreshContext();
       }
       addActivity(eventLabel(sessionID, "模式已切换"), payload.mode_id, "success");
+      break;
+    case "permission.changed":
+      if (sessionID === selectedSessionID()) {
+        state.selectedSession.permission_profile_id = payload.profile_id;
+        updateControls();
+      }
+      addActivity(eventLabel(sessionID, "权限已切换"), payload.profile_id, "success");
       break;
     case "plan.approved":
       if (sessionID === selectedSessionID()) {
@@ -1222,7 +1480,21 @@ function bindUI() {
       elements.composer.requestSubmit();
     }
   });
-  elements.modelSelect.addEventListener("change", () => switchModel(elements.modelSelect.value));
+  elements.sessionTitle.addEventListener("click", beginSessionRename);
+  elements.sessionRenameForm.addEventListener("submit", renameSession);
+  elements.sessionRenameCancel.addEventListener("click", cancelSessionRename);
+  elements.sessionTitleInput.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      cancelSessionRename();
+      elements.sessionTitle.focus();
+    }
+  });
+  bindChoiceMenu(elements.modelMenuTrigger, elements.modelMenu);
+  bindChoiceMenu(elements.permissionMenuTrigger, elements.permissionMenu);
+  document.addEventListener("pointerdown", (event) => {
+    if (!event.target.closest(".choice-menu")) closeChoiceMenus();
+  });
   elements.stopTurn.addEventListener("click", interruptTurn);
   elements.executePlan.addEventListener("click", executePlan);
   elements.revisePlan.addEventListener("click", revisePlan);
@@ -1255,17 +1527,20 @@ async function initialize() {
   bindUI();
   resetContext();
   try {
-    const [models, modes, sessions] = await Promise.all([
+    const [models, modes, permissions, sessions] = await Promise.all([
       rpc("model.list"),
       rpc("mode.list"),
+      rpc("permission.list"),
       rpc("session.list"),
     ]);
     state.models = models.models || [];
     state.credentialsPath = models.credentials_path || "";
     state.modes = modes.modes || [];
+    state.permissionProfiles = permissions.profiles || [];
     state.sessions = sessions.sessions || [];
     renderModelCatalog();
     renderModeCatalog();
+    renderPermissionCatalog();
     renderSessionList();
     await subscribeEvents();
     pollEvents();

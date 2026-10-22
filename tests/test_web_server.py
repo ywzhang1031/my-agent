@@ -89,7 +89,13 @@ class LocalWebServerTests(unittest.TestCase):
 
         self.assertIn('type="password"', html)
         self.assertIn('id="credential-panel"', html)
+        self.assertIn('id="permission-menu"', html)
+        self.assertIn('id="model-menu"', html)
+        self.assertIn('id="session-rename-form"', html)
+        self.assertNotIn("<select", html)
         self.assertIn('rpc("provider.credential.set"', javascript)
+        self.assertIn('rpc("permission.switch"', javascript)
+        self.assertIn('rpc("session.rename"', javascript)
         self.assertNotIn("localStorage", javascript)
 
     def test_rpc_endpoint_requires_token_and_preserves_request_id(self) -> None:

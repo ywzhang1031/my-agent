@@ -4,6 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>My Agent</title>
+    <link rel="icon" href="data:,">
     <link rel="stylesheet" href="/styles.css">
     <script src="/bootstrap.js" defer></script>
     <script src="/app.js" defer></script>
@@ -23,15 +24,52 @@
         <header class="topbar">
           <button class="icon-button mobile-only" id="sidebar-toggle" type="button" title="会话列表" aria-label="会话列表">☰</button>
           <div class="session-heading">
-            <strong id="session-title">未选择会话</strong>
+            <button class="session-title-button" id="session-title" type="button" title="重命名会话" disabled>
+              <span id="session-title-text">未选择会话</span>
+              <span class="session-title-edit" aria-hidden="true">✎</span>
+            </button>
+            <form class="session-rename-form" id="session-rename-form" hidden>
+              <label class="sr-only" for="session-title-input">会话名称</label>
+              <input id="session-title-input" type="text" maxlength="80" autocomplete="off" spellcheck="false">
+              <button type="button" id="session-rename-cancel" title="取消重命名" aria-label="取消重命名">×</button>
+              <button type="submit" id="session-rename-save" title="保存名称" aria-label="保存名称">✓</button>
+            </form>
             <span id="connection-status" class="connection-status" data-state="connecting">连接中</span>
           </div>
           <div class="topbar-controls">
             <div class="mode-selector" id="mode-selector" aria-label="协作模式"></div>
-            <label class="model-control">
-              <span class="sr-only">模型</span>
-              <select id="model-select" disabled></select>
-            </label>
+            <div class="choice-menu model-menu">
+              <button
+                class="choice-menu-trigger"
+                id="model-menu-trigger"
+                type="button"
+                aria-haspopup="listbox"
+                aria-expanded="false"
+                aria-controls="model-menu"
+                disabled
+              >
+                <span class="choice-menu-kicker">模型</span>
+                <span class="choice-menu-value" id="model-menu-value">未选择</span>
+                <span class="choice-menu-chevron" aria-hidden="true">⌄</span>
+              </button>
+              <div class="choice-menu-popover" id="model-menu" role="listbox" aria-label="选择模型" hidden></div>
+            </div>
+            <div class="choice-menu permission-menu">
+              <button
+                class="choice-menu-trigger"
+                id="permission-menu-trigger"
+                type="button"
+                aria-haspopup="listbox"
+                aria-expanded="false"
+                aria-controls="permission-menu"
+                disabled
+              >
+                <span class="choice-menu-kicker">权限</span>
+                <span class="choice-menu-value" id="permission-menu-value">未选择</span>
+                <span class="choice-menu-chevron" aria-hidden="true">⌄</span>
+              </button>
+              <div class="choice-menu-popover" id="permission-menu" role="listbox" aria-label="选择权限策略" hidden></div>
+            </div>
             <button class="icon-button inspector-toggle" id="inspector-toggle" type="button" title="上下文与活动" aria-label="上下文与活动">ⓘ</button>
           </div>
         </header>

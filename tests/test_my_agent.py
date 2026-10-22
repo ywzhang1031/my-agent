@@ -29,11 +29,16 @@ from my_agent.cli import (
 )
 from my_agent.config import load_runtime_config, save_provider_credential
 from my_agent.context import ContextManager, estimate_text_tokens
-from my_agent.control import ApprovalDecision, raise_if_cancelled
+from my_agent.control import (
+    ApprovalDecision,
+    DenyApprovalBroker,
+    PermissionRequest,
+    raise_if_cancelled,
+)
 from my_agent.messages import AssistantMessage, ToolCall, ToolResultMessage, UserMessage
 from my_agent.model_invoker import ModelInvoker, RetryPolicy, RetryScheduled
 from my_agent.modes import BUILD_MODE, PLAN_MODE, extract_proposed_plan, get_mode
-from my_agent.permissions import PermissionPolicy
+from my_agent.permissions import PermissionEffect, PermissionPolicy
 from my_agent.protocol import (
     AgentState,
     ItemCompletedEvent,
@@ -358,6 +363,7 @@ class MyAgentTests(unittest.TestCase):
             state.provider_id = "deepseek"
             state.model_id = "deepseek-v4-pro"
             state.mode_id = "build"
+            state.permission_profile_id = "accept_edits"
             state.proposed_plan = ProposedPlan(
                 plan_id=f"{state.session_id}:1:plan",
                 source_turn_id=f"{state.session_id}:1",
@@ -396,6 +402,7 @@ class MyAgentTests(unittest.TestCase):
             self.assertEqual(loaded.provider_id, "deepseek")
             self.assertEqual(loaded.model_id, "deepseek-v4-pro")
             self.assertEqual(loaded.mode_id, "build")
+            self.assertEqual(loaded.permission_profile_id, "accept_edits")
             self.assertEqual(loaded.proposed_plan, state.proposed_plan)
             self.assertEqual(loaded.pending_turn, state.pending_turn)
             self.assertTrue(loaded.metadata_path.exists())
@@ -966,6 +973,62 @@ class MyAgentTests(unittest.TestCase):
             self.assertEqual(approval["source"], "prompt")
             self.assertTrue(approval["prompted"])
             self.assertEqual(trajectory["metrics"]["approval_requests"], 1)
+
+    def test_trusted_profile_runs_hard_safe_patch_without_prompt(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace_path = Path(tmpdir, "workspace")
+            workspace_path.mkdir()
+            target = workspace_path / "app.py"
+            target.write_text("value = 1\n", encoding="utf-8")
+            state = SessionStore(Path(tmpdir, "sessions")).create(workspace_path)
+            provider = ScriptedProviderAdapter(
+                [
+                    _model_response(
+                        tool_calls=[
+                            ToolCall(
+                                call_id="call_patch",
+                                name="apply_patch",
+                                arguments={
+                                    "patch": (
+                                        "*** Begin Patch\n"
+                                        "*** Update File: app.py\n"
+                                        "@@\n"
+                                        "-value = 1\n"
+                                        "+value = 2\n"
+                                        "*** End Patch"
+                                    )
+                                },
+                            )
+                        ],
+                        finish_reason="tool_calls",
+                    ),
+                    _model_response(content="Updated app.py."),
+                ]
+            )
+            loop = AgentLoop(
+                workspace=Workspace(workspace_path),
+                model=_model(provider),
+                tools=ToolRegistry([ApplyPatchTool()]),
+                permissions=PermissionPolicy("trusted"),
+                trace=TraceRecorder(state.trace_path),
+                max_steps=3,
+            )
+            runtime = AgentRuntime(loop, state, interactive_approvals=True)
+
+            runtime.send(StartTurn(user_input="Update app.py"))
+            events = []
+            while True:
+                event = runtime.next_event(timeout=2)
+                events.append(event)
+                if event.kind == "turn_completed":
+                    break
+
+            runtime.close()
+            self.assertEqual(target.read_text(encoding="utf-8"), "value = 2\n")
+            self.assertNotIn("approval_requested", [event.kind for event in events])
+            resolved = [event for event in events if event.kind == "approval_resolved"]
+            self.assertEqual(len(resolved), 1)
+            self.assertEqual(resolved[0].data["source"], "profile:trusted")
 
     def test_agent_runtime_reuses_exact_session_approval(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2383,6 +2446,44 @@ class MyAgentTests(unittest.TestCase):
         for argv in (["rm", "-rf", "."], ["bash", "-lc", "pytest"], ["./check.sh"]):
             with self.subTest(argv=argv):
                 self.assertFalse(policy.decide_command(argv).allowed)
+
+    def test_permission_profiles_control_approval_without_bypassing_hard_guards(self):
+        supervised = PermissionPolicy("supervised")
+        accept_edits = PermissionPolicy("accept_edits")
+        trusted = PermissionPolicy("trusted")
+
+        self.assertEqual(
+            supervised.decide_permission("apply_patch", "app.py"),
+            PermissionEffect.ASK,
+        )
+        self.assertEqual(
+            accept_edits.decide_permission("apply_patch", "app.py"),
+            PermissionEffect.ALLOW,
+        )
+        self.assertEqual(
+            accept_edits.decide_permission("exec_command", "pytest -q"),
+            PermissionEffect.ASK,
+        )
+        self.assertEqual(
+            trusted.decide_permission("exec_command", "pytest -q"),
+            PermissionEffect.ALLOW,
+        )
+        self.assertFalse(trusted.allow_file_change("update", ".git/config")[0])
+        self.assertFalse(trusted.decide_command(["rm", "-rf", "."]).allowed)
+
+    def test_non_interactive_approval_broker_denies_ask_actions(self):
+        outcome = DenyApprovalBroker().authorize(
+            PermissionRequest(
+                action="exec_command",
+                resource="pytest -q",
+                description="run pytest -q",
+            ),
+            cancel_event=None,
+            on_waiting=lambda: self.fail("non-interactive broker must not prompt"),
+        )
+
+        self.assertEqual(outcome.decision, ApprovalDecision.DENY)
+        self.assertEqual(outcome.source, "unavailable")
 
     def test_exec_command_validates_argv_and_workspace_relative_cwd(self):
         with tempfile.TemporaryDirectory() as tmpdir:

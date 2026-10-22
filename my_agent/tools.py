@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import threading
 from dataclasses import dataclass, field
@@ -265,11 +266,7 @@ class ExecCommandTool(ToolBase):
             timeout = _command_timeout(arguments.get("timeout_seconds"), ctx.timeout_seconds)
         except (ValueError, WorkspaceError):
             return None
-        resource = json.dumps(
-            {"argv": list(decision.argv), "cwd": relative_cwd},
-            ensure_ascii=False,
-            sort_keys=True,
-        )
+        resource = shlex.join(decision.argv)
         return PermissionRequest(
             action="exec_command",
             resource=resource,
