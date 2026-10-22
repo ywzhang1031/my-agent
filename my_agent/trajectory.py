@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = "my-agent.trajectory.v5"
+SCHEMA_VERSION = "my-agent.trajectory.v6"
 
 
 def read_jsonl_trace(path: str | Path) -> list[dict[str, Any]]:
@@ -45,6 +45,11 @@ def _make_session_trajectory(
         final = _first_event(turn_events, "final_answer")
         aborted = _first_event(turn_events, "turn_aborted")
         interrupted = _first_event(turn_events, "turn_interrupted")
+        continuations = [
+            event
+            for event in turn_events
+            if event.get("event") == "turn_continuation_required"
+        ]
         errors = [event for event in turn_events if event.get("event") == "turn_error"]
         turns.append(
             {
@@ -70,6 +75,15 @@ def _make_session_trajectory(
                 ],
                 "final_answer": final.get("answer", "") if final else "",
                 "plan_events": _make_plan_events(turn_events),
+                "continuation_events": [
+                    {
+                        "steps_completed": event.get("steps_completed"),
+                        "step_budget": event.get("step_budget"),
+                        "next_step": event.get("next_step"),
+                        "ts": event.get("ts"),
+                    }
+                    for event in continuations
+                ],
                 "outcome": {
                     "status": (
                         "completed"
@@ -80,10 +94,18 @@ def _make_session_trajectory(
                         if interrupted
                         else "failed"
                         if errors
+                        else "waiting_user"
+                        if continuations
                         else "incomplete"
                     ),
                     "final_step": final.get("step") if final else None,
-                    "stopped_by": final.get("stopped_by") if final else None,
+                    "stopped_by": (
+                        final.get("stopped_by")
+                        if final
+                        else "continuation_required"
+                        if continuations
+                        else None
+                    ),
                     "plan_id": final.get("plan_id") if final else None,
                 },
                 "metrics": _make_metrics(
@@ -113,6 +135,8 @@ def _make_session_trajectory(
             if any(turn["outcome"]["status"] == "interrupted" for turn in turns)
             else "aborted"
             if any(turn["outcome"]["status"] == "aborted" for turn in turns)
+            else "waiting_user"
+            if any(turn["outcome"]["status"] == "waiting_user" for turn in turns)
             else "incomplete",
             "turn_count": len(turns),
         },
@@ -273,6 +297,11 @@ def _make_metrics(events: list[dict[str, Any]], started_at: float | None, ended_
         "turn_aborts": sum(1 for event in events if event.get("event") == "turn_aborted"),
         "turn_interruptions": sum(
             1 for event in events if event.get("event") == "turn_interrupted"
+        ),
+        "turn_continuation_requests": sum(
+            1
+            for event in events
+            if event.get("event") == "turn_continuation_required"
         ),
         "approval_requests": sum(
             1 for event in events if event.get("event") == "approval_requested"

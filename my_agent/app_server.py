@@ -4,6 +4,7 @@ import threading
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
+from uuid import uuid4
 
 from .config import ConfiguredModel
 from .control import ApprovalDecision
@@ -26,6 +27,7 @@ from .protocol import (
 from .rpc import RequestEnvelope, ResponseEnvelope
 from .runtime import AgentRuntime
 from .service import AgentService, ServiceSessionView
+from .server_instance import ServerInstanceLease
 from .session import SessionState, SessionStore, message_to_dict
 
 
@@ -74,6 +76,13 @@ class AppServer:
         )
         self._credential_setter = credential_setter
         self._lifecycle_lock = threading.Lock()
+        self._closed = False
+        self.instance_id = uuid4().hex
+        self._instance_lease = ServerInstanceLease.acquire(
+            self.session_store.root,
+            instance_id=self.instance_id,
+            workspace=self.workspace,
+        )
 
     def handle(self, request: RequestEnvelope) -> ResponseEnvelope:
         try:
@@ -126,7 +135,14 @@ class AppServer:
         return self.agent_service.unsubscribe_events(subscription_id)
 
     def close(self, timeout: float = 5.0) -> None:
-        self.agent_service.close(timeout)
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            self._closed = True
+        try:
+            self.agent_service.close(timeout)
+        finally:
+            self._instance_lease.release()
 
     def _dispatch(self, request: RequestEnvelope) -> dict[str, Any]:
         handlers = {
@@ -524,6 +540,12 @@ class AppServer:
                 dict(state.pending_turn.last_error_details)
                 if state.pending_turn
                 else {}
+            ),
+            "pending_turn_pause_reason": (
+                state.pending_turn.pause_reason if state.pending_turn else None
+            ),
+            "pending_turn_pause_details": (
+                dict(state.pending_turn.pause_details) if state.pending_turn else {}
             ),
             "proposed_plan_id": plan.plan_id if plan else None,
             "proposed_plan_status": plan.status if plan else None,

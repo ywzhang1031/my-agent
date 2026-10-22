@@ -32,6 +32,7 @@ class JsonlAppServer:
                 "type": "server.ready",
                 "rpc_version": RPC_VERSION,
                 "protocol_version": PROTOCOL_VERSION,
+                "instance_id": self.app_server.instance_id,
                 "workspace": str(self.app_server.workspace),
             },
         )

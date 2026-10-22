@@ -29,6 +29,8 @@ class PendingTurn:
     last_error: str | None = None
     last_error_retryable: bool | None = None
     last_error_details: dict[str, Any] = field(default_factory=dict)
+    pause_reason: str | None = None
+    pause_details: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -306,6 +308,8 @@ def _pending_turn_to_dict(pending: PendingTurn | None) -> dict[str, Any] | None:
         "last_error": pending.last_error,
         "last_error_retryable": pending.last_error_retryable,
         "last_error_details": pending.last_error_details,
+        "pause_reason": pending.pause_reason,
+        "pause_details": pending.pause_details,
     }
 
 
@@ -326,6 +330,8 @@ def _pending_turn_from_dict(data: Any) -> PendingTurn | None:
         last_error=data.get("last_error"),
         last_error_retryable=data.get("last_error_retryable"),
         last_error_details=dict(data.get("last_error_details", {})),
+        pause_reason=data.get("pause_reason"),
+        pause_details=dict(data.get("pause_details", {})),
     )
 
 

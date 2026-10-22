@@ -387,6 +387,12 @@ class MyAgentTests(unittest.TestCase):
                     "provider_id": "deepseek",
                     "action_required": "configure_api_key",
                 },
+                pause_reason="step_budget",
+                pause_details={
+                    "steps_completed": 12,
+                    "step_budget": 12,
+                    "next_step": 13,
+                },
             )
 
             store.save(state)
@@ -526,7 +532,7 @@ class MyAgentTests(unittest.TestCase):
                 {state.session_id + ":1"},
             )
             trajectory = make_trajectory(trace_events, source_path=state.trace_path)
-            self.assertEqual(trajectory["schema_version"], "my-agent.trajectory.v5")
+            self.assertEqual(trajectory["schema_version"], "my-agent.trajectory.v6")
             self.assertEqual(trajectory["turns"][0]["outcome"]["status"], "completed")
             self.assertEqual(len(trajectory["turns"][0]["errors"]), 1)
             self.assertEqual(trajectory["metrics"]["turn_errors"], 1)
@@ -686,6 +692,85 @@ class MyAgentTests(unittest.TestCase):
             self.assertEqual(trajectory["turns"][0]["outcome"]["status"], "aborted")
             self.assertEqual(trajectory["metrics"]["turn_aborts"], 1)
 
+    def test_step_budget_pauses_and_each_retry_gets_a_new_batch(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace_path = Path(tmpdir, "workspace")
+            workspace_path.mkdir()
+            state = SessionStore(Path(tmpdir, "sessions")).create(workspace_path)
+            provider = ScriptedProviderAdapter(
+                [
+                    _model_response(
+                        tool_calls=[
+                            ToolCall(
+                                call_id="call-1",
+                                name="list_files",
+                                arguments={"path": ".", "max_files": 5},
+                            )
+                        ],
+                        finish_reason="tool_calls",
+                    ),
+                    _model_response(
+                        tool_calls=[
+                            ToolCall(
+                                call_id="call-2",
+                                name="list_files",
+                                arguments={"path": ".", "max_files": 10},
+                            )
+                        ],
+                        finish_reason="tool_calls",
+                    ),
+                    _model_response(content="Inspection complete."),
+                ]
+            )
+            loop = AgentLoop(
+                workspace=Workspace(workspace_path),
+                model=_model(provider),
+                tools=ToolRegistry([ListFilesTool()]),
+                permissions=PermissionPolicy(),
+                trace=TraceRecorder(state.trace_path),
+                max_steps=1,
+            )
+
+            first_batch = loop.run_turn(state, "Inspect files")
+
+            self.assertEqual(first_batch.stopped_by, "continuation_required")
+            self.assertEqual(first_batch.answer, "")
+            self.assertIsNotNone(state.pending_turn)
+            self.assertEqual(state.pending_turn.step, 2)
+            self.assertEqual(state.pending_turn.pause_reason, "step_budget")
+            self.assertEqual(state.pending_turn.pause_details["next_step"], 2)
+            self.assertNotEqual(
+                getattr(state.messages[-1], "content", ""),
+                "Stopped after reaching max_steps=1 without a final answer.",
+            )
+
+            second_batch = loop.retry_turn(state)
+
+            self.assertEqual(second_batch.stopped_by, "continuation_required")
+            self.assertEqual(state.pending_turn.step, 3)
+            self.assertEqual(state.pending_turn.pause_details["steps_completed"], 2)
+
+            completed = loop.retry_turn(state)
+            trace_events = read_jsonl_trace(state.trace_path)
+            trajectory = make_trajectory(trace_events, state.trace_path)
+
+            self.assertEqual(completed.answer, "Inspection complete.")
+            self.assertIsNone(state.pending_turn)
+            self.assertEqual(len(provider.requests), 3)
+            self.assertEqual(
+                sum(
+                    event["event"] == "turn_continuation_required"
+                    for event in trace_events
+                ),
+                2,
+            )
+            self.assertEqual(
+                sum(event["event"] == "final_answer" for event in trace_events),
+                1,
+            )
+            self.assertEqual(len(trajectory["turns"][0]["continuation_events"]), 2)
+            self.assertEqual(trajectory["metrics"]["turn_continuation_requests"], 2)
+
     def test_plan_mode_proposes_approved_plan_then_build_completes_it(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace_path = Path(tmpdir, "workspace")
@@ -745,7 +830,7 @@ class MyAgentTests(unittest.TestCase):
             self.assertEqual(built.stopped_by, "final_answer")
             self.assertEqual(state.proposed_plan.status, "completed")
             trajectory = make_trajectory(events, state.trace_path)
-            self.assertEqual(trajectory["schema_version"], "my-agent.trajectory.v5")
+            self.assertEqual(trajectory["schema_version"], "my-agent.trajectory.v6")
             self.assertEqual(trajectory["turns"][0]["mode_id"], "plan")
             self.assertEqual(
                 trajectory["turns"][0]["outcome"]["stopped_by"],
@@ -973,6 +1058,58 @@ class MyAgentTests(unittest.TestCase):
             self.assertEqual(approval["source"], "prompt")
             self.assertTrue(approval["prompted"])
             self.assertEqual(trajectory["metrics"]["approval_requests"], 1)
+
+    def test_agent_runtime_waits_for_user_at_step_budget_then_resumes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace_path = Path(tmpdir, "workspace")
+            workspace_path.mkdir()
+            state = SessionStore(Path(tmpdir, "sessions")).create(workspace_path)
+            provider = ScriptedProviderAdapter(
+                [
+                    _model_response(
+                        tool_calls=[
+                            ToolCall(
+                                call_id="call-list",
+                                name="list_files",
+                                arguments={"path": ".", "max_files": 5},
+                            )
+                        ],
+                        finish_reason="tool_calls",
+                    ),
+                    _model_response(content="Done."),
+                ]
+            )
+            loop = AgentLoop(
+                workspace=Workspace(workspace_path),
+                model=_model(provider),
+                tools=ToolRegistry([ListFilesTool()]),
+                permissions=PermissionPolicy(),
+                trace=TraceRecorder(state.trace_path),
+                max_steps=1,
+            )
+            runtime = AgentRuntime(loop, state, interactive_approvals=True)
+
+            runtime.send(StartTurn(user_input="Inspect files"))
+            while True:
+                paused = runtime.next_event(timeout=2)
+                if paused.kind == "turn_continuation_required":
+                    break
+
+            runtime.wait()
+            self.assertEqual(runtime.state, RuntimeState.WAITING_USER)
+            self.assertEqual(paused.data["next_step"], 2)
+            self.assertIsNotNone(state.pending_turn)
+
+            runtime.send(StartTurn(retry=True))
+            while True:
+                completed = runtime.next_event(timeout=2)
+                if completed.kind == "turn_completed":
+                    break
+
+            runtime.close()
+            self.assertEqual(completed.result.answer, "Done.")
+            self.assertEqual(runtime.state, RuntimeState.COMPLETED)
+            self.assertIsNone(state.pending_turn)
 
     def test_trusted_profile_runs_hard_safe_patch_without_prompt(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3789,7 +3926,7 @@ class MyAgentTests(unittest.TestCase):
 
         self.assertEqual(
             trajectory["schema_version"],
-            "my-agent.trajectory.v5",
+            "my-agent.trajectory.v6",
         )
         self.assertEqual(trajectory["workspace"], "/tmp/repo")
         turn = trajectory["turns"][0]
@@ -3899,7 +4036,7 @@ class MyAgentTests(unittest.TestCase):
 
         self.assertEqual(
             trajectory["schema_version"],
-            "my-agent.trajectory.v5",
+            "my-agent.trajectory.v6",
         )
         self.assertEqual(trajectory["session_id"], "session-1")
         self.assertEqual(len(trajectory["turns"]), 2)

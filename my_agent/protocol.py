@@ -15,6 +15,7 @@ class AgentState(str, Enum):
     IDLE = "idle"
     RUNNING_MODEL = "running_model"
     WAITING_APPROVAL = "waiting_approval"
+    WAITING_USER = "waiting_user"
     RUNNING_TOOL = "running_tool"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -48,6 +49,7 @@ class EventType(str, Enum):
     APPROVAL_REQUESTED = "approval.requested"
     APPROVAL_RESOLVED = "approval.resolved"
     TURN_ERROR = "turn.error"
+    TURN_CONTINUATION_REQUIRED = "turn.continuation_required"
     TURN_COMPLETED = "turn.completed"
     TURN_FAILED = "turn.failed"
     TURN_INTERRUPTED = "turn.interrupted"
@@ -266,6 +268,14 @@ class TurnErrorEvent(AgentEvent):
 
 
 @dataclass(frozen=True, kw_only=True)
+class TurnContinuationRequiredEvent(AgentEvent):
+    steps_completed: int
+    step_budget: int
+    next_step: int
+    event_type: ClassVar[EventType] = EventType.TURN_CONTINUATION_REQUIRED
+
+
+@dataclass(frozen=True, kw_only=True)
 class TurnCompletedEvent(AgentEvent):
     answer: str
     steps: int
@@ -339,6 +349,7 @@ AgentEventType: TypeAlias = (
     | ApprovalRequestedEvent
     | ApprovalResolvedEvent
     | TurnErrorEvent
+    | TurnContinuationRequiredEvent
     | TurnCompletedEvent
     | TurnFailedEvent
     | TurnInterruptedEvent
@@ -383,6 +394,7 @@ _EVENT_TYPES = {
         ApprovalRequestedEvent,
         ApprovalResolvedEvent,
         TurnErrorEvent,
+        TurnContinuationRequiredEvent,
         TurnCompletedEvent,
         TurnFailedEvent,
         TurnInterruptedEvent,

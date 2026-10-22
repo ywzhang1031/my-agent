@@ -132,13 +132,15 @@ DEEPSEEK_API_KEY=... .venv/bin/python cli.py ui --workspace . --open-browser
 默认地址是 `http://127.0.0.1:8765/`；端口被占用时可以传 `--port 0` 让操作系统选择可用端口，
 实际 URL 会打印到 stderr。页面支持：
 
-- 创建、恢复、重命名和切换持久化 session；名称保存在 `session.json`
+- 创建、恢复、重命名和切换持久化 session；侧边栏支持 `…`、右键和 `Shift+F10`
+  打开会话菜单，名称保存在 `session.json`
 - 流式 answer/thinking、provider retry 和 tool activity
 - `apply_patch` / `exec_command` 的 once/session/deny 审批
 - Plan mode 计划正文、执行或修改操作
 - provider/model 与 Build/Plan mode 切换；模型和权限使用紧凑、可键盘导航的弹出菜单
 - `supervised` / `accept_edits` / `trusted` 权限策略切换
 - 分类 context 使用量、pending turn 的 retry/abort 和运行中 turn 的 interrupt
+- 每批模型步骤达到预算后暂停并询问“继续或停止”，继续时从下一步恢复，不伪造 final answer
 - provider 报告 API key 缺失或认证失败时，显示凭据面板并将 key 原子写入
   `credentials.json`（`0600`）；保存后热重载当前 session 并自动重试 pending turn
 
@@ -155,6 +157,12 @@ key 写入 `localStorage`。环境变量仍是启动时的最高优先级，但�
 每个页面先通过 `events.subscribe` 创建独立 subscription，再使用自己的 `subscription_id` long-poll。
 同一事件会 fan-out 到所有匹配的页面，多个 tab 不再争抢一个全局队列。subscription 只存在于当前
 进程并有空闲过期时间；页面收到 `410` 后会携带各 session 的最后 sequence 自动重建订阅。
+
+同一 session 存储目录只允许一个 AppServer 进程持有。`ui` 和 `serve` 启动时会对
+`<sessions-dir>/.app-server.lock` 获取操作系统级 lease；重复启动会打印现有实例的 PID、instance ID
+和启动时间，而不是让两个进程并发改写 `session.json` / `events-v2.jsonl`。一个 AppServer 仍可同时
+服务外部浏览器、Codex 内置浏览器和多个 tab。HTTP response、`/api/health`、`bootstrap.js` 以及
+JSONL `server.ready` 都携带当前 instance ID；页面发现后端重启后会自动刷新并获取新 token。
 
 ## Multi-session JSONL AppServer
 
@@ -255,7 +263,9 @@ terminal 使用增量过滤器隐藏可能跨多个 chunk 的协议标签，同�
 稍后仍可执行 `/approve`。非交互终端不会阻塞等待 selector，也会提示使用 `/approve` 或继续修改。
 
 只有关联的 Build turn 返回真正的 final answer，计划才变为 `completed`；model error 保留 pending
-turn 供 `/retry`，`/abort`、输出截断或 `max_steps` 会把计划恢复为 `proposed`，允许再次审批。
+turn 供 `/retry`。`--max-steps` 是单批执行预算：达到预算会发出
+`turn.continuation_required`，保留 pending turn 和已完成 observation，由用户继续下一批或 `/abort`。
+只有 `/abort` 或输出截断才会把执行中的计划恢复为 `proposed`，允许再次审批。
 
 collaboration mode 与 permission profile 是两个不同维度。`/mode` 选择任务协作方式；
 `/permissions` 选择敏感工具的审批策略：
@@ -367,6 +377,7 @@ OpenAI reasoning 默认使用配置中的 `medium` effort 和 `auto` summary，�
 - `rpc.py`：定义同步 request/response envelope、`request_id` 和结构化 RPC error
 - `event_store.py`：按 session 追加 durable typed events，校验单调 sequence，并按 cursor 重放
 - `event_broker.py`：管理 per-client subscription、session filter、fan-out 和空闲过期
+- `server_instance.py`：对 session 存储根目录持有跨进程 AppServer lease，并记录实例诊断元数据
 - `projection.py`：把 typed events 物化为可供 UI 刷新恢复的 `session -> turn -> item` 视图
 - `service.py`：按 session 路由命令，编排 model/mode/plan/abort 状态转换，保存 session，并把内部
   runtime event 提升为客户端协议事件
@@ -444,7 +455,8 @@ proposed plan -> action selector -> ExecutePlanCommand -> AgentService
                               \-> Revise -> revising -> new proposed plan
                               \-> Esc -> keep proposed for /approve
 Build execution -> final answer: completed
-                -> abort/length/max_steps: proposed again
+                -> step budget: waiting_user -> continue next batch / abort
+                -> abort/length: proposed again
 ```
 
 `AppServer` 是 UI/transport 的 control-plane 边界；`AgentService` 是 session runtime 与 harness 的
@@ -452,6 +464,7 @@ Build execution -> final answer: completed
 `InterruptTurnCommand`、`ResolveApprovalCommand`、`SwitchModelCommand`、`SwitchModeCommand`、
 `ExecutePlanCommand`、`RevisePlanCommand` 和 `AbortTurnCommand` 都只包含可序列化字段。输出不再是
 `kind: str + data: dict`，而是 `ItemStartedEvent`、`ItemDeltaEvent`、`ItemCompletedEvent`、
+`TurnContinuationRequiredEvent`、
 `ApprovalRequestedEvent`、`TurnCompletedEvent` 等具体 dataclass；每个事件包含协议版本、event ID、
 session ID、可选 turn ID、单 session 递增序号、durable 标记和显式状态，并可转换为 JSON object。
 
@@ -529,7 +542,7 @@ PYTHONPATH=. python3 scripts/export_trajectory.py \
   --output "$WORKSPACE/.my-agent/sessions/$SESSION_ID/trajectory.json"
 ```
 
-`trace.jsonl` 是原始事件流；导出的 `trajectory.json` 使用 `my-agent.trajectory.v5`，先按 turn
+`trace.jsonl` 是原始事件流；导出的 `trajectory.json` 使用 `my-agent.trajectory.v6`，先按 turn
 分组，再按 step 分组，避免不同 turn 中相同 step 编号发生碰撞。每轮结束后会自动刷新
 `trajectory.json`，手动导出主要用于重新生成或校验现有 session trajectory。v5 为每个 turn
 增加 `mode_id`、`approved_plan_id`、`stopped_by`、`plan_events` 和 plan lifecycle metrics；

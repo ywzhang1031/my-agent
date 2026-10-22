@@ -26,6 +26,7 @@ class RuntimeState(str, Enum):
     IDLE = "idle"
     RUNNING_MODEL = "running_model"
     WAITING_APPROVAL = "waiting_approval"
+    WAITING_USER = "waiting_user"
     RUNNING_TOOL = "running_tool"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -262,15 +263,26 @@ class AgentRuntime:
             terminal_state = RuntimeState.FAILED
             terminal_text = str(exc)
         else:
-            terminal_kind = "turn_completed"
-            terminal_state = RuntimeState.COMPLETED
-            terminal_text = result.answer
-            terminal_data = {
-                "steps": result.steps,
-                "stopped_by": result.stopped_by,
-                "mode_id": result.mode_id,
-                "plan_id": result.plan_id,
-            }
+            if result.stopped_by == "continuation_required":
+                pending = self.session.pending_turn
+                terminal_kind = "turn_continuation_required"
+                terminal_state = RuntimeState.WAITING_USER
+                terminal_text = "step budget reached; user decision required"
+                terminal_data = {
+                    "steps_completed": result.steps,
+                    "step_budget": self.loop.max_steps,
+                    "next_step": pending.step if pending is not None else result.steps + 1,
+                }
+            else:
+                terminal_kind = "turn_completed"
+                terminal_state = RuntimeState.COMPLETED
+                terminal_text = result.answer
+                terminal_data = {
+                    "steps": result.steps,
+                    "stopped_by": result.stopped_by,
+                    "mode_id": result.mode_id,
+                    "plan_id": result.plan_id,
+                }
             terminal_result = result
         finally:
             with self._lock:

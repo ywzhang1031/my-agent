@@ -40,6 +40,7 @@ from .protocol import (
     SwitchPermissionProfileCommand,
     TurnAbortedEvent,
     TurnCompletedEvent,
+    TurnContinuationRequiredEvent,
     TurnErrorEvent,
     TurnFailedEvent,
     TurnInterruptedEvent,
@@ -382,6 +383,7 @@ class AgentService:
                 event = handle.runtime.next_event()
                 terminal = event.kind in {
                     "turn_completed",
+                    "turn_continuation_required",
                     "turn_failed",
                     "turn_interrupted",
                 }
@@ -743,6 +745,16 @@ class AgentService:
                 error=event.text,
                 retryable=bool(data["retryable"]),
                 details=dict(data.get("details", {})),
+            )
+        elif event.kind == "turn_continuation_required":
+            self._publish(
+                handle,
+                TurnContinuationRequiredEvent,
+                state,
+                turn_id=self._current_turn_id(handle),
+                steps_completed=int(data["steps_completed"]),
+                step_budget=int(data["step_budget"]),
+                next_step=int(data["next_step"]),
             )
         elif event.kind == "turn_completed":
             turn_id = self._current_turn_id(handle)

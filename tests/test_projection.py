@@ -9,6 +9,7 @@ from my_agent.protocol import (
     ItemDeltaEvent,
     ItemStartedEvent,
     TurnCompletedEvent,
+    TurnContinuationRequiredEvent,
     TurnStartedEvent,
 )
 
@@ -114,6 +115,34 @@ class SessionProjectionTests(unittest.TestCase):
         self.assertEqual(turn["status"], "completed")
         self.assertEqual(turn["items"][0]["status"], "completed")
         self.assertEqual(turn["items"][0]["content"], "Inspection complete.")
+
+    def test_continuation_required_keeps_turn_open_for_user_decision(self) -> None:
+        projection = SessionProjection("session-1")
+        projection.apply(
+            TurnStartedEvent(
+                session_id="session-1",
+                turn_id="session-1:1",
+                sequence=1,
+                state=AgentState.RUNNING_MODEL,
+                task="Inspect app.py",
+            )
+        )
+        projection.apply(
+            TurnContinuationRequiredEvent(
+                session_id="session-1",
+                turn_id="session-1:1",
+                sequence=2,
+                state=AgentState.WAITING_USER,
+                steps_completed=12,
+                step_budget=12,
+                next_step=13,
+            )
+        )
+
+        self.assertEqual(
+            projection.to_dict()["turns"][0]["status"],
+            "waiting_user",
+        )
 
 
 if __name__ == "__main__":

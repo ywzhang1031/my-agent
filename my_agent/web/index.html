@@ -106,8 +106,8 @@
 
         <div class="action-panel recovery-panel" id="recovery-panel" hidden>
           <div>
-            <span class="panel-label">Turn 未完成</span>
-            <strong>重试或放弃当前 turn</strong>
+            <span class="panel-label" id="recovery-label">Turn 未完成</span>
+            <strong id="recovery-title">重试或放弃当前 turn</strong>
             <p class="panel-message" id="recovery-error"></p>
           </div>
           <div class="action-buttons">
@@ -168,6 +168,12 @@
         </div>
         <div class="activity-list" id="activity-list"></div>
       </aside>
+    </div>
+    <div class="session-context-menu" id="session-context-menu" role="menu" aria-label="会话操作" hidden>
+      <button type="button" role="menuitem" id="session-menu-rename">
+        <span aria-hidden="true">✎</span>
+        <span>重命名</span>
+      </button>
     </div>
     <div class="backdrop" id="backdrop" hidden></div>
     <div class="toast" id="toast" role="status" hidden></div>

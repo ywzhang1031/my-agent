@@ -37,6 +37,7 @@ from .protocol import (
     SwitchPermissionProfileCommand,
     TurnAbortedEvent,
     TurnCompletedEvent,
+    TurnContinuationRequiredEvent,
     TurnFailedEvent,
     TurnInterruptedEvent,
 )
@@ -90,7 +91,18 @@ PLAN_ACTIONS = (
     SelectionOption("Revise plan", "Stay in Plan mode and describe changes"),
 )
 
-TerminalEvent = TurnCompletedEvent | TurnFailedEvent | TurnInterruptedEvent
+CONTINUATION_ACTIONS = (
+    SelectionOption("Continue", "Run another model/tool step batch"),
+    SelectionOption("Stop turn", "Discard the pending turn and keep completed filesystem changes"),
+)
+
+TerminalEvent = (
+    TurnCompletedEvent
+    | TurnContinuationRequiredEvent
+    | TurnFailedEvent
+    | TurnInterruptedEvent
+    | TurnAbortedEvent
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -165,7 +177,12 @@ def _add_runtime_options(
         default=None,
         help="Session storage root. Defaults to <workspace>/.my-agent/sessions.",
     )
-    parser.add_argument("--max-steps", type=int, default=12, help="Maximum model/tool loop steps per turn.")
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=12,
+        help="Model/tool steps to run before asking whether to continue.",
+    )
     parser.add_argument(
         "--mode",
         choices=[mode.mode_id for mode in COLLABORATION_MODES],
@@ -305,7 +322,11 @@ def _run_serve(args: argparse.Namespace) -> int:
 
 def _run_ui(args: argparse.Namespace) -> int:
     app_server = _build_app_server(args)
-    server = LocalWebServer(app_server, port=args.port)
+    try:
+        server = LocalWebServer(app_server, port=args.port)
+    except Exception:
+        app_server.close()
+        raise
     print(f"My Agent UI: {server.url}", file=sys.stderr)
     if args.open_browser:
         import webbrowser
@@ -327,29 +348,33 @@ def _build_app_server(args: argparse.Namespace) -> AppServer:
         save_session=lambda session: _save_session_artifacts(store, session),
         event_store=EventStore(store.root),
     )
-    return AppServer(
-        workspace=workspace.root,
-        session_store=store,
-        agent_service=service,
-        runtime_factory=lambda state, model_ref, mode_id: _build_server_runtime(
-            args,
-            state,
-            model_ref=model_ref,
-            mode_id=mode_id,
-        ),
-        models=(
-            model
-            for model in args.runtime_config.models()
-            if model.provider_id in SUPPORTED_PROVIDER_IDS
-        ),
-        modes=COLLABORATION_MODES,
-        credentials_path=args.runtime_config.credentials_path,
-        credential_setter=lambda provider_id, api_key: _store_provider_credential(
-            args,
-            provider_id,
-            api_key,
-        ),
-    )
+    try:
+        return AppServer(
+            workspace=workspace.root,
+            session_store=store,
+            agent_service=service,
+            runtime_factory=lambda state, model_ref, mode_id: _build_server_runtime(
+                args,
+                state,
+                model_ref=model_ref,
+                mode_id=mode_id,
+            ),
+            models=(
+                model
+                for model in args.runtime_config.models()
+                if model.provider_id in SUPPORTED_PROVIDER_IDS
+            ),
+            modes=COLLABORATION_MODES,
+            credentials_path=args.runtime_config.credentials_path,
+            credential_setter=lambda provider_id, api_key: _store_provider_credential(
+                args,
+                provider_id,
+                api_key,
+            ),
+        )
+    except Exception:
+        service.close()
+        raise
 
 
 def _store_provider_credential(
@@ -633,6 +658,9 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                     terminal_event = _run_chat_turn(
                         args, store, state, service, editor, retry=True
                     )
+                    terminal_event = _offer_continuation_action(
+                        args, store, state, service, editor, terminal_event
+                    )
                     _offer_plan_action(
                         args, store, state, service, editor, terminal_event
                     )
@@ -681,6 +709,9 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                 terminal_event = _run_chat_turn(
                     args, store, state, service, editor, user_input=user_input
                 )
+                terminal_event = _offer_continuation_action(
+                    args, store, state, service, editor, terminal_event
+                )
                 _offer_plan_action(
                     args, store, state, service, editor, terminal_event
                 )
@@ -713,6 +744,51 @@ def _approve_and_execute_plan(
     )
     _save_session_artifacts(store, state)
     _render_terminal_event(args, renderer, terminal_event)
+    return _offer_continuation_action(
+        args, store, state, service, editor, terminal_event
+    )
+
+
+def _offer_continuation_action(
+    args: argparse.Namespace,
+    store: SessionStore,
+    state: SessionState,
+    service: AgentService,
+    editor: LineEditor,
+    terminal_event: TerminalEvent,
+) -> TerminalEvent:
+    while isinstance(terminal_event, TurnContinuationRequiredEvent):
+        if not editor.supports_interactive_selection:
+            print("turn paused; use /retry to continue or /abort to stop")
+            return terminal_event
+        action = editor.select(
+            "continue> ",
+            CONTINUATION_ACTIONS,
+            current_value="Continue",
+        )
+        if action == "Continue":
+            terminal_event = _run_chat_turn(
+                args,
+                store,
+                state,
+                service,
+                editor,
+                retry=True,
+            )
+            continue
+        service.dispatch(AbortTurnCommand(session_id=state.session_id))
+        aborted = service.next_event(timeout=1)
+        if not isinstance(aborted, TurnAbortedEvent):
+            raise RuntimeError(
+                f"expected turn.aborted, got {aborted.event_type.value}"
+            )
+        warning = (
+            " Filesystem changes from completed tools were not reverted."
+            if aborted.tool_calls_executed
+            else ""
+        )
+        print(f"aborted {aborted.turn_id}.{warning}")
+        return aborted
     return terminal_event
 
 
@@ -835,7 +911,15 @@ def _consume_service_events(
                         decision=decision,
                     )
                 )
-        if isinstance(event, (TurnCompletedEvent, TurnFailedEvent, TurnInterruptedEvent)):
+        if isinstance(
+            event,
+            (
+                TurnCompletedEvent,
+                TurnContinuationRequiredEvent,
+                TurnFailedEvent,
+                TurnInterruptedEvent,
+            ),
+        ):
             if args.stream and not isinstance(event, TurnCompletedEvent):
                 renderer.finish("")
             service.wait(session_id)
@@ -854,6 +938,14 @@ def _render_terminal_event(
             print(f"assistant> {event.answer}")
         return
     renderer.finish("")
+    if isinstance(event, TurnContinuationRequiredEvent):
+        print(
+            f"step budget reached after {event.steps_completed} steps; "
+            f"continue to run the next {event.step_budget} steps or stop the turn"
+        )
+        return
+    if isinstance(event, TurnAbortedEvent):
+        return
     if isinstance(event, TurnInterruptedEvent):
         print("generation interrupted; use /retry to continue or /abort to discard the turn")
     else:
@@ -865,6 +957,10 @@ def _render_terminal_event(
 def _terminal_event_message(event: TerminalEvent) -> str:
     if isinstance(event, TurnCompletedEvent):
         return event.answer
+    if isinstance(event, TurnContinuationRequiredEvent):
+        return "turn requires a user decision before continuing"
+    if isinstance(event, TurnAbortedEvent):
+        return "turn aborted"
     if isinstance(event, TurnInterruptedEvent):
         return event.reason
     return event.error

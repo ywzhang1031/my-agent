@@ -23,6 +23,7 @@ from my_agent.protocol import (
     SwitchPermissionProfileCommand,
     PermissionProfileChangedEvent,
     TurnCompletedEvent,
+    TurnContinuationRequiredEvent,
     command_from_dict,
     command_to_dict,
     event_from_dict,
@@ -31,7 +32,7 @@ from my_agent.protocol import (
 from my_agent.runtime import RuntimeEvent, RuntimeState, StartTurn
 from my_agent.service import AgentService
 from my_agent.event_store import EventStore
-from my_agent.session import ProposedPlan, SessionState
+from my_agent.session import PendingTurn, ProposedPlan, SessionState
 
 
 def _capture_error(errors, action) -> None:
@@ -142,6 +143,19 @@ class ProtocolTests(unittest.TestCase):
         restored = event_from_dict(event_to_dict(event))
 
         self.assertEqual(restored, event)
+
+    def test_continuation_required_event_round_trip(self) -> None:
+        event = TurnContinuationRequiredEvent(
+            session_id="session-1",
+            turn_id="session-1:1",
+            sequence=4,
+            state=AgentState.WAITING_USER,
+            steps_completed=12,
+            step_budget=12,
+            next_step=13,
+        )
+
+        self.assertEqual(event_from_dict(event_to_dict(event)), event)
 
 
 class AgentServiceTests(unittest.TestCase):
@@ -339,6 +353,50 @@ class AgentServiceTests(unittest.TestCase):
             completed = service.next_event(subscription_id, timeout=1)
 
             self.assertIsInstance(completed, TurnCompletedEvent)
+            service.close()
+
+    def test_continuation_required_is_a_persisted_non_completion_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._state(Path(tmp))
+            state.pending_turn = PendingTurn(
+                turn_id="session-1:1",
+                task="Inspect",
+                message_start=0,
+                step=13,
+                pause_reason="step_budget",
+                pause_details={"steps_completed": 12, "step_budget": 12, "next_step": 13},
+            )
+            runtime = _Runtime(state)
+            runtime.events.put(
+                RuntimeEvent(
+                    kind="turn_continuation_required",
+                    state=RuntimeState.WAITING_USER,
+                    data={
+                        "steps_completed": 12,
+                        "step_budget": 12,
+                        "next_step": 13,
+                    },
+                )
+            )
+            saved = []
+            service = AgentService(
+                tool_registry_factory=lambda mode: object(),
+                save_session=lambda session: saved.append(session.pending_turn.step),
+            )
+            service.register(runtime)
+            subscription_id = self._subscribe(service, state.session_id)
+
+            service.dispatch(
+                StartTurnCommand(session_id=state.session_id, retry=True)
+            )
+            event = service.next_event(subscription_id, timeout=1)
+            service.wait(state.session_id)
+
+            self.assertIsInstance(event, TurnContinuationRequiredEvent)
+            self.assertEqual(event.next_step, 13)
+            self.assertEqual(event.state, AgentState.WAITING_USER)
+            self.assertEqual(saved, [13])
+            self.assertIsNotNone(state.pending_turn)
             service.close()
 
     def test_service_registers_and_unregisters_sessions(self) -> None:

@@ -65,6 +65,8 @@ class AgentLoop:
         mode: CollaborationMode = BUILD_MODE,
         context_manager: ContextManager | None = None,
     ) -> None:
+        if max_steps < 1:
+            raise ValueError("max_steps must be at least 1")
         self.workspace = workspace
         self.model = model
         self.tools = tools
@@ -266,8 +268,12 @@ class AgentLoop:
             "session_id": state.session_id,
             "turn_id": pending.turn_id,
         }
+        batch_start = pending.step
+        batch_end = batch_start + self.max_steps - 1
+        pending.pause_reason = None
+        pending.pause_details = {}
 
-        for step in range(pending.step, self.max_steps + 1):
+        for step in range(batch_start, batch_end + 1):
             pending.step = step
             try:
                 raise_if_cancelled(cancel_event)
@@ -590,26 +596,23 @@ class AgentLoop:
                     raise
             pending.step = step + 1
 
-        answer = f"Stopped after reaching max_steps={self.max_steps} without a final answer."
-        messages.append(AssistantMessage(content=answer))
+        steps_completed = pending.step - 1
+        pause_details = {
+            "steps_completed": steps_completed,
+            "step_budget": self.max_steps,
+            "next_step": pending.step,
+        }
+        pending.pause_reason = "step_budget"
+        pending.pause_details = pause_details
         self.trace.write(
-            "final_answer",
-            {**event_context, "step": self.max_steps, "answer": answer},
+            "turn_continuation_required",
+            {**event_context, **pause_details},
         )
-        self._finish_plan_execution(
-            state,
-            pending,
-            event_context,
-            step=self.max_steps,
-            successful=False,
-            reason="max_steps",
-        )
-        state.pending_turn = None
         return TurnResult(
-            answer=answer,
+            answer="",
             messages=list(messages),
-            steps=self.max_steps,
-            stopped_by="max_steps",
+            steps=steps_completed,
+            stopped_by="continuation_required",
             mode_id=self.mode.mode_id,
         )
 

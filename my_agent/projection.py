@@ -11,6 +11,7 @@ from .protocol import (
     ItemStartedEvent,
     TurnAbortedEvent,
     TurnCompletedEvent,
+    TurnContinuationRequiredEvent,
     TurnErrorEvent,
     TurnFailedEvent,
     TurnInterruptedEvent,
@@ -117,6 +118,8 @@ class SessionProjection:
             item.data["error"] = event.error
         elif isinstance(event, TurnCompletedEvent):
             turn.status = "completed"
+        elif isinstance(event, TurnContinuationRequiredEvent):
+            turn.status = "waiting_user"
         elif isinstance(event, TurnErrorEvent):
             turn.status = "failed"
             turn.error = event.error

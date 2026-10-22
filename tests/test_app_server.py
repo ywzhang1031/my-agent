@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -21,7 +22,8 @@ from my_agent.rpc import (
 )
 from my_agent.runtime import RuntimeEvent, RuntimeState, StartTurn
 from my_agent.service import AgentService
-from my_agent.session import SessionState, SessionStore
+from my_agent.server_instance import ServerInstanceConflictError, ServerInstanceLease
+from my_agent.session import PendingTurn, SessionState, SessionStore
 
 
 class _Profile:
@@ -90,7 +92,12 @@ class _Runtime:
 
     def next_event(self, timeout=None):
         event = self.events.get(timeout=timeout)
-        if event.kind in {"turn_completed", "turn_failed", "turn_interrupted"}:
+        if event.kind in {
+            "turn_completed",
+            "turn_continuation_required",
+            "turn_failed",
+            "turn_interrupted",
+        }:
             self.active = False
         return event
 
@@ -168,6 +175,31 @@ class AppServerTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.app.close()
         self.tempdir.cleanup()
+
+    def test_session_store_allows_only_one_app_server_instance(self) -> None:
+        with self.assertRaisesRegex(
+            ServerInstanceConflictError,
+            "session store is already in use",
+        ):
+            ServerInstanceLease.acquire(
+                self.store.root,
+                instance_id="second-instance",
+                workspace=self.workspace,
+            )
+
+        self.app.close()
+        replacement = ServerInstanceLease.acquire(
+            self.store.root,
+            instance_id="replacement-instance",
+            workspace=self.workspace,
+        )
+        replacement.release()
+
+    def test_app_server_exposes_a_process_instance_id(self) -> None:
+        self.assertTrue(self.app.instance_id)
+        self.assertEqual(len(self.app.instance_id), 32)
+        lock_path = self.store.root / ".app-server.lock"
+        self.assertEqual(stat.S_IMODE(lock_path.stat().st_mode), 0o600)
 
     def rpc(self, method: str, **params) -> ResponseEnvelope:
         return self.app.handle(RequestEnvelope(method=method, params=params))
@@ -324,6 +356,30 @@ class AppServerTests(unittest.TestCase):
 
         self.assertFalse(response.ok)
         self.assertEqual(response.error.code, "session_not_active")
+
+    def test_session_read_exposes_pending_continuation_decision(self) -> None:
+        session_id = self.create_session()
+        state = self.runtimes[session_id].session
+        state.pending_turn = PendingTurn(
+            turn_id=f"{session_id}:1",
+            task="Inspect",
+            message_start=0,
+            step=13,
+            pause_reason="step_budget",
+            pause_details={
+                "steps_completed": 12,
+                "step_budget": 12,
+                "next_step": 13,
+            },
+        )
+        self.store.save(state)
+
+        response = self.rpc("session.read", session_id=session_id)
+
+        self.assertTrue(response.ok, response.error)
+        session = response.result["session"]
+        self.assertEqual(session["pending_turn_pause_reason"], "step_budget")
+        self.assertEqual(session["pending_turn_pause_details"]["next_step"], 13)
 
     def test_provider_credential_set_rebuilds_runtime_without_returning_secret(self) -> None:
         session_id = self.create_session()

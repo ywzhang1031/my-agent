@@ -101,6 +101,7 @@ class LocalWebServer:
                         {
                             "ok": True,
                             "workspace": str(owner.app_server.workspace),
+                            "instance_id": owner.app_server.instance_id,
                             "rpc_version": RPC_VERSION,
                             "protocol_version": PROTOCOL_VERSION,
                         },
@@ -111,6 +112,7 @@ class LocalWebServer:
                         {
                             "token": owner.token,
                             "workspace": str(owner.app_server.workspace),
+                            "instanceID": owner.app_server.instance_id,
                             "rpcVersion": RPC_VERSION,
                             "protocolVersion": PROTOCOL_VERSION,
                         },
@@ -269,6 +271,7 @@ class LocalWebServer:
                 self.send_response(status)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(body)))
+                self.send_header("X-My-Agent-Instance", owner.app_server.instance_id)
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("X-Content-Type-Options", "nosniff")
                 self.send_header("Referrer-Policy", "no-referrer")

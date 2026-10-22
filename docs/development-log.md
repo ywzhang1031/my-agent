@@ -381,6 +381,29 @@ Web UI 将 provider authentication failure 从通用 pending-turn 恢复提升�
 概念边界同步固定：session/thread 是长生命周期容器，turn 是一次执行，item 是 turn 内原子内容或动作；
 mode 是横切的协作策略。plan artifact、subagent execution 和 cross-turn goal state 都不等于 mode。
 
+## Milestone 23: User-Controlled Step Budget
+
+固定 `max_steps` 不再结束 turn，而是成为一批连续模型决策的软预算。
+
+- 每批达到预算后，`AgentLoop` 保留 `PendingTurn`、消息、工具 observation 和下一 step，不再追加
+  `Stopped after...` 伪 final answer，也不结束关联的 plan execution。
+- Runtime 进入 `waiting_user`，Service 发布 durable `turn.continuation_required`；Web 与 CLI 都让用户选择
+  继续下一批或停止。每次继续获得同样大小的新预算，因此不存在固定的 turn 总步数上限。
+- `session.json` 保存 pause reason/details，页面刷新或进程重启后仍能恢复决策面板。
+- trajectory schema 升级为 `my-agent.trajectory.v6`，记录 continuation events 和
+  `turn_continuation_requests`，区分“等待用户”与 completed/failed。
+
+## Milestone 24: Single AppServer Ownership
+
+Web UI 支持多页面连接，但 session 存储目录不再允许多个 AppServer 进程并发写入。
+
+- `ServerInstanceLease` 使用操作系统 `flock` 独占 `<sessions-dir>/.app-server.lock`；锁随进程退出自动释放，
+  文件中的 PID、instance ID、启动时间和路径只用于诊断。
+- 第二个 `ui` / `serve` 实例会立即失败并提示复用现有服务或选择不同的 `--sessions-dir`。
+- HTTP health/bootstrap/response header 和 JSONL `server.ready` 暴露同一个 instance ID。Web 页面检测到
+  服务重启后自动 reload，重新获取启动 token；缺少 instance ID 的旧后端会提示先重启服务。
+- 这个约束不限制客户端数量：多个浏览器或 Codex 页面仍使用独立 subscription 接收同一事件 fan-out。
+
 ## Current Boundaries
 
 - `apply_patch` 可以自动修改 workspace 内的单个普通 UTF-8/LF 文件。
@@ -404,8 +427,8 @@ mode 是横切的协作策略。plan artifact、subagent execution 和 cross-tur
 - 当前实现 DeepSeek Chat Completions 和 OpenAI Responses adapter；其他厂商仍需实现并测试自己的
   wire adapter。
 - `serve` 是单 workspace、多 session 的 stdio AppServer；`ui` 是 loopback-only HTTP client，已支持
-  同一进程内多页面独立 subscription/fan-out，但尚未提供远程鉴权、WebSocket/SSE transport、event
-  retention/compaction 或运行中 turn 的跨进程恢复。
+  同一 AppServer 上多页面独立 subscription/fan-out，并禁止多个进程共用 session 存储目录，但尚未提供
+  远程鉴权、WebSocket/SSE transport、event retention/compaction 或运行中 turn 的跨进程恢复。
 
 ## Next Candidates
 

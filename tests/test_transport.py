@@ -20,6 +20,7 @@ from my_agent.transport import JsonlAppServer
 class _AppServer:
     def __init__(self) -> None:
         self.workspace = Path("/tmp/workspace")
+        self.instance_id = "instance-1"
         self.requests = []
         self.events = queue.Queue()
         self.closed = False
@@ -124,6 +125,7 @@ class JsonlAppServerTests(unittest.TestCase):
         messages = [json.loads(line) for line in output_stream.getvalue().splitlines()]
         self.assertEqual(messages[0]["channel"], "control")
         self.assertEqual(messages[0]["type"], "server.ready")
+        self.assertEqual(messages[0]["instance_id"], "instance-1")
         response = next(item for item in messages if item["channel"] == "response")
         event = next(item for item in messages if item["channel"] == "event")
         self.assertEqual(response["request_id"], "request-1")

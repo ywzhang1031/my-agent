@@ -12,6 +12,8 @@ const elements = {
   sessionTitleInput: document.querySelector("#session-title-input"),
   sessionRenameCancel: document.querySelector("#session-rename-cancel"),
   sessionRenameSave: document.querySelector("#session-rename-save"),
+  sessionContextMenu: document.querySelector("#session-context-menu"),
+  sessionMenuRename: document.querySelector("#session-menu-rename"),
   connectionStatus: document.querySelector("#connection-status"),
   conversation: document.querySelector("#conversation"),
   emptyState: document.querySelector("#empty-state"),
@@ -38,6 +40,8 @@ const elements = {
   executePlan: document.querySelector("#execute-plan"),
   revisePlan: document.querySelector("#revise-plan"),
   recoveryPanel: document.querySelector("#recovery-panel"),
+  recoveryLabel: document.querySelector("#recovery-label"),
+  recoveryTitle: document.querySelector("#recovery-title"),
   recoveryError: document.querySelector("#recovery-error"),
   retryTurn: document.querySelector("#retry-turn"),
   abortTurn: document.querySelector("#abort-turn"),
@@ -75,6 +79,9 @@ const state = {
   credentialRequest: null,
   credentialsPath: "",
   credentialSaving: false,
+  sessionMenuSessionID: null,
+  renamingSessionID: null,
+  reloadingServer: false,
   stopped: false,
 };
 
@@ -93,6 +100,25 @@ function requestID() {
   return `request-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
+function verifyServerInstance(response) {
+  const responseInstanceID = response.headers.get("X-My-Agent-Instance");
+  if (
+    !responseInstanceID ||
+    !bootstrap.instanceID ||
+    responseInstanceID === bootstrap.instanceID
+  ) {
+    return;
+  }
+  if (!state.reloadingServer) {
+    state.reloadingServer = true;
+    state.stopped = true;
+    setConnection("服务已重启", "offline");
+    showToast("Agent 服务已重启，正在重新连接");
+    window.setTimeout(() => window.location.reload(), 300);
+  }
+  throw new Error("Agent server instance changed");
+}
+
 async function rpc(method, params = {}) {
   const response = await fetch("/api/rpc", {
     method: "POST",
@@ -108,6 +134,7 @@ async function rpc(method, params = {}) {
       params,
     }),
   });
+  verifyServerInstance(response);
   if (!response.ok) {
     throw new Error(`HTTP ${response.status}`);
   }
@@ -180,6 +207,47 @@ function updateSessionSummary(sessionID, updates = {}) {
 function renderSessionList() {
   const fragment = document.createDocumentFragment();
   for (const session of state.sessions) {
+    const row = document.createElement("div");
+    row.className = "session-row";
+    row.dataset.sessionId = session.session_id;
+    if (session.session_id === selectedSessionID()) row.dataset.current = "true";
+
+    if (state.renamingSessionID === session.session_id) {
+      const form = document.createElement("form");
+      form.className = "session-inline-rename";
+      const input = document.createElement("input");
+      input.type = "text";
+      input.maxLength = 80;
+      input.value = session.title || sessionDisplayName(session);
+      input.setAttribute("aria-label", "会话名称");
+      input.autocomplete = "off";
+      input.spellcheck = false;
+      const cancel = document.createElement("button");
+      cancel.type = "button";
+      cancel.textContent = "×";
+      cancel.title = "取消重命名";
+      cancel.setAttribute("aria-label", "取消重命名");
+      const save = document.createElement("button");
+      save.type = "submit";
+      save.textContent = "✓";
+      save.title = "保存名称";
+      save.setAttribute("aria-label", "保存名称");
+      form.append(input, cancel, save);
+      form.addEventListener("submit", (event) =>
+        renameSidebarSession(event, session.session_id, input, save),
+      );
+      cancel.addEventListener("click", cancelSidebarRename);
+      input.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          cancelSidebarRename();
+        }
+      });
+      row.append(form);
+      fragment.append(row);
+      continue;
+    }
+
     const button = document.createElement("button");
     button.type = "button";
     button.className = "session-item";
@@ -208,10 +276,80 @@ function renderSessionList() {
     meta.textContent = `${session.message_count || 0} 条消息 · ${formatTime(session.updated_at)}`;
 
     button.append(name, indicator, meta);
-    button.addEventListener("click", () => selectSession(session.session_id));
-    fragment.append(button);
+    button.addEventListener("click", () => {
+      closeSessionMenu();
+      selectSession(session.session_id);
+    });
+    button.addEventListener("keydown", (event) => {
+      if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+        event.preventDefault();
+        openSessionMenu(session.session_id, { anchor: more, focus: true });
+      }
+    });
+
+    const more = document.createElement("button");
+    more.type = "button";
+    more.className = "session-actions";
+    more.textContent = "⋯";
+    more.title = `“${sessionDisplayName(session)}”的操作`;
+    more.setAttribute("aria-label", `“${sessionDisplayName(session)}”的操作`);
+    more.setAttribute("aria-haspopup", "menu");
+    more.setAttribute("aria-expanded", "false");
+    more.setAttribute("aria-controls", "session-context-menu");
+    more.addEventListener("click", (event) => {
+      event.stopPropagation();
+      if (
+        !elements.sessionContextMenu.hidden &&
+        state.sessionMenuSessionID === session.session_id
+      ) {
+        closeSessionMenu();
+        return;
+      }
+      openSessionMenu(session.session_id, { anchor: more, focus: false });
+    });
+
+    row.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      openSessionMenu(session.session_id, {
+        point: { x: event.clientX, y: event.clientY },
+        focus: true,
+      });
+    });
+    row.append(button, more);
+    fragment.append(row);
   }
   elements.sessionList.replaceChildren(fragment);
+}
+
+function openSessionMenu(sessionID, { anchor = null, point = null, focus = false } = {}) {
+  closeChoiceMenus();
+  closeSessionMenu();
+  state.sessionMenuSessionID = sessionID;
+  elements.sessionContextMenu.hidden = false;
+  const menuRect = elements.sessionContextMenu.getBoundingClientRect();
+  const anchorRect = anchor?.getBoundingClientRect();
+  const desiredLeft = point ? point.x : anchorRect.right - menuRect.width;
+  const desiredTop = point ? point.y : anchorRect.bottom + 4;
+  const left = Math.max(8, Math.min(desiredLeft, window.innerWidth - menuRect.width - 8));
+  let top = Math.max(8, Math.min(desiredTop, window.innerHeight - menuRect.height - 8));
+  if (!point && top < desiredTop) top = Math.max(8, anchorRect.top - menuRect.height - 4);
+  elements.sessionContextMenu.style.left = `${left}px`;
+  elements.sessionContextMenu.style.top = `${top}px`;
+  for (const button of elements.sessionList.querySelectorAll(".session-actions")) {
+    button.setAttribute(
+      "aria-expanded",
+      String(button.closest(".session-row")?.dataset.sessionId === sessionID),
+    );
+  }
+  if (focus) elements.sessionMenuRename.focus();
+}
+
+function closeSessionMenu() {
+  if (!elements.sessionContextMenu.hidden) elements.sessionContextMenu.hidden = true;
+  state.sessionMenuSessionID = null;
+  for (const button of elements.sessionList.querySelectorAll(".session-actions")) {
+    button.setAttribute("aria-expanded", "false");
+  }
 }
 
 function renderModelCatalog() {
@@ -415,9 +553,20 @@ function updateControls() {
   }
 
   const proposed = session?.proposed_plan_status === "proposed";
+  const continuationRequired = session?.pending_turn_pause_reason === "step_budget";
+  const pauseDetails = session?.pending_turn_pause_details || {};
   elements.planPanel.hidden = !proposed || busy;
   elements.recoveryPanel.hidden = !pending || busy || credentialNeeded;
-  elements.recoveryError.textContent = session?.pending_turn_error || "";
+  elements.recoveryLabel.textContent = continuationRequired ? "需要你的决定" : "Turn 未完成";
+  elements.recoveryTitle.textContent = continuationRequired
+    ? `已完成 ${pauseDetails.steps_completed || 0} 个模型步骤`
+    : "重试或放弃当前 turn";
+  elements.recoveryError.textContent = continuationRequired
+    ? "模型仍希望继续调用工具。当前状态已保存，是否继续执行？"
+    : session?.pending_turn_error || "";
+  elements.retryTurn.textContent = continuationRequired
+    ? `继续 ${pauseDetails.step_budget || 0} 步`
+    : "重试";
   elements.credentialPanel.hidden = !credentialNeeded || busy;
   elements.credentialTitle.textContent = credentialNeeded
     ? `配置 ${state.credentialRequest.providerID} API Key`
@@ -878,6 +1027,8 @@ async function refreshSessions() {
 async function selectSession(sessionID) {
   const summary = sessionSummary(sessionID);
   if (!summary) return;
+  state.renamingSessionID = null;
+  closeSessionMenu();
   cancelSessionRename();
   try {
     if (!summary.active) {
@@ -932,6 +1083,76 @@ function beginSessionRename() {
   elements.sessionTitleInput.select();
 }
 
+async function beginSidebarRename(sessionID) {
+  closeSessionMenu();
+  const summary = sessionSummary(sessionID);
+  if (!summary) return;
+  try {
+    if (!summary.active) {
+      await rpc("session.resume", { session_id: sessionID });
+      summary.active = true;
+    }
+    state.renamingSessionID = sessionID;
+    renderSessionList();
+    const input = elements.sessionList.querySelector(".session-inline-rename input");
+    input?.focus();
+    input?.select();
+  } catch (error) {
+    showToast(`无法重命名会话：${error.message}`);
+  }
+}
+
+function cancelSidebarRename() {
+  const sessionID = state.renamingSessionID;
+  state.renamingSessionID = null;
+  renderSessionList();
+  elements.sessionList
+    .querySelector(`.session-row[data-session-id="${sessionID}"] .session-actions`)
+    ?.focus();
+}
+
+function validateSessionTitle(title) {
+  if (!title) return "会话名称不能为空";
+  if (title.length > 80) return "会话名称最多 80 个字符";
+  return "";
+}
+
+async function saveSessionTitle(sessionID, title) {
+  await rpc("session.rename", { session_id: sessionID, title });
+  updateSessionSummary(sessionID, { title });
+  if (sessionID === selectedSessionID()) {
+    state.selectedSession.title = title;
+    updateControls();
+  }
+}
+
+async function renameSidebarSession(event, sessionID, input, saveButton) {
+  event.preventDefault();
+  const title = input.value.trim();
+  const error = validateSessionTitle(title);
+  if (error) {
+    showToast(error);
+    input.focus();
+    return;
+  }
+  if (title === sessionSummary(sessionID)?.title) {
+    cancelSidebarRename();
+    return;
+  }
+  input.disabled = true;
+  saveButton.disabled = true;
+  try {
+    await saveSessionTitle(sessionID, title);
+    state.renamingSessionID = null;
+    renderSessionList();
+  } catch (rpcError) {
+    input.disabled = false;
+    saveButton.disabled = false;
+    input.focus();
+    showToast(`重命名失败：${rpcError.message}`);
+  }
+}
+
 function cancelSessionRename() {
   elements.sessionRenameForm.hidden = true;
   elements.sessionTitle.hidden = false;
@@ -943,13 +1164,9 @@ async function renameSession(event) {
   event.preventDefault();
   const sessionID = selectedSessionID();
   const title = elements.sessionTitleInput.value.trim();
-  if (!sessionID || !title) {
-    showToast("会话名称不能为空");
-    elements.sessionTitleInput.focus();
-    return;
-  }
-  if (title.length > 80) {
-    showToast("会话名称最多 80 个字符");
+  const error = validateSessionTitle(title);
+  if (!sessionID || error) {
+    showToast(error || "未选择会话");
     elements.sessionTitleInput.focus();
     return;
   }
@@ -961,12 +1178,7 @@ async function renameSession(event) {
   elements.sessionTitleInput.disabled = true;
   elements.sessionRenameSave.disabled = true;
   try {
-    await rpc("session.rename", { session_id: sessionID, title });
-    if (sessionID === selectedSessionID()) {
-      state.selectedSession.title = title;
-      updateSessionSummary(sessionID, { title });
-      updateControls();
-    }
+    await saveSessionTitle(sessionID, title);
     cancelSessionRename();
   } catch (error) {
     elements.sessionTitleInput.disabled = false;
@@ -1324,6 +1536,23 @@ async function handleEvent(event) {
       }
       addActivity(eventLabel(sessionID, "模型错误"), payload.error, payload.retryable ? "warning" : "danger");
       break;
+    case "turn.continuation_required":
+      state.busySessions.delete(sessionID);
+      state.attentionSessions.add(sessionID);
+      if (sessionID === selectedSessionID()) {
+        state.selectedSession.pending_turn_id = event.turn_id;
+        state.selectedSession.pending_turn_pause_reason = "step_budget";
+        state.selectedSession.pending_turn_pause_details = payload;
+        state.liveItems.delete(sessionID);
+        updateControls();
+      }
+      addActivity(
+        eventLabel(sessionID, "等待是否继续"),
+        `已完成 ${payload.steps_completed} 步`,
+        "warning",
+      );
+      if (sessionID === selectedSessionID()) await selectSession(sessionID);
+      break;
     case "turn.completed":
       if (payload.plan_id && sessionID === selectedSessionID()) {
         state.selectedSession.proposed_plan_id = payload.plan_id;
@@ -1425,6 +1654,7 @@ async function pollEvents() {
         headers: { "X-My-Agent-Token": bootstrap.token },
         cache: "no-store",
       });
+      verifyServerInstance(response);
       if (response.status === 204) {
         setConnection("已连接", "online");
         failures = 0;
@@ -1490,11 +1720,33 @@ function bindUI() {
       elements.sessionTitle.focus();
     }
   });
+  elements.sessionMenuRename.addEventListener("click", () => {
+    const sessionID = state.sessionMenuSessionID;
+    if (sessionID) beginSidebarRename(sessionID);
+  });
+  elements.sessionContextMenu.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      const sessionID = state.sessionMenuSessionID;
+      closeSessionMenu();
+      elements.sessionList
+        .querySelector(`.session-row[data-session-id="${sessionID}"] .session-actions`)
+        ?.focus();
+    }
+  });
   bindChoiceMenu(elements.modelMenuTrigger, elements.modelMenu);
   bindChoiceMenu(elements.permissionMenuTrigger, elements.permissionMenu);
   document.addEventListener("pointerdown", (event) => {
     if (!event.target.closest(".choice-menu")) closeChoiceMenus();
+    if (
+      !event.target.closest("#session-context-menu") &&
+      !event.target.closest(".session-actions")
+    ) {
+      closeSessionMenu();
+    }
   });
+  elements.sessionList.addEventListener("scroll", closeSessionMenu);
+  window.addEventListener("resize", closeSessionMenu);
   elements.stopTurn.addEventListener("click", interruptTurn);
   elements.executePlan.addEventListener("click", executePlan);
   elements.revisePlan.addEventListener("click", revisePlan);
@@ -1519,9 +1771,9 @@ function bindUI() {
 }
 
 async function initialize() {
-  if (!bootstrap?.token) {
+  if (!bootstrap?.token || !bootstrap?.instanceID) {
     setConnection("初始化失败", "offline");
-    showToast("缺少本地 UI bootstrap 配置");
+    showToast("Agent 服务版本已过期，请重启服务并刷新页面");
     return;
   }
   bindUI();

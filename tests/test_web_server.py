@@ -18,6 +18,7 @@ from my_agent.web_server import LocalWebServer
 class _AppServer:
     def __init__(self, workspace: Path) -> None:
         self.workspace = workspace
+        self.instance_id = "instance-1"
         self.requests = []
         self.events = queue.Queue()
         self.closed = False
@@ -72,7 +73,14 @@ class LocalWebServerTests(unittest.TestCase):
             self.assertIn("My Agent", response.read().decode("utf-8"))
             self.assertIn("default-src 'self'", response.headers["Content-Security-Policy"])
         with self.request("/bootstrap.js") as response:
-            self.assertIn("test-token", response.read().decode("utf-8"))
+            bootstrap = response.read().decode("utf-8")
+            self.assertIn("test-token", bootstrap)
+            self.assertIn('"instanceID":"instance-1"', bootstrap)
+            self.assertEqual(response.headers["X-My-Agent-Instance"], "instance-1")
+
+        with self.request("/api/health") as response:
+            health = json.loads(response.read())
+            self.assertEqual(health["instance_id"], "instance-1")
 
         connection = http.client.HTTPConnection("127.0.0.1", self.server.port)
         connection.request("GET", "/api/health", headers={"Host": "example.com"})
@@ -92,10 +100,19 @@ class LocalWebServerTests(unittest.TestCase):
         self.assertIn('id="permission-menu"', html)
         self.assertIn('id="model-menu"', html)
         self.assertIn('id="session-rename-form"', html)
+        self.assertIn('id="session-context-menu"', html)
+        self.assertIn('id="recovery-title"', html)
         self.assertNotIn("<select", html)
         self.assertIn('rpc("provider.credential.set"', javascript)
         self.assertIn('rpc("permission.switch"', javascript)
         self.assertIn('rpc("session.rename"', javascript)
+        self.assertIn('case "turn.continuation_required"', javascript)
+        self.assertIn('pending_turn_pause_reason === "step_budget"', javascript)
+        self.assertIn('X-My-Agent-Instance', javascript)
+        self.assertIn('window.location.reload()', javascript)
+        self.assertIn('!bootstrap?.instanceID', javascript)
+        self.assertIn('event.key === "ContextMenu"', javascript)
+        self.assertIn('event.shiftKey && event.key === "F10"', javascript)
         self.assertNotIn("localStorage", javascript)
 
     def test_rpc_endpoint_requires_token_and_preserves_request_id(self) -> None:
@@ -132,6 +149,10 @@ class LocalWebServerTests(unittest.TestCase):
         with self.assertRaises(HTTPError) as context:
             urlopen(unauthorized)
         self.assertEqual(context.exception.code, 401)
+        self.assertEqual(
+            context.exception.headers["X-My-Agent-Instance"],
+            "instance-1",
+        )
         context.exception.close()
 
     def test_event_endpoint_long_polls_typed_events(self) -> None:
