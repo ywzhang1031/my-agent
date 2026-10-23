@@ -4,6 +4,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Mapping
 
+from .control import ApprovalDecision, ApprovalGrant
 from .event_broker import EventBroker
 from .event_store import EventStore
 from .messages import UserMessage
@@ -16,6 +17,7 @@ from .protocol import (
     AgentState,
     ApprovalRequestedEvent,
     ApprovalResolvedEvent,
+    ClearPermissionGrantsCommand,
     ContextCompactedEvent,
     ExecutePlanCommand,
     InterruptTurnCommand,
@@ -29,8 +31,10 @@ from .protocol import (
     PlanApprovedEvent,
     PlanRevisionRequestedEvent,
     PermissionProfileChangedEvent,
+    PermissionGrantsChangedEvent,
     ProviderRetryEvent,
     RenameSessionCommand,
+    RevokePermissionGrantCommand,
     ResolveApprovalCommand,
     RevisePlanCommand,
     SandboxChangedEvent,
@@ -205,6 +209,12 @@ class AgentService:
         if isinstance(command, SwitchPermissionProfileCommand):
             self._switch_permission_profile(handle, command.profile_id)
             return
+        if isinstance(command, RevokePermissionGrantCommand):
+            self._revoke_permission_grant(handle, command.action, command.resource)
+            return
+        if isinstance(command, ClearPermissionGrantsCommand):
+            self._clear_permission_grants(handle)
+            return
         if isinstance(command, SwitchSandboxCommand):
             self._switch_sandbox(handle, command.mode)
             return
@@ -298,6 +308,9 @@ class AgentService:
     def inspect_context(self, session_id: str):
         handle = self._handle(session_id)
         return handle.runtime.loop.inspect_context(handle.runtime.session)
+
+    def permission_grants(self, session_id: str) -> tuple[ApprovalGrant, ...]:
+        return self._handle(session_id).runtime.permission_grants()
 
     def session_view(self, session_id: str) -> ServiceSessionView:
         runtime = self._handle(session_id).runtime
@@ -478,6 +491,47 @@ class AgentService:
             AgentState.IDLE,
             turn_id=None,
             mode=selected_mode,
+        )
+
+    def _revoke_permission_grant(
+        self,
+        handle: _SessionHandle,
+        action: str,
+        resource: str,
+    ) -> None:
+        removed = handle.runtime.revoke_permission_grant(action, resource)
+        self._publish_permission_grants_changed(
+            handle,
+            reason="revoked",
+            removed_count=int(removed),
+        )
+
+    def _clear_permission_grants(self, handle: _SessionHandle) -> None:
+        removed_count = handle.runtime.clear_permission_grants()
+        self._publish_permission_grants_changed(
+            handle,
+            reason="cleared",
+            removed_count=removed_count,
+        )
+
+    def _publish_permission_grants_changed(
+        self,
+        handle: _SessionHandle,
+        *,
+        reason: str,
+        removed_count: int = 0,
+        turn_id: str | None = None,
+        state: AgentState | None = None,
+    ) -> None:
+        self._publish(
+            handle,
+            PermissionGrantsChangedEvent,
+            state or AgentState(handle.runtime.state.value),
+            turn_id=turn_id,
+            durable=False,
+            grants=[grant.to_dict() for grant in handle.runtime.permission_grants()],
+            reason=reason,
+            removed_count=removed_count,
         )
 
     def _execute_plan(self, handle: _SessionHandle) -> None:
@@ -755,6 +809,16 @@ class AgentService:
                 prompted=bool(data["prompted"]),
                 source=str(data["source"]),
             )
+            if (
+                str(data["decision"]) == ApprovalDecision.ALLOW_SESSION.value
+                and str(data["source"]) == "prompt"
+            ):
+                self._publish_permission_grants_changed(
+                    handle,
+                    reason="granted",
+                    turn_id=self._current_turn_id(handle),
+                    state=state,
+                )
         elif event.kind == "turn_error":
             self._publish(
                 handle,

@@ -32,6 +32,7 @@ from my_agent.config import load_runtime_config, save_provider_credential
 from my_agent.context import ContextManager, estimate_text_tokens
 from my_agent.control import (
     ApprovalDecision,
+    ApprovalGrant,
     DenyApprovalBroker,
     PermissionRequest,
     raise_if_cancelled,
@@ -1256,6 +1257,12 @@ class MyAgentTests(unittest.TestCase):
             self.assertEqual(len(resolved), 2)
             self.assertEqual(resolved[0].data["source"], "prompt")
             self.assertEqual(resolved[1].data["source"], "session")
+            self.assertEqual(
+                runtime.permission_grants(),
+                (ApprovalGrant("apply_patch", "app.py", "update app.py"),),
+            )
+            self.assertTrue(runtime.revoke_permission_grant("apply_patch", "app.py"))
+            self.assertEqual(runtime.permission_grants(), ())
 
     def test_agent_runtime_interrupts_approval_with_complete_tool_results(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2031,7 +2038,7 @@ class MyAgentTests(unittest.TestCase):
                     "--credentials",
                     str(Path(tmpdir, "credentials.json")),
                 ],
-                input="/sandbox\n/help\n/exit\n",
+                input="/grants\n/sandbox\n/help\n/exit\n",
                 text=True,
                 capture_output=True,
                 cwd=Path(__file__).resolve().parents[1],
@@ -2040,7 +2047,9 @@ class MyAgentTests(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("Current sandbox: workspace-write", completed.stdout)
+        self.assertIn("No runtime permission grants", completed.stdout)
         self.assertIn("/help       Show slash commands", completed.stdout)
+        self.assertIn("/grants", completed.stdout)
         self.assertIn("/sandbox", completed.stdout)
         self.assertIn("use Up/Down and Enter to run", completed.stdout)
 

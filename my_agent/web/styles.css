@@ -987,6 +987,7 @@ textarea:disabled {
 .context-total,
 .context-breakdown,
 .context-meta,
+.permission-grant-list,
 .activity-list {
   padding-right: 14px;
   padding-left: 14px;
@@ -1053,6 +1054,79 @@ textarea:disabled {
   color: var(--muted);
   font-size: 11px;
   line-height: 1.6;
+}
+
+.permission-grants-header {
+  display: flex;
+  min-height: 52px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 16px;
+  padding: 0 14px;
+  border-top: 1px solid var(--border);
+}
+
+.permission-grants-header > div {
+  display: grid;
+  gap: 2px;
+}
+
+.permission-grants-header span,
+.permission-grant-empty {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.permission-grant-list {
+  display: grid;
+  gap: 2px;
+}
+
+.permission-grant-empty {
+  padding: 5px 0 10px;
+}
+
+.permission-grant-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 0;
+  border-bottom: 1px solid #eef0f1;
+}
+
+.permission-grant-copy {
+  min-width: 0;
+}
+
+.permission-grant-copy strong,
+.permission-grant-copy span {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.permission-grant-copy strong {
+  font-size: 11px;
+}
+
+.permission-grant-copy span {
+  margin-top: 2px;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+}
+
+.permission-grant-revoke {
+  width: 28px;
+  height: 28px;
+  color: var(--muted);
+}
+
+.permission-grant-revoke:hover {
+  color: var(--danger);
 }
 
 .activity-header {

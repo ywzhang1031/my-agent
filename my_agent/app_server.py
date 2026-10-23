@@ -14,9 +14,11 @@ from .protocol import (
     AbortTurnCommand,
     AgentCommandType,
     AgentEventType,
+    ClearPermissionGrantsCommand,
     ExecutePlanCommand,
     InterruptTurnCommand,
     RenameSessionCommand,
+    RevokePermissionGrantCommand,
     ResolveApprovalCommand,
     RevisePlanCommand,
     StartTurnCommand,
@@ -161,6 +163,7 @@ class AppServer:
             "provider.credential.set": self._set_provider_credential,
             "mode.list": self._list_modes,
             "permission.list": self._list_permission_profiles,
+            "permission.grants.list": self._list_permission_grants,
             "sandbox.list": self._list_sandbox_profiles,
             "context.inspect": self._inspect_context,
             "turn.start": self._start_turn,
@@ -170,6 +173,8 @@ class AppServer:
             "model.switch": self._switch_model,
             "mode.switch": self._switch_mode,
             "permission.switch": self._switch_permission_profile,
+            "permission.grant.revoke": self._revoke_permission_grant,
+            "permission.grants.clear": self._clear_permission_grants,
             "sandbox.switch": self._switch_sandbox,
             "plan.execute": self._execute_plan,
             "plan.revise": self._revise_plan,
@@ -376,6 +381,18 @@ class AppServer:
             ]
         }
 
+    def _list_permission_grants(self, params: dict[str, Any]) -> dict[str, Any]:
+        session_id = self._session_id(params)
+        self._require_active_session(session_id)
+        return {
+            "grants": [
+                grant.to_dict()
+                for grant in self.agent_service.permission_grants(session_id)
+            ],
+            "lifetime": "runtime",
+            "persistent": False,
+        }
+
     def _list_sandbox_profiles(self, params: dict[str, Any]) -> dict[str, Any]:
         self._check_params(params)
         profiles = []
@@ -455,6 +472,24 @@ class AppServer:
                 session_id=self._required_string(params, "session_id"),
                 profile_id=profile_id,
             )
+        )
+
+    def _revoke_permission_grant(self, params: dict[str, Any]) -> dict[str, Any]:
+        self._check_params(
+            params,
+            required={"session_id", "action", "resource"},
+        )
+        return self._dispatch_command(
+            RevokePermissionGrantCommand(
+                session_id=self._required_string(params, "session_id"),
+                action=self._required_string(params, "action"),
+                resource=self._required_string(params, "resource"),
+            )
+        )
+
+    def _clear_permission_grants(self, params: dict[str, Any]) -> dict[str, Any]:
+        return self._dispatch_command(
+            ClearPermissionGrantsCommand(session_id=self._session_id(params))
         )
 
     def _switch_sandbox(self, params: dict[str, Any]) -> dict[str, Any]:

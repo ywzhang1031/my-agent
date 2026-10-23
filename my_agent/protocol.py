@@ -30,6 +30,8 @@ class CommandType(str, Enum):
     SWITCH_MODEL = "model.switch"
     SWITCH_MODE = "mode.switch"
     SWITCH_PERMISSION_PROFILE = "permission.switch"
+    REVOKE_PERMISSION_GRANT = "permission.grant.revoke"
+    CLEAR_PERMISSION_GRANTS = "permission.grants.clear"
     SWITCH_SANDBOX = "sandbox.switch"
     EXECUTE_PLAN = "plan.execute"
     REVISE_PLAN = "plan.revise"
@@ -57,6 +59,7 @@ class EventType(str, Enum):
     MODEL_CHANGED = "model.changed"
     MODE_CHANGED = "mode.changed"
     PERMISSION_PROFILE_CHANGED = "permission.changed"
+    PERMISSION_GRANTS_CHANGED = "permission.grants.changed"
     SANDBOX_CHANGED = "sandbox.changed"
     PLAN_APPROVED = "plan.approved"
     PLAN_REVISION_REQUESTED = "plan.revision_requested"
@@ -115,6 +118,18 @@ class SwitchPermissionProfileCommand(AgentCommand):
 
 
 @dataclass(frozen=True, kw_only=True)
+class RevokePermissionGrantCommand(AgentCommand):
+    action: str
+    resource: str
+    command_type: ClassVar[CommandType] = CommandType.REVOKE_PERMISSION_GRANT
+
+
+@dataclass(frozen=True, kw_only=True)
+class ClearPermissionGrantsCommand(AgentCommand):
+    command_type: ClassVar[CommandType] = CommandType.CLEAR_PERMISSION_GRANTS
+
+
+@dataclass(frozen=True, kw_only=True)
 class SwitchSandboxCommand(AgentCommand):
     mode: str
     command_type: ClassVar[CommandType] = CommandType.SWITCH_SANDBOX
@@ -143,6 +158,8 @@ AgentCommandType: TypeAlias = (
     | SwitchModelCommand
     | SwitchModeCommand
     | SwitchPermissionProfileCommand
+    | RevokePermissionGrantCommand
+    | ClearPermissionGrantsCommand
     | SwitchSandboxCommand
     | ExecutePlanCommand
     | RevisePlanCommand
@@ -326,6 +343,14 @@ class PermissionProfileChangedEvent(AgentEvent):
 
 
 @dataclass(frozen=True, kw_only=True)
+class PermissionGrantsChangedEvent(AgentEvent):
+    grants: list[dict[str, str]]
+    reason: str
+    removed_count: int = 0
+    event_type: ClassVar[EventType] = EventType.PERMISSION_GRANTS_CHANGED
+
+
+@dataclass(frozen=True, kw_only=True)
 class SandboxChangedEvent(AgentEvent):
     mode: str
     event_type: ClassVar[EventType] = EventType.SANDBOX_CHANGED
@@ -371,6 +396,7 @@ AgentEventType: TypeAlias = (
     | ModelChangedEvent
     | ModeChangedEvent
     | PermissionProfileChangedEvent
+    | PermissionGrantsChangedEvent
     | SandboxChangedEvent
     | PlanApprovedEvent
     | PlanRevisionRequestedEvent
@@ -388,6 +414,8 @@ _COMMAND_TYPES = {
         SwitchModelCommand,
         SwitchModeCommand,
         SwitchPermissionProfileCommand,
+        RevokePermissionGrantCommand,
+        ClearPermissionGrantsCommand,
         SwitchSandboxCommand,
         ExecutePlanCommand,
         RevisePlanCommand,
@@ -418,6 +446,7 @@ _EVENT_TYPES = {
         ModelChangedEvent,
         ModeChangedEvent,
         PermissionProfileChangedEvent,
+        PermissionGrantsChangedEvent,
         SandboxChangedEvent,
         PlanApprovedEvent,
         PlanRevisionRequestedEvent,

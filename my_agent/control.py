@@ -29,6 +29,24 @@ class ApprovalOutcome:
 
 
 @dataclass(frozen=True)
+class ApprovalGrant:
+    action: str
+    resource: str
+    description: str
+
+    @property
+    def scope_key(self) -> tuple[str, str]:
+        return self.action, self.resource
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "action": self.action,
+            "resource": self.resource,
+            "description": self.description,
+        }
+
+
+@dataclass(frozen=True)
 class PermissionRequest:
     action: str
     resource: str

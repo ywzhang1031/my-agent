@@ -9,6 +9,7 @@ from pathlib import Path
 from my_agent.agent_loop import TurnResult
 from my_agent.app_server import AppServer
 from my_agent.config import ConfiguredModel
+from my_agent.control import ApprovalGrant
 from my_agent.event_store import EventStore
 from my_agent.modes import BUILD_MODE, COLLABORATION_MODES, get_mode
 from my_agent.permissions import PermissionPolicy
@@ -86,6 +87,7 @@ class _Runtime:
         self.commands = []
         self.closed = False
         self.active = False
+        self.grants: list[ApprovalGrant] = []
 
     def send(self, command) -> None:
         self.commands.append(command)
@@ -122,6 +124,23 @@ class _Runtime:
 
     def switch_sandbox(self, mode: str) -> None:
         self.loop.sandbox_policy = SandboxPolicy(mode, Path(self.session.workspace))
+
+    def permission_grants(self) -> tuple[ApprovalGrant, ...]:
+        return tuple(self.grants)
+
+    def revoke_permission_grant(self, action: str, resource: str) -> bool:
+        before = len(self.grants)
+        self.grants = [
+            grant
+            for grant in self.grants
+            if (grant.action, grant.resource) != (action, resource)
+        ]
+        return len(self.grants) != before
+
+    def clear_permission_grants(self) -> int:
+        removed = len(self.grants)
+        self.grants.clear()
+        return removed
 
 
 class AppServerTests(unittest.TestCase):
@@ -358,6 +377,43 @@ class AppServerTests(unittest.TestCase):
             self.runtimes[session_id].loop.sandbox_policy.mode,
             DANGER_FULL_ACCESS,
         )
+
+    def test_runtime_permission_grant_rpc_is_explicitly_ephemeral(self) -> None:
+        session_id = self.create_session()
+        runtime = self.runtimes[session_id]
+        runtime.grants = [
+            ApprovalGrant("edit", "app.py", "Edit app.py"),
+            ApprovalGrant("shell", "pytest", "Run pytest"),
+        ]
+
+        listed = self.rpc("permission.grants.list", session_id=session_id)
+        self.assertEqual(listed.result["lifetime"], "runtime")
+        self.assertFalse(listed.result["persistent"])
+        self.assertEqual(len(listed.result["grants"]), 2)
+
+        revoked = self.rpc(
+            "permission.grant.revoke",
+            session_id=session_id,
+            action="edit",
+            resource="app.py",
+        )
+        self.assertTrue(revoked.ok, revoked.error)
+        revoked_event = self.app.next_event(self.subscription_id, timeout=1)
+        self.assertEqual(revoked_event.reason, "revoked")
+        self.assertEqual(revoked_event.removed_count, 1)
+
+        cleared = self.rpc("permission.grants.clear", session_id=session_id)
+        self.assertTrue(cleared.ok, cleared.error)
+        cleared_event = self.app.next_event(self.subscription_id, timeout=1)
+        self.assertEqual(cleared_event.reason, "cleared")
+        self.assertEqual(cleared_event.removed_count, 1)
+        self.assertEqual(runtime.grants, [])
+
+        runtime.grants = [ApprovalGrant("shell", "pytest", "Run pytest")]
+        self.rpc("session.close", session_id=session_id)
+        self.rpc("session.resume", session_id=session_id)
+        resumed = self.rpc("permission.grants.list", session_id=session_id)
+        self.assertEqual(resumed.result["grants"], [])
 
     def test_two_sessions_run_concurrently_but_one_session_rejects_overlap(self) -> None:
         first = self.create_session()

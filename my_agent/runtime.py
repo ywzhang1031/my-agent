@@ -9,6 +9,7 @@ from typing import Any
 from .agent_loop import AgentEvent, AgentLoop, TurnResult
 from .control import (
     ApprovalDecision,
+    ApprovalGrant,
     ApprovalNotifier,
     ApprovalOutcome,
     DenyApprovalBroker,
@@ -74,7 +75,7 @@ class RuntimeApprovalBroker:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._pending: _PendingApproval | None = None
-        self._session_approvals: set[tuple[str, str]] = set()
+        self._session_approvals: dict[tuple[str, str], ApprovalGrant] = {}
 
     def authorize(
         self,
@@ -108,7 +109,11 @@ class RuntimeApprovalBroker:
             if self._pending is pending:
                 self._pending = None
             if decision == ApprovalDecision.ALLOW_SESSION:
-                self._session_approvals.add(request.scope_key)
+                self._session_approvals[request.scope_key] = ApprovalGrant(
+                    action=request.action,
+                    resource=request.resource,
+                    description=request.description,
+                )
         if decision is None:
             raise RuntimeError("approval resolved without a decision")
         return ApprovalOutcome(decision, "prompt")
@@ -122,6 +127,25 @@ class RuntimeApprovalBroker:
                 raise ValueError(f"approval request is not pending: {request_id}")
             pending.decision = decision
             pending.ready.set()
+
+    def grants(self) -> tuple[ApprovalGrant, ...]:
+        with self._lock:
+            return tuple(
+                sorted(
+                    self._session_approvals.values(),
+                    key=lambda grant: grant.scope_key,
+                )
+            )
+
+    def revoke(self, action: str, resource: str) -> bool:
+        with self._lock:
+            return self._session_approvals.pop((action, resource), None) is not None
+
+    def clear(self) -> int:
+        with self._lock:
+            removed = len(self._session_approvals)
+            self._session_approvals.clear()
+            return removed
 
 
 class AgentRuntime:
@@ -199,6 +223,21 @@ class AgentRuntime:
         if self.session.pending_turn is not None:
             raise RuntimeError("cannot switch sandbox while a turn is pending")
         self.loop.switch_sandbox(mode)
+
+    def permission_grants(self) -> tuple[ApprovalGrant, ...]:
+        if not isinstance(self._approvals, RuntimeApprovalBroker):
+            return ()
+        return self._approvals.grants()
+
+    def revoke_permission_grant(self, action: str, resource: str) -> bool:
+        if not isinstance(self._approvals, RuntimeApprovalBroker):
+            return False
+        return self._approvals.revoke(action, resource)
+
+    def clear_permission_grants(self) -> int:
+        if not isinstance(self._approvals, RuntimeApprovalBroker):
+            return 0
+        return self._approvals.clear()
 
     def wait(self, timeout: float = 5.0) -> None:
         with self._lock:

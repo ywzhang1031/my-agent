@@ -60,6 +60,8 @@ const elements = {
   usageFill: document.querySelector("#usage-fill"),
   contextBreakdown: document.querySelector("#context-breakdown"),
   contextMeta: document.querySelector("#context-meta"),
+  permissionGrantList: document.querySelector("#permission-grant-list"),
+  clearPermissionGrants: document.querySelector("#clear-permission-grants"),
   activityList: document.querySelector("#activity-list"),
   clearActivity: document.querySelector("#clear-activity"),
   toast: document.querySelector("#toast"),
@@ -71,6 +73,7 @@ const state = {
   modes: [],
   permissionProfiles: [],
   sandboxProfiles: [],
+  permissionGrants: [],
   selectedSession: null,
   busySessions: new Set(),
   attentionSessions: new Set(),
@@ -1059,6 +1062,40 @@ function resetContext() {
   renderContext({ breakdown: {} });
 }
 
+function renderPermissionGrants() {
+  const fragment = document.createDocumentFragment();
+  elements.clearPermissionGrants.disabled = !state.selectedSession || !state.permissionGrants.length;
+  if (!state.selectedSession || !state.permissionGrants.length) {
+    const empty = document.createElement("div");
+    empty.className = "permission-grant-empty";
+    empty.textContent = state.selectedSession ? "没有本次运行授权" : "选择会话后显示";
+    fragment.append(empty);
+  } else {
+    for (const grant of state.permissionGrants) {
+      const row = document.createElement("div");
+      row.className = "permission-grant-row";
+      const copy = document.createElement("div");
+      copy.className = "permission-grant-copy";
+      const action = document.createElement("strong");
+      action.textContent = grant.action;
+      const resource = document.createElement("span");
+      resource.textContent = grant.resource;
+      resource.title = grant.description || grant.resource;
+      copy.append(action, resource);
+      const revoke = document.createElement("button");
+      revoke.className = "icon-button permission-grant-revoke";
+      revoke.type = "button";
+      revoke.textContent = "×";
+      revoke.title = `撤销 ${grant.action} ${grant.resource}`;
+      revoke.setAttribute("aria-label", revoke.title);
+      revoke.addEventListener("click", () => revokePermissionGrant(grant));
+      row.append(copy, revoke);
+      fragment.append(row);
+    }
+  }
+  elements.permissionGrantList.replaceChildren(fragment);
+}
+
 async function refreshContext() {
   const sessionID = selectedSessionID();
   if (!sessionID) return resetContext();
@@ -1067,6 +1104,50 @@ async function refreshContext() {
     if (sessionID === selectedSessionID()) renderContext(result.context || {});
   } catch (error) {
     addActivity("上下文读取失败", error.message, "warning");
+  }
+}
+
+async function refreshPermissionGrants() {
+  const sessionID = selectedSessionID();
+  if (!sessionID) {
+    state.permissionGrants = [];
+    renderPermissionGrants();
+    return;
+  }
+  try {
+    const result = await rpc("permission.grants.list", { session_id: sessionID });
+    if (sessionID === selectedSessionID()) {
+      state.permissionGrants = result.grants || [];
+      renderPermissionGrants();
+    }
+  } catch (error) {
+    addActivity("运行时授权读取失败", error.message, "warning");
+  }
+}
+
+async function revokePermissionGrant(grant) {
+  const sessionID = selectedSessionID();
+  if (!sessionID) return;
+  try {
+    await rpc("permission.grant.revoke", {
+      session_id: sessionID,
+      action: grant.action,
+      resource: grant.resource,
+    });
+    await refreshPermissionGrants();
+  } catch (error) {
+    showToast(`无法撤销授权：${error.message}`);
+  }
+}
+
+async function clearPermissionGrants() {
+  const sessionID = selectedSessionID();
+  if (!sessionID || !state.permissionGrants.length) return;
+  try {
+    await rpc("permission.grants.clear", { session_id: sessionID });
+    await refreshPermissionGrants();
+  } catch (error) {
+    showToast(`无法清空授权：${error.message}`);
   }
 }
 
@@ -1089,6 +1170,8 @@ async function selectSession(sessionID) {
     }
     const result = await rpc("session.read", { session_id: sessionID });
     state.selectedSession = result.session;
+    state.permissionGrants = [];
+    renderPermissionGrants();
     loadProjection(result.projection);
     syncCredentialRequest(state.selectedSession);
     state.attentionSessions.delete(sessionID);
@@ -1098,6 +1181,7 @@ async function selectSession(sessionID) {
     updateControls();
     renderSessionList();
     await refreshContext();
+    await refreshPermissionGrants();
     closeOverlays();
   } catch (error) {
     showToast(`无法打开会话：${error.message}`);
@@ -1680,6 +1764,20 @@ async function handleEvent(event) {
       }
       addActivity(eventLabel(sessionID, "权限已切换"), payload.profile_id, "success");
       break;
+    case "permission.grants.changed":
+      if (sessionID === selectedSessionID()) {
+        state.permissionGrants = payload.grants || [];
+        renderPermissionGrants();
+      }
+      addActivity(
+        eventLabel(
+          sessionID,
+          payload.reason === "granted" ? "已添加本次运行授权" : "本次运行授权已更新",
+        ),
+        `${(payload.grants || []).length} active`,
+        "neutral",
+      );
+      break;
     case "sandbox.changed":
       if (sessionID === selectedSessionID()) {
         state.selectedSession.sandbox_mode = payload.mode;
@@ -1849,6 +1947,7 @@ function bindUI() {
     state.activities = [];
     renderActivities();
   });
+  elements.clearPermissionGrants.addEventListener("click", clearPermissionGrants);
   for (const button of elements.approvalPanel.querySelectorAll("[data-approval]")) {
     button.addEventListener("click", () => resolveApproval(button.dataset.approval));
   }
@@ -1869,6 +1968,7 @@ async function initialize() {
   }
   bindUI();
   resetContext();
+  renderPermissionGrants();
   try {
     const [models, modes, permissions, sandboxes, sessions] = await Promise.all([
       rpc("model.list"),

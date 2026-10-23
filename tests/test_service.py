@@ -7,11 +7,13 @@ import unittest
 from pathlib import Path
 
 from my_agent.agent_loop import TurnResult
-from my_agent.control import ApprovalDecision
+from my_agent.control import ApprovalDecision, ApprovalGrant
 from my_agent.modes import BUILD_MODE, PLAN_MODE
 from my_agent.permissions import PermissionPolicy
 from my_agent.protocol import (
     AgentState,
+    ApprovalResolvedEvent,
+    ClearPermissionGrantsCommand,
     ExecutePlanCommand,
     ItemCompletedEvent,
     ItemDeltaEvent,
@@ -24,6 +26,8 @@ from my_agent.protocol import (
     SwitchPermissionProfileCommand,
     SwitchSandboxCommand,
     PermissionProfileChangedEvent,
+    PermissionGrantsChangedEvent,
+    RevokePermissionGrantCommand,
     TurnCompletedEvent,
     TurnContinuationRequiredEvent,
     command_from_dict,
@@ -81,6 +85,7 @@ class _Runtime:
         self.events: queue.Queue[RuntimeEvent] = queue.Queue()
         self.commands = []
         self.closed = False
+        self.grants: list[ApprovalGrant] = []
 
     def send(self, command) -> None:
         self.commands.append(command)
@@ -96,6 +101,23 @@ class _Runtime:
 
     def switch_sandbox(self, mode: str) -> None:
         self.loop.sandbox_policy = SandboxPolicy(mode, Path(self.session.workspace))
+
+    def permission_grants(self) -> tuple[ApprovalGrant, ...]:
+        return tuple(self.grants)
+
+    def revoke_permission_grant(self, action: str, resource: str) -> bool:
+        before = len(self.grants)
+        self.grants = [
+            grant
+            for grant in self.grants
+            if (grant.action, grant.resource) != (action, resource)
+        ]
+        return len(self.grants) != before
+
+    def clear_permission_grants(self) -> int:
+        removed = len(self.grants)
+        self.grants.clear()
+        return removed
 
     def wait(self, timeout=5.0) -> None:
         return None
@@ -147,6 +169,34 @@ class ProtocolTests(unittest.TestCase):
             state=AgentState.IDLE,
             event_id="event-1",
             mode=DANGER_FULL_ACCESS,
+        )
+
+        self.assertEqual(command_from_dict(command_to_dict(command)), command)
+        self.assertEqual(event_from_dict(event_to_dict(event)), event)
+
+    def test_permission_grant_protocol_round_trip(self) -> None:
+        command = RevokePermissionGrantCommand(
+            session_id="session-1",
+            command_id="command-1",
+            action="edit",
+            resource="app.py",
+        )
+        event = PermissionGrantsChangedEvent(
+            session_id="session-1",
+            turn_id=None,
+            sequence=6,
+            state=AgentState.IDLE,
+            durable=False,
+            event_id="event-1",
+            grants=[
+                {
+                    "action": "shell",
+                    "resource": "pytest",
+                    "description": "Run pytest",
+                }
+            ],
+            reason="revoked",
+            removed_count=1,
         )
 
         self.assertEqual(command_from_dict(command_to_dict(command)), command)
@@ -286,6 +336,78 @@ class AgentServiceTests(unittest.TestCase):
             self.assertIsInstance(runtime.commands[0], StartTurn)
             service.close()
 
+    def test_allow_session_emits_ephemeral_grant_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._state(Path(tmp))
+            runtime = _Runtime(state)
+            runtime.grants = [ApprovalGrant("apply_patch", "app.py", "update app.py")]
+            runtime.events.put(
+                RuntimeEvent(
+                    kind="turn_started",
+                    state=RuntimeState.RUNNING_MODEL,
+                    data={"turn_id": "session-1:1", "task": "update app.py"},
+                )
+            )
+            runtime.events.put(
+                RuntimeEvent(
+                    kind="approval_resolved",
+                    state=RuntimeState.RUNNING_TOOL,
+                    data={
+                        "step": 1,
+                        "call_id": "call-1",
+                        "tool_name": "apply_patch",
+                        "request_id": "approval-1",
+                        "decision": ApprovalDecision.ALLOW_SESSION.value,
+                        "prompted": True,
+                        "source": "prompt",
+                    },
+                )
+            )
+            runtime.events.put(
+                RuntimeEvent(
+                    kind="turn_completed",
+                    state=RuntimeState.COMPLETED,
+                    text="done",
+                    data={
+                        "steps": 1,
+                        "stopped_by": "final_answer",
+                        "mode_id": "build",
+                        "plan_id": None,
+                    },
+                    result=TurnResult(
+                        answer="done",
+                        messages=[],
+                        steps=1,
+                        stopped_by="final_answer",
+                    ),
+                )
+            )
+            service = AgentService(tool_registry_factory=lambda mode: object())
+            service.register(runtime)
+            subscription_id = self._subscribe(service, state.session_id)
+
+            service.dispatch(
+                StartTurnCommand(session_id=state.session_id, user_input="update app.py")
+            )
+            events, _ = self._next_terminal(service, subscription_id)
+
+            resolved_index = next(
+                index
+                for index, event in enumerate(events)
+                if isinstance(event, ApprovalResolvedEvent)
+            )
+            grant_index = next(
+                index
+                for index, event in enumerate(events)
+                if isinstance(event, PermissionGrantsChangedEvent)
+            )
+            grant_event = events[grant_index]
+            self.assertGreater(grant_index, resolved_index)
+            self.assertFalse(grant_event.durable)
+            self.assertEqual(grant_event.reason, "granted")
+            self.assertEqual(grant_event.grants, [runtime.grants[0].to_dict()])
+            service.close()
+
     def test_permission_profile_switch_is_persisted_and_emits_event(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state = self._state(Path(tmp))
@@ -338,6 +460,42 @@ class AgentServiceTests(unittest.TestCase):
             self.assertEqual(state.sandbox_mode, DANGER_FULL_ACCESS)
             self.assertEqual(runtime.loop.sandbox_policy.mode, DANGER_FULL_ACCESS)
             self.assertEqual(saved, [DANGER_FULL_ACCESS])
+            service.close()
+
+    def test_permission_grants_can_be_listed_revoked_and_cleared(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._state(Path(tmp))
+            runtime = _Runtime(state)
+            runtime.grants = [
+                ApprovalGrant("edit", "app.py", "Edit app.py"),
+                ApprovalGrant("shell", "pytest", "Run pytest"),
+            ]
+            service = AgentService(tool_registry_factory=lambda mode: object())
+            service.register(runtime)
+            subscription_id = self._subscribe(service, state.session_id)
+
+            self.assertEqual(service.permission_grants(state.session_id), tuple(runtime.grants))
+
+            service.dispatch(
+                RevokePermissionGrantCommand(
+                    session_id=state.session_id,
+                    action="edit",
+                    resource="app.py",
+                )
+            )
+            revoked = service.next_event(subscription_id, timeout=1)
+            self.assertIsInstance(revoked, PermissionGrantsChangedEvent)
+            self.assertFalse(revoked.durable)
+            self.assertEqual(revoked.reason, "revoked")
+            self.assertEqual(revoked.removed_count, 1)
+            self.assertEqual(revoked.grants, [runtime.grants[0].to_dict()])
+
+            service.dispatch(ClearPermissionGrantsCommand(session_id=state.session_id))
+            cleared = service.next_event(subscription_id, timeout=1)
+            self.assertIsInstance(cleared, PermissionGrantsChangedEvent)
+            self.assertEqual(cleared.reason, "cleared")
+            self.assertEqual(cleared.removed_count, 1)
+            self.assertEqual(cleared.grants, [])
             service.close()
 
     def test_session_rename_is_persisted_and_emits_event(self) -> None:

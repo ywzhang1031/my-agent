@@ -206,9 +206,10 @@ DEEPSEEK_API_KEY=... .venv/bin/python cli.py serve --workspace .
 control plane 提供：
 
 - `session.create/list/read/resume/close/rename`
-- `model.list`、`mode.list`、`permission.list`、`sandbox.list`、`context.inspect`
+- `model.list`、`mode.list`、`permission.list`、`permission.grants.list`、`sandbox.list`、`context.inspect`
 - `turn.start/retry/interrupt/abort`
-- `approval.resolve`、`model.switch`、`mode.switch`、`permission.switch`、`sandbox.switch`
+- `approval.resolve`、`model.switch`、`mode.switch`、`permission.switch`、
+  `permission.grant.revoke`、`permission.grants.clear`、`sandbox.switch`
 - `plan.execute/revise`、`events.subscribe/unsubscribe`
 
 `session.close` 只停止并卸载内存 runtime，不删除磁盘记录；`session.resume` 将它重新加载。AppServer
@@ -295,7 +296,10 @@ Profile 选择保存在 `session.json`，可以按 session 独立切换；runnin
 - `n` / `deny`：不执行工具，将拒绝作为 tool observation 返回给模型
 
 `apply_patch` 的 session resource 是同一 workspace-relative path；`exec_command` 是同一组
-normalized `argv`。`/new` 会创建新 runtime，因此也会清空 session approvals。
+normalized `argv`。`/grants` 可以查看这些精确授权，并逐项撤销或全部清空。grant 只存在于当前
+runtime 内存中，不写入 `session.json`，关闭/恢复 session、`/new` 或重启 AppServer 都会清空。
+撤销只影响后续权限判断，不会中断已经开始执行的工具。审批事实仍会进入 trace 和 durable
+`approval.resolved` event；grant 快照使用 live-only event，不会被 event replay 恢复。
 非交互 `ask` 无法展示审批 UI，因此 `supervised` / `accept_edits` 中需要询问的操作会被拒绝；
 只有显式选择 `--permission-profile trusted` 才会自动执行通过硬限制的敏感工具。
 
@@ -311,6 +315,7 @@ REPL 支持这些本地命令：
 - `/model`：打开模型选择器，用上下方向键选择、`Enter` 切换、`Esc` 取消
 - `/mode`：用同样的选择器切换 Build/Plan；running 或 pending turn 存在时拒绝切换
 - `/permissions`：切换 `supervised`、`accept_edits` 或 `trusted` 权限策略
+- `/grants`：查看并撤销当前 runtime 的精确 `allow_session` 授权
 - `/sandbox`：切换命令的 OS 隔离边界；running 或 pending turn 存在时拒绝切换
 - `/approve`：执行保留的 proposed plan，主要用于取消 selector、恢复 session 或非 TTY 场景
 - `/config`：显示实际配置/凭据路径、默认模型和已解析 provider，不显示 API key
@@ -322,7 +327,7 @@ REPL 使用 `prompt_toolkit`，支持左右移动光标、行内插入和上下�
 全部 slash commands 及说明；菜单打开时用上下方向键移动，按 `Enter` 直接执行选中的命令。
 `Tab`/`Shift-Tab` 仍可用于正向或反向补全。执行 `/model` 后会直接打开模型选择器，当前模型
 默认高亮；用上下方向键移动并按 `Enter` 确认，不需要手动输入 model ID。`/mode` 和
-`/permissions` 和 `/sandbox` 使用相同交互。底部状态栏持续显示当前 `provider/model`、collaboration mode、
+`/permissions`、`/grants` 和 `/sandbox` 使用相同交互。底部状态栏持续显示当前 `provider/model`、collaboration mode、
 permission profile、context 百分比、估算用量和 pending
 状态，同时显示当前 sandbox mode。历史保存在 `.my-agent/history`，权限设为 `0600`。
 输入过程中按 `Ctrl-C` 只清空当前行；turn 运行或等待审批时按 `Ctrl-C` 会发送

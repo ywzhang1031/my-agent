@@ -469,3 +469,17 @@ Sandbox policy 从启动参数和只读状态提升为可查询、可切换的 s
   执行条件，而不只是 argv。
 - 本里程碑仍未增加 Linux/Windows backend，也没有把 permission approval 与 OS sandbox 合并；
   前者决定“是否允许执行”，后者决定“获准后进程实际上能访问什么”。
+
+## Milestone 27: Runtime Permission Grant Control Plane
+
+`allow_session` 不再是 broker 内部不可见的集合，而是可查询、可撤销的运行时授权。
+
+- `ApprovalGrant` 保留精确的 `(action, resource)` 和用户审批时看到的 description；
+  `RuntimeApprovalBroker` 在同一把锁下完成命中、添加、撤销和清空。
+- `RevokePermissionGrantCommand`、`ClearPermissionGrantsCommand` 和
+  `PermissionGrantsChangedEvent` 进入 typed protocol；grant snapshot event 是 live-only，避免重启后
+  从 durable event log 错误恢复已经失效的授权。
+- AppServer 增加 `permission.grants.list`、`permission.grant.revoke` 和
+  `permission.grants.clear`。查询结果显式返回 `lifetime=runtime`、`persistent=false`。
+- CLI `/grants` 与 Web inspector 使用同一 Service 控制面，可逐项撤销或全部清空。
+- 本里程碑不增加 project/global 永久授权。撤销只约束后续工具调用，已开始执行的工具不会被追溯中断。

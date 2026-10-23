@@ -9,7 +9,7 @@ from queue import Empty
 from .agent_loop import AgentLoop
 from .app_server import AppServer
 from .config import RuntimeConfig, load_runtime_config, save_provider_credential
-from .control import ApprovalDecision
+from .control import ApprovalDecision, ApprovalGrant
 from .event_store import EventStore
 from .model_invoker import ModelInvoker
 from .modes import BUILD_MODE, COLLABORATION_MODES, CollaborationMode, get_mode
@@ -22,6 +22,7 @@ from .providers.factory import (
 from .protocol import (
     AbortTurnCommand,
     ApprovalRequestedEvent,
+    ClearPermissionGrantsCommand,
     ExecutePlanCommand,
     InterruptTurnCommand,
     ModeChangedEvent,
@@ -29,6 +30,8 @@ from .protocol import (
     PlanApprovedEvent,
     PlanRevisionRequestedEvent,
     PermissionProfileChangedEvent,
+    PermissionGrantsChangedEvent,
+    RevokePermissionGrantCommand,
     ResolveApprovalCommand,
     RevisePlanCommand,
     SandboxChangedEvent,
@@ -84,6 +87,7 @@ SLASH_COMMANDS = (
     SlashCommand("/model", "Choose the model"),
     SlashCommand("/mode", "Choose Build or Plan mode"),
     SlashCommand("/permissions", "Choose the permission profile"),
+    SlashCommand("/grants", "Review runtime permission grants"),
     SlashCommand("/sandbox", "Choose the command sandbox"),
     SlashCommand("/approve", "Approve the proposed plan and execute it"),
     SlashCommand("/config", "Show provider configuration"),
@@ -657,6 +661,58 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                     args.permission_profile = changed.profile_id
                     print(f"permissions: {changed.profile_id}")
                     continue
+                if user_input == "/grants":
+                    grants = service.permission_grants(state.session_id)
+                    _print_permission_grants(grants)
+                    if not grants:
+                        continue
+                    if not editor.supports_interactive_selection:
+                        print("interactive grant revocation requires a TTY")
+                        continue
+                    labels = {
+                        f"{grant.action} {grant.resource}": grant for grant in grants
+                    }
+                    clear_label = "Clear all grants"
+                    selected = editor.select(
+                        "grants> ",
+                        (
+                            *(
+                                SelectionOption(label, grant.description)
+                                for label, grant in labels.items()
+                            ),
+                            SelectionOption(
+                                clear_label,
+                                "Revoke every runtime grant",
+                            ),
+                        ),
+                    )
+                    if selected is None:
+                        print("grant selection cancelled")
+                        continue
+                    if selected == clear_label:
+                        service.dispatch(
+                            ClearPermissionGrantsCommand(session_id=state.session_id)
+                        )
+                    else:
+                        grant = labels[selected]
+                        service.dispatch(
+                            RevokePermissionGrantCommand(
+                                session_id=state.session_id,
+                                action=grant.action,
+                                resource=grant.resource,
+                            )
+                        )
+                    changed = service.next_event(timeout=1)
+                    if not isinstance(changed, PermissionGrantsChangedEvent):
+                        raise RuntimeError(
+                            "expected permission.grants.changed, got "
+                            f"{changed.event_type.value}"
+                        )
+                    print(
+                        f"revoked {changed.removed_count} runtime permission "
+                        f"grant{'s' if changed.removed_count != 1 else ''}"
+                    )
+                    continue
                 if user_input == "/sandbox":
                     if state.pending_turn is not None:
                         print(
@@ -774,6 +830,7 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                     print("/model uses Up/Down to choose, Enter to switch, and Esc to cancel.")
                     print("/mode uses the same selector.")
                     print("/permissions selects supervised, accept_edits, or trusted.")
+                    print("/grants reviews exact allow-session grants for this runtime.")
                     print("/sandbox selects the operating-system command boundary.")
                     print("Completed plans open Execute/Revise; /approve runs a saved proposal.")
                     continue
@@ -1288,6 +1345,15 @@ def _print_permission_catalog(current_profile_id: str) -> None:
     for profile in PERMISSION_PROFILES:
         marker = "*" if profile.profile_id == current_profile_id else " "
         print(f"  {marker} {profile.profile_id:<16}{profile.description}")
+
+
+def _print_permission_grants(grants: tuple[ApprovalGrant, ...]) -> None:
+    if not grants:
+        print("No runtime permission grants.")
+        return
+    print("Runtime permission grants (cleared when the runtime stops)")
+    for grant in grants:
+        print(f"  {grant.action:<16}{grant.resource} ({grant.description})")
 
 
 def _print_sandbox_catalog(current_mode: str) -> None:
