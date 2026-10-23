@@ -9,7 +9,6 @@ from typing import Protocol, Sequence
 
 WORKSPACE_WRITE = "workspace-write"
 DANGER_FULL_ACCESS = "danger-full-access"
-SANDBOX_MODES = (WORKSPACE_WRITE, DANGER_FULL_ACCESS)
 DEFAULT_SANDBOX_MODE = WORKSPACE_WRITE
 
 SEATBELT_EXECUTABLE = Path("/usr/bin/sandbox-exec")
@@ -42,13 +41,86 @@ class SandboxUnavailableError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class SandboxProfile:
+    mode: str
+    description: str
+    filesystem_read: str
+    filesystem_write: str
+    network: str
+    dangerous: bool
+
+
+@dataclass(frozen=True)
+class SandboxAvailability:
+    available: bool
+    backend: str | None
+    unavailable_reason: str | None = None
+
+
+SANDBOX_PROFILES = (
+    SandboxProfile(
+        mode=WORKSPACE_WRITE,
+        description=(
+            "Host files are readable; writes are limited to the workspace and temp "
+            "directories, with network access denied."
+        ),
+        filesystem_read="host-readable",
+        filesystem_write="workspace-and-temp",
+        network="denied",
+        dangerous=False,
+    ),
+    SandboxProfile(
+        mode=DANGER_FULL_ACCESS,
+        description=(
+            "No operating-system sandbox; commands inherit the agent process access."
+        ),
+        filesystem_read="unrestricted",
+        filesystem_write="unrestricted",
+        network="allowed",
+        dangerous=True,
+    ),
+)
+SANDBOX_MODES = tuple(profile.mode for profile in SANDBOX_PROFILES)
+
+
+def get_sandbox_profile(mode: str) -> SandboxProfile:
+    for profile in SANDBOX_PROFILES:
+        if profile.mode == mode:
+            return profile
+    raise ValueError(f"unknown sandbox mode: {mode}")
+
+
+def sandbox_availability(
+    mode: str,
+    *,
+    platform: str | None = None,
+) -> SandboxAvailability:
+    get_sandbox_profile(mode)
+    if mode == DANGER_FULL_ACCESS:
+        return SandboxAvailability(available=True, backend="none")
+    selected_platform = platform or platform_module.system()
+    if selected_platform != "Darwin":
+        return SandboxAvailability(
+            available=False,
+            backend=None,
+            unavailable_reason=f"not supported on {selected_platform}",
+        )
+    if not SEATBELT_EXECUTABLE.is_file():
+        return SandboxAvailability(
+            available=False,
+            backend=None,
+            unavailable_reason=f"sandbox executable not found: {SEATBELT_EXECUTABLE}",
+        )
+    return SandboxAvailability(available=True, backend="macos-seatbelt")
+
+
+@dataclass(frozen=True)
 class SandboxPolicy:
     mode: str
     workspace: Path
 
     def __post_init__(self) -> None:
-        if self.mode not in SANDBOX_MODES:
-            raise ValueError(f"unknown sandbox mode: {self.mode}")
+        get_sandbox_profile(self.mode)
         object.__setattr__(self, "workspace", self.workspace.expanduser().resolve())
 
 

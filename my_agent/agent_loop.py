@@ -198,6 +198,9 @@ class AgentLoop:
         self.mode = mode
         self.tools = tools
 
+    def switch_sandbox(self, mode: str) -> None:
+        self.sandbox_policy = SandboxPolicy(mode=mode, workspace=self.workspace.root)
+
     def approve_plan(self, state: SessionState) -> ProposedPlan:
         if state.pending_turn is not None:
             raise ValueError("cannot approve a plan while a turn is pending")

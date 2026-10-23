@@ -454,3 +454,18 @@ observation 中记录实际 `sandbox_mode` 和 `sandbox_backend`。
 - `danger-full-access` 是显式逃生口；`trusted` permission profile 只跳过审批，不绕过 sandbox。
 - session、CLI toolbar、AppServer view 和 Web topbar 都显示同一持久化 sandbox mode。
 - 不支持的平台返回 `sandbox_error`，不静默降级为无隔离执行。
+
+## Milestone 26: Sandbox Control Plane
+
+Sandbox policy 从启动参数和只读状态提升为可查询、可切换的 session 控制面。
+
+- `SANDBOX_PROFILES` 明确描述每种模式的宿主读取、写入范围、网络、危险级别和 backend 可用性；
+  `sandbox.list` 将这些事实提供给客户端，不让 UI 猜测安全语义。
+- `SwitchSandboxCommand` 与 `SandboxChangedEvent` 进入 typed protocol；`AgentService` 只在 turn 边界切换，
+  更新 runtime policy、持久化 `session.json`，再发布事件。
+- `session.create` 可指定 `sandbox_mode`；CLI `/sandbox` 和 Web 顶栏选择器调用同一控制面。
+  不可用 backend 在 Web 中禁选，`danger-full-access` 显式标为高风险。
+- `exec_command` 的 approval details 包含实际 sandbox mode、写入边界和网络策略，用户批准的是完整
+  执行条件，而不只是 argv。
+- 本里程碑仍未增加 Linux/Windows backend，也没有把 permission approval 与 OS sandbox 合并；
+  前者决定“是否允许执行”，后者决定“获准后进程实际上能访问什么”。

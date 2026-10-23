@@ -14,7 +14,7 @@ from .messages import ToolCall
 from .control import ApprovalBroker, AutoApproveBroker, PermissionRequest
 from .patches import MAX_PATCH_CHARS, apply_patch, parse_patch
 from .permissions import PermissionPolicy
-from .sandbox import DEFAULT_SANDBOX_MODE, SandboxPolicy
+from .sandbox import DEFAULT_SANDBOX_MODE, SandboxPolicy, get_sandbox_profile
 from .workspace import Workspace, WorkspaceError
 
 
@@ -268,6 +268,11 @@ class ExecCommandTool(ToolBase):
             timeout = _command_timeout(arguments.get("timeout_seconds"), ctx.timeout_seconds)
         except (ValueError, WorkspaceError):
             return None
+        policy = ctx.sandbox_policy or SandboxPolicy(
+            mode=DEFAULT_SANDBOX_MODE,
+            workspace=ctx.workspace.root,
+        )
+        sandbox = get_sandbox_profile(policy.mode)
         resource = shlex.join(decision.argv)
         return PermissionRequest(
             action="exec_command",
@@ -278,6 +283,13 @@ class ExecCommandTool(ToolBase):
                 "cwd": relative_cwd,
                 "timeout_seconds": timeout,
                 "category": decision.category,
+                "sandbox": {
+                    "mode": sandbox.mode,
+                    "filesystem_read": sandbox.filesystem_read,
+                    "filesystem_write": sandbox.filesystem_write,
+                    "network": sandbox.network,
+                    "dangerous": sandbox.dangerous,
+                },
             },
         )
 

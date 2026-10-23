@@ -379,17 +379,6 @@ textarea:disabled {
   gap: 8px;
 }
 
-.sandbox-status {
-  flex: 0 0 auto;
-  padding: 4px 7px;
-  border: 1px solid var(--border);
-  border-radius: 5px;
-  color: var(--muted);
-  background: var(--surface-muted);
-  font-size: 11px;
-  line-height: 1;
-}
-
 .mode-selector {
   display: flex;
   height: 30px;
@@ -466,6 +455,10 @@ textarea:disabled {
   width: 132px;
 }
 
+.sandbox-menu .choice-menu-trigger {
+  width: 148px;
+}
+
 .choice-menu-popover {
   position: absolute;
   top: calc(100% + 6px);
@@ -486,6 +479,10 @@ textarea:disabled {
   width: 252px;
 }
 
+.sandbox-menu .choice-menu-popover {
+  width: 320px;
+}
+
 .choice-menu-option {
   display: grid;
   width: 100%;
@@ -503,6 +500,11 @@ textarea:disabled {
 .choice-menu-option:hover,
 .choice-menu-option:focus-visible {
   background: var(--surface-muted);
+}
+
+.choice-menu-option:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
 }
 
 .choice-menu-option-copy {
@@ -525,6 +527,13 @@ textarea:disabled {
 .choice-menu-option-copy span {
   color: var(--muted);
   font-size: 11px;
+}
+
+.sandbox-menu .choice-menu-option-copy span {
+  overflow: visible;
+  line-height: 1.35;
+  text-overflow: clip;
+  white-space: normal;
 }
 
 .choice-menu-check {
@@ -1164,9 +1173,44 @@ textarea:disabled {
   .inspector-close {
     display: inline-grid;
   }
+
+  .choice-menu-kicker {
+    display: none;
+  }
+
+  .choice-menu-trigger {
+    width: 150px;
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .sandbox-menu .choice-menu-trigger {
+    width: 120px;
+  }
+
+  .permission-menu .choice-menu-trigger {
+    width: 100px;
+  }
 }
 
-@media (max-width: 720px) {
+@media (max-width: 900px) {
+  .mode-selector {
+    display: none;
+  }
+
+  .choice-menu-trigger {
+    width: 120px;
+  }
+
+  .sandbox-menu .choice-menu-trigger {
+    width: 100px;
+  }
+
+  .permission-menu .choice-menu-trigger {
+    width: 90px;
+  }
+}
+
+@media (max-width: 760px) {
   .app-shell {
     display: block;
   }
@@ -1219,9 +1263,12 @@ textarea:disabled {
   }
 
   .connection-status,
-  .sandbox-status,
   .session-title-edit,
   .choice-menu-kicker {
+    display: none;
+  }
+
+  .sandbox-menu {
     display: none;
   }
 
@@ -1259,7 +1306,8 @@ textarea:disabled {
   }
 
   .choice-menu-popover,
-  .permission-menu .choice-menu-popover {
+  .permission-menu .choice-menu-popover,
+  .sandbox-menu .choice-menu-popover {
     position: fixed;
     top: 47px;
     right: 8px;

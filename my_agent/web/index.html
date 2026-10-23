@@ -38,7 +38,22 @@
           </div>
           <div class="topbar-controls">
             <div class="mode-selector" id="mode-selector" aria-label="协作模式"></div>
-            <span class="sandbox-status" id="sandbox-status" title="命令执行沙箱">沙箱 未选择</span>
+            <div class="choice-menu sandbox-menu">
+              <button
+                class="choice-menu-trigger"
+                id="sandbox-menu-trigger"
+                type="button"
+                aria-haspopup="listbox"
+                aria-expanded="false"
+                aria-controls="sandbox-menu"
+                disabled
+              >
+                <span class="choice-menu-kicker">沙箱</span>
+                <span class="choice-menu-value" id="sandbox-menu-value">未选择</span>
+                <span class="choice-menu-chevron" aria-hidden="true">⌄</span>
+              </button>
+              <div class="choice-menu-popover" id="sandbox-menu" role="listbox" aria-label="选择命令沙箱" hidden></div>
+            </div>
             <div class="choice-menu model-menu">
               <button
                 class="choice-menu-trigger"

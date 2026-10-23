@@ -1523,6 +1523,31 @@ class MyAgentTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "turn is pending"):
                 runtime.switch_model(_model(initial))
 
+    def test_agent_runtime_switches_sandbox_only_at_turn_boundaries(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace_path = Path(tmpdir, "workspace")
+            workspace_path.mkdir()
+            state = SessionStore(Path(tmpdir, "sessions")).create(workspace_path)
+            loop = AgentLoop(
+                workspace=Workspace(workspace_path),
+                model=_model(ScriptedProviderAdapter([])),
+                tools=ToolRegistry([]),
+                permissions=PermissionPolicy(),
+                trace=TraceRecorder(state.trace_path),
+            )
+            runtime = AgentRuntime(loop, state, interactive_approvals=True)
+
+            runtime.switch_sandbox(DANGER_FULL_ACCESS)
+
+            self.assertEqual(loop.sandbox_policy.mode, DANGER_FULL_ACCESS)
+            state.pending_turn = PendingTurn(
+                turn_id=f"{state.session_id}:1",
+                task="pending",
+                message_start=0,
+            )
+            with self.assertRaisesRegex(RuntimeError, "turn is pending"):
+                runtime.switch_sandbox(WORKSPACE_WRITE)
+
     def test_context_manager_compacts_old_turns_and_preserves_recent_messages(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace_path = Path(tmpdir, "workspace")
@@ -2006,7 +2031,7 @@ class MyAgentTests(unittest.TestCase):
                     "--credentials",
                     str(Path(tmpdir, "credentials.json")),
                 ],
-                input="/help\n/exit\n",
+                input="/sandbox\n/help\n/exit\n",
                 text=True,
                 capture_output=True,
                 cwd=Path(__file__).resolve().parents[1],
@@ -2014,7 +2039,9 @@ class MyAgentTests(unittest.TestCase):
             )
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("Current sandbox: workspace-write", completed.stdout)
         self.assertIn("/help       Show slash commands", completed.stdout)
+        self.assertIn("/sandbox", completed.stdout)
         self.assertIn("use Up/Down and Enter to run", completed.stdout)
 
     def test_chat_config_shows_paths_without_credentials(self):
@@ -2650,6 +2677,23 @@ class MyAgentTests(unittest.TestCase):
 
         self.assertEqual(outcome.decision, ApprovalDecision.DENY)
         self.assertEqual(outcome.source, "unavailable")
+
+    def test_exec_command_approval_describes_sandbox_boundary(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Workspace(tmpdir)
+            request = ExecCommandTool().permission_request(
+                {"argv": ["pytest", "-q"]},
+                ToolContext(
+                    workspace=workspace,
+                    permissions=PermissionPolicy(),
+                    sandbox_policy=SandboxPolicy(WORKSPACE_WRITE, workspace.root),
+                ),
+            )
+
+        self.assertIsNotNone(request)
+        self.assertEqual(request.details["sandbox"]["mode"], WORKSPACE_WRITE)
+        self.assertEqual(request.details["sandbox"]["network"], "denied")
+        self.assertFalse(request.details["sandbox"]["dangerous"])
 
     def test_exec_command_validates_argv_and_workspace_relative_cwd(self):
         with tempfile.TemporaryDirectory() as tmpdir:

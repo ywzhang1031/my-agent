@@ -192,6 +192,14 @@ class AgentRuntime:
             raise RuntimeError("cannot switch permissions while a turn is pending")
         self.loop.permissions.switch_profile(profile_id)
 
+    def switch_sandbox(self, mode: str) -> None:
+        with self._lock:
+            if self._worker is not None and self._worker.is_alive():
+                raise RuntimeError("cannot switch sandbox while a turn is running")
+        if self.session.pending_turn is not None:
+            raise RuntimeError("cannot switch sandbox while a turn is pending")
+        self.loop.switch_sandbox(mode)
+
     def wait(self, timeout: float = 5.0) -> None:
         with self._lock:
             worker = self._worker

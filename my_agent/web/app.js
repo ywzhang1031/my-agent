@@ -15,7 +15,6 @@ const elements = {
   sessionContextMenu: document.querySelector("#session-context-menu"),
   sessionMenuRename: document.querySelector("#session-menu-rename"),
   connectionStatus: document.querySelector("#connection-status"),
-  sandboxStatus: document.querySelector("#sandbox-status"),
   conversation: document.querySelector("#conversation"),
   emptyState: document.querySelector("#empty-state"),
   newSession: document.querySelector("#new-session"),
@@ -24,6 +23,9 @@ const elements = {
   inspectorClose: document.querySelector("#inspector-close"),
   backdrop: document.querySelector("#backdrop"),
   modeSelector: document.querySelector("#mode-selector"),
+  sandboxMenuTrigger: document.querySelector("#sandbox-menu-trigger"),
+  sandboxMenuValue: document.querySelector("#sandbox-menu-value"),
+  sandboxMenu: document.querySelector("#sandbox-menu"),
   modelMenuTrigger: document.querySelector("#model-menu-trigger"),
   modelMenuValue: document.querySelector("#model-menu-value"),
   modelMenu: document.querySelector("#model-menu"),
@@ -68,6 +70,7 @@ const state = {
   models: [],
   modes: [],
   permissionProfiles: [],
+  sandboxProfiles: [],
   selectedSession: null,
   busySessions: new Set(),
   attentionSessions: new Set(),
@@ -92,6 +95,11 @@ const permissionLabels = {
   supervised: "监督",
   accept_edits: "自动编辑",
   trusted: "可信",
+};
+
+const sandboxLabels = {
+  "workspace-write": "工作区写入",
+  "danger-full-access": "完全访问",
 };
 
 function requestID() {
@@ -418,13 +426,45 @@ function renderPermissionCatalog() {
   }
 }
 
-function createChoiceOption({ value, label, description, onSelect }) {
+function renderSandboxCatalog() {
+  const fragment = document.createDocumentFragment();
+  for (const profile of state.sandboxProfiles) {
+    const availability = profile.available
+      ? profile.description
+      : `${profile.description} 不可用：${profile.unavailable_reason || "缺少 backend"}`;
+    fragment.append(
+      createChoiceOption({
+        value: profile.mode,
+        label: sandboxLabels[profile.mode] || profile.mode,
+        description: profile.dangerous ? `高风险：${availability}` : availability,
+        disabled: !profile.available,
+        onSelect: switchSandbox,
+      }),
+    );
+  }
+  elements.sandboxMenu.replaceChildren(fragment);
+  if (!elements.sandboxMenuTrigger.dataset.value) {
+    const profile = state.sandboxProfiles[0];
+    if (profile) {
+      setChoiceMenuValue(
+        elements.sandboxMenuTrigger,
+        elements.sandboxMenuValue,
+        elements.sandboxMenu,
+        profile.mode,
+        sandboxLabels[profile.mode] || profile.mode,
+      );
+    }
+  }
+}
+
+function createChoiceOption({ value, label, description, disabled = false, onSelect }) {
   const button = document.createElement("button");
   button.type = "button";
   button.className = "choice-menu-option";
   button.dataset.value = value;
   button.setAttribute("role", "option");
   button.setAttribute("aria-selected", "false");
+  button.disabled = disabled;
 
   const copy = document.createElement("span");
   copy.className = "choice-menu-option-copy";
@@ -460,6 +500,7 @@ function setChoiceMenuValue(trigger, valueElement, menu, value, label) {
 
 function closeChoiceMenus(except = null) {
   for (const [trigger, menu] of [
+    [elements.sandboxMenuTrigger, elements.sandboxMenu],
     [elements.modelMenuTrigger, elements.modelMenu],
     [elements.permissionMenuTrigger, elements.permissionMenu],
   ]) {
@@ -474,7 +515,7 @@ function openChoiceMenu(trigger, menu, direction = 1) {
   closeChoiceMenus(menu);
   menu.hidden = false;
   trigger.setAttribute("aria-expanded", "true");
-  const options = [...menu.querySelectorAll(".choice-menu-option")];
+  const options = [...menu.querySelectorAll(".choice-menu-option:not(:disabled)")];
   const selected = options.find((option) => option.getAttribute("aria-selected") === "true");
   const target = selected || (direction < 0 ? options.at(-1) : options[0]);
   target?.focus();
@@ -492,7 +533,7 @@ function bindChoiceMenu(trigger, menu) {
     }
   });
   menu.addEventListener("keydown", (event) => {
-    const options = [...menu.querySelectorAll(".choice-menu-option")];
+    const options = [...menu.querySelectorAll(".choice-menu-option:not(:disabled)")];
     const index = options.indexOf(document.activeElement);
     if (event.key === "Escape") {
       event.preventDefault();
@@ -527,9 +568,7 @@ function updateControls() {
   elements.stopTurn.hidden = !busy;
   elements.modelMenuTrigger.disabled = !enabled || busy || pending;
   elements.permissionMenuTrigger.disabled = !enabled || busy || pending;
-  elements.sandboxStatus.textContent = session?.sandbox_mode
-    ? `沙箱 ${session.sandbox_mode}`
-    : "沙箱 未选择";
+  elements.sandboxMenuTrigger.disabled = busy || pending || !state.sandboxProfiles.length;
 
   if (session?.provider_id && session?.model_id) {
     const modelRef = `${session.provider_id}/${session.model_id}`;
@@ -549,6 +588,15 @@ function updateControls() {
       elements.permissionMenu,
       session.permission_profile_id,
       permissionLabels[session.permission_profile_id] || session.permission_profile_id,
+    );
+  }
+  if (session?.sandbox_mode) {
+    setChoiceMenuValue(
+      elements.sandboxMenuTrigger,
+      elements.sandboxMenuValue,
+      elements.sandboxMenu,
+      session.sandbox_mode,
+      sandboxLabels[session.sandbox_mode] || session.sandbox_mode,
     );
   }
   for (const button of elements.modeSelector.querySelectorAll("button")) {
@@ -1064,6 +1112,9 @@ async function createSession() {
   if (elements.permissionMenuTrigger.dataset.value) {
     params.permission_profile_id = elements.permissionMenuTrigger.dataset.value;
   }
+  if (elements.sandboxMenuTrigger.dataset.value) {
+    params.sandbox_mode = elements.sandboxMenuTrigger.dataset.value;
+  }
   const selectedMode = elements.modeSelector.querySelector('[aria-pressed="true"]');
   if (selectedMode?.dataset.modeId) params.mode_id = selectedMode.dataset.modeId;
   try {
@@ -1262,6 +1313,27 @@ async function switchPermissionProfile(profileID) {
   }
 }
 
+async function switchSandbox(mode) {
+  const sessionID = selectedSessionID();
+  if (!sessionID) {
+    setChoiceMenuValue(
+      elements.sandboxMenuTrigger,
+      elements.sandboxMenuValue,
+      elements.sandboxMenu,
+      mode,
+      sandboxLabels[mode] || mode,
+    );
+    return;
+  }
+  if (mode === state.selectedSession.sandbox_mode) return;
+  try {
+    await rpc("sandbox.switch", { session_id: sessionID, mode });
+  } catch (error) {
+    updateControls();
+    showToast(`沙箱切换失败：${error.message}`);
+  }
+}
+
 async function resolveApproval(decision) {
   const approval = state.pendingApproval;
   if (!approval || approval.sessionID !== selectedSessionID()) return;
@@ -1290,7 +1362,14 @@ function showApproval(sessionID, payload) {
   if (details.patch_preview) {
     elements.approvalDetails.textContent = details.patch_preview;
   } else if (details.argv) {
-    elements.approvalDetails.textContent = `${compactJSON(details.argv)}\ncwd: ${details.cwd || "."}`;
+    const lines = [compactJSON(details.argv), `cwd: ${details.cwd || "."}`];
+    if (details.sandbox) {
+      lines.push(
+        `sandbox: ${details.sandbox.mode}`,
+        `write: ${details.sandbox.filesystem_write}; network: ${details.sandbox.network}`,
+      );
+    }
+    elements.approvalDetails.textContent = lines.join("\n");
   } else {
     elements.approvalDetails.textContent = payload.resource || "";
   }
@@ -1601,6 +1680,13 @@ async function handleEvent(event) {
       }
       addActivity(eventLabel(sessionID, "权限已切换"), payload.profile_id, "success");
       break;
+    case "sandbox.changed":
+      if (sessionID === selectedSessionID()) {
+        state.selectedSession.sandbox_mode = payload.mode;
+        updateControls();
+      }
+      addActivity(eventLabel(sessionID, "沙箱已切换"), payload.mode, "success");
+      break;
     case "plan.approved":
       if (sessionID === selectedSessionID()) {
         state.selectedSession.mode_id = payload.mode_id;
@@ -1740,6 +1826,7 @@ function bindUI() {
   });
   bindChoiceMenu(elements.modelMenuTrigger, elements.modelMenu);
   bindChoiceMenu(elements.permissionMenuTrigger, elements.permissionMenu);
+  bindChoiceMenu(elements.sandboxMenuTrigger, elements.sandboxMenu);
   document.addEventListener("pointerdown", (event) => {
     if (!event.target.closest(".choice-menu")) closeChoiceMenus();
     if (
@@ -1783,21 +1870,25 @@ async function initialize() {
   bindUI();
   resetContext();
   try {
-    const [models, modes, permissions, sessions] = await Promise.all([
+    const [models, modes, permissions, sandboxes, sessions] = await Promise.all([
       rpc("model.list"),
       rpc("mode.list"),
       rpc("permission.list"),
+      rpc("sandbox.list"),
       rpc("session.list"),
     ]);
     state.models = models.models || [];
     state.credentialsPath = models.credentials_path || "";
     state.modes = modes.modes || [];
     state.permissionProfiles = permissions.profiles || [];
+    state.sandboxProfiles = sandboxes.profiles || [];
     state.sessions = sessions.sessions || [];
     renderModelCatalog();
     renderModeCatalog();
     renderPermissionCatalog();
+    renderSandboxCatalog();
     renderSessionList();
+    updateControls();
     await subscribeEvents();
     pollEvents();
     setConnection("已连接", "online");

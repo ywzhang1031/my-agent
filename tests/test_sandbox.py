@@ -7,16 +7,49 @@ from pathlib import Path
 from my_agent.execution import _process_status
 from my_agent.sandbox import (
     DANGER_FULL_ACCESS,
+    SANDBOX_PROFILES,
     WORKSPACE_WRITE,
     DangerFullAccessBackend,
     MacOSSeatbeltBackend,
     SandboxPolicy,
     SandboxUnavailableError,
+    get_sandbox_profile,
     prepare_sandbox_command,
+    sandbox_availability,
 )
 
 
 class SandboxTests(unittest.TestCase):
+    def test_profile_catalog_describes_effective_security_boundaries(self) -> None:
+        self.assertEqual(
+            [profile.mode for profile in SANDBOX_PROFILES],
+            [WORKSPACE_WRITE, DANGER_FULL_ACCESS],
+        )
+
+        workspace_write = get_sandbox_profile(WORKSPACE_WRITE)
+        self.assertEqual(workspace_write.filesystem_read, "host-readable")
+        self.assertEqual(workspace_write.filesystem_write, "workspace-and-temp")
+        self.assertEqual(workspace_write.network, "denied")
+        self.assertFalse(workspace_write.dangerous)
+
+        full_access = get_sandbox_profile(DANGER_FULL_ACCESS)
+        self.assertEqual(full_access.filesystem_write, "unrestricted")
+        self.assertEqual(full_access.network, "allowed")
+        self.assertTrue(full_access.dangerous)
+
+        with self.assertRaisesRegex(ValueError, "unknown sandbox mode"):
+            get_sandbox_profile("unknown")
+
+    def test_availability_reports_backend_without_silent_fallback(self) -> None:
+        unsupported = sandbox_availability(WORKSPACE_WRITE, platform="Linux")
+        full_access = sandbox_availability(DANGER_FULL_ACCESS, platform="Linux")
+
+        self.assertFalse(unsupported.available)
+        self.assertIsNone(unsupported.backend)
+        self.assertIn("not supported", unsupported.unavailable_reason)
+        self.assertTrue(full_access.available)
+        self.assertEqual(full_access.backend, "none")
+
     def test_danger_full_access_leaves_command_unchanged(self) -> None:
         policy = SandboxPolicy(mode=DANGER_FULL_ACCESS, workspace=Path("/tmp/workspace"))
 

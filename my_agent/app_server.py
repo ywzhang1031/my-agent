@@ -23,15 +23,20 @@ from .protocol import (
     SwitchModeCommand,
     SwitchModelCommand,
     SwitchPermissionProfileCommand,
+    SwitchSandboxCommand,
 )
 from .rpc import RequestEnvelope, ResponseEnvelope
 from .runtime import AgentRuntime
+from .sandbox import SANDBOX_PROFILES, get_sandbox_profile, sandbox_availability
 from .service import AgentService, ServiceSessionView
 from .server_instance import ServerInstanceLease
 from .session import SessionState, SessionStore, message_to_dict
 
 
-RuntimeFactory = Callable[[SessionState, str | None, str | None], AgentRuntime]
+RuntimeFactory = Callable[
+    [SessionState, str | None, str | None, str | None, str | None],
+    AgentRuntime,
+]
 CredentialSetter = Callable[[str, str], Mapping[str, Any] | None]
 
 
@@ -156,6 +161,7 @@ class AppServer:
             "provider.credential.set": self._set_provider_credential,
             "mode.list": self._list_modes,
             "permission.list": self._list_permission_profiles,
+            "sandbox.list": self._list_sandbox_profiles,
             "context.inspect": self._inspect_context,
             "turn.start": self._start_turn,
             "turn.retry": self._retry_turn,
@@ -164,6 +170,7 @@ class AppServer:
             "model.switch": self._switch_model,
             "mode.switch": self._switch_mode,
             "permission.switch": self._switch_permission_profile,
+            "sandbox.switch": self._switch_sandbox,
             "plan.execute": self._execute_plan,
             "plan.revise": self._revise_plan,
             "turn.abort": self._abort_turn,
@@ -181,7 +188,12 @@ class AppServer:
     def _create_session(self, params: dict[str, Any]) -> dict[str, Any]:
         self._check_params(
             params,
-            optional={"model_ref", "mode_id", "permission_profile_id"},
+            optional={
+                "model_ref",
+                "mode_id",
+                "permission_profile_id",
+                "sandbox_mode",
+            },
         )
         model_ref = self._optional_string(params, "model_ref")
         mode_id = self._optional_string(params, "mode_id")
@@ -189,17 +201,34 @@ class AppServer:
             params,
             "permission_profile_id",
         )
+        sandbox_mode = self._optional_string(params, "sandbox_mode")
         if model_ref is not None and model_ref not in {model.ref for model in self._models}:
             raise ValueError(f"unknown model: {model_ref}")
         if mode_id is not None and mode_id not in {mode.mode_id for mode in self._modes}:
             raise ValueError(f"unknown collaboration mode: {mode_id}")
         if permission_profile_id is not None:
             get_permission_profile(permission_profile_id)
+        if sandbox_mode is not None:
+            get_sandbox_profile(sandbox_mode)
+            availability = sandbox_availability(sandbox_mode)
+            if not availability.available:
+                raise RuntimeError(
+                    f"sandbox mode {sandbox_mode!r} is unavailable: "
+                    f"{availability.unavailable_reason}"
+                )
         with self._lifecycle_lock:
             state = self.session_store.create(self.workspace)
             if permission_profile_id is not None:
                 state.permission_profile_id = permission_profile_id
-            self._attach(state, model_ref=model_ref, mode_id=mode_id)
+            if sandbox_mode is not None:
+                state.sandbox_mode = sandbox_mode
+            self._attach(
+                state,
+                model_ref=model_ref,
+                mode_id=mode_id,
+                permission_profile_id=permission_profile_id,
+                sandbox_mode=sandbox_mode,
+            )
         return {"session": self._active_session_to_dict(state.session_id)}
 
     def _list_sessions(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -347,6 +376,26 @@ class AppServer:
             ]
         }
 
+    def _list_sandbox_profiles(self, params: dict[str, Any]) -> dict[str, Any]:
+        self._check_params(params)
+        profiles = []
+        for profile in SANDBOX_PROFILES:
+            availability = sandbox_availability(profile.mode)
+            profiles.append(
+                {
+                    "mode": profile.mode,
+                    "description": profile.description,
+                    "filesystem_read": profile.filesystem_read,
+                    "filesystem_write": profile.filesystem_write,
+                    "network": profile.network,
+                    "dangerous": profile.dangerous,
+                    "available": availability.available,
+                    "backend": availability.backend,
+                    "unavailable_reason": availability.unavailable_reason,
+                }
+            )
+        return {"profiles": profiles}
+
     def _inspect_context(self, params: dict[str, Any]) -> dict[str, Any]:
         session_id = self._session_id(params)
         self._require_active_session(session_id)
@@ -405,6 +454,23 @@ class AppServer:
             SwitchPermissionProfileCommand(
                 session_id=self._required_string(params, "session_id"),
                 profile_id=profile_id,
+            )
+        )
+
+    def _switch_sandbox(self, params: dict[str, Any]) -> dict[str, Any]:
+        self._check_params(params, required={"session_id", "mode"})
+        mode = self._required_string(params, "mode")
+        get_sandbox_profile(mode)
+        availability = sandbox_availability(mode)
+        if not availability.available:
+            raise RuntimeError(
+                f"sandbox mode {mode!r} is unavailable: "
+                f"{availability.unavailable_reason}"
+            )
+        return self._dispatch_command(
+            SwitchSandboxCommand(
+                session_id=self._required_string(params, "session_id"),
+                mode=mode,
             )
         )
 
@@ -491,9 +557,17 @@ class AppServer:
         *,
         model_ref: str | None = None,
         mode_id: str | None = None,
+        permission_profile_id: str | None = None,
+        sandbox_mode: str | None = None,
     ) -> None:
         self._require_workspace(state)
-        runtime = self._runtime_factory(state, model_ref, mode_id)
+        runtime = self._runtime_factory(
+            state,
+            model_ref,
+            mode_id,
+            permission_profile_id,
+            sandbox_mode,
+        )
         self.agent_service.register(runtime)
         self.session_store.save(state)
 

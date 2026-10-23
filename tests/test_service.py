@@ -17,10 +17,12 @@ from my_agent.protocol import (
     ItemDeltaEvent,
     RenameSessionCommand,
     ResolveApprovalCommand,
+    SandboxChangedEvent,
     SessionRenamedEvent,
     StartTurnCommand,
     SwitchModeCommand,
     SwitchPermissionProfileCommand,
+    SwitchSandboxCommand,
     PermissionProfileChangedEvent,
     TurnCompletedEvent,
     TurnContinuationRequiredEvent,
@@ -30,6 +32,7 @@ from my_agent.protocol import (
     event_to_dict,
 )
 from my_agent.runtime import RuntimeEvent, RuntimeState, StartTurn
+from my_agent.sandbox import DANGER_FULL_ACCESS, WORKSPACE_WRITE, SandboxPolicy
 from my_agent.service import AgentService
 from my_agent.event_store import EventStore
 from my_agent.session import PendingTurn, ProposedPlan, SessionState
@@ -52,11 +55,12 @@ class _Model:
 
 
 class _Loop:
-    def __init__(self) -> None:
+    def __init__(self, workspace: Path) -> None:
         self.model = _Model()
         self.mode = PLAN_MODE
         self.tools = object()
         self.permissions = PermissionPolicy()
+        self.sandbox_policy = SandboxPolicy(WORKSPACE_WRITE, workspace)
 
     def switch_mode(self, mode, tools) -> None:
         self.mode = mode
@@ -72,7 +76,7 @@ class _Loop:
 class _Runtime:
     def __init__(self, state: SessionState) -> None:
         self.session = state
-        self.loop = _Loop()
+        self.loop = _Loop(Path(state.workspace))
         self.state = RuntimeState.IDLE
         self.events: queue.Queue[RuntimeEvent] = queue.Queue()
         self.commands = []
@@ -89,6 +93,9 @@ class _Runtime:
 
     def switch_permission_profile(self, profile_id: str) -> None:
         self.loop.permissions.switch_profile(profile_id)
+
+    def switch_sandbox(self, mode: str) -> None:
+        self.loop.sandbox_policy = SandboxPolicy(mode, Path(self.session.workspace))
 
     def wait(self, timeout=5.0) -> None:
         return None
@@ -122,6 +129,24 @@ class ProtocolTests(unittest.TestCase):
             state=AgentState.IDLE,
             event_id="event-1",
             title="Provider adapter work",
+        )
+
+        self.assertEqual(command_from_dict(command_to_dict(command)), command)
+        self.assertEqual(event_from_dict(event_to_dict(event)), event)
+
+    def test_sandbox_protocol_round_trip(self) -> None:
+        command = SwitchSandboxCommand(
+            session_id="session-1",
+            command_id="command-1",
+            mode=DANGER_FULL_ACCESS,
+        )
+        event = SandboxChangedEvent(
+            session_id="session-1",
+            turn_id=None,
+            sequence=5,
+            state=AgentState.IDLE,
+            event_id="event-1",
+            mode=DANGER_FULL_ACCESS,
         )
 
         self.assertEqual(command_from_dict(command_to_dict(command)), command)
@@ -286,6 +311,33 @@ class AgentServiceTests(unittest.TestCase):
             self.assertEqual(state.permission_profile_id, "accept_edits")
             self.assertEqual(runtime.loop.permissions.profile.profile_id, "accept_edits")
             self.assertEqual(saved, ["accept_edits"])
+            service.close()
+
+    def test_sandbox_switch_is_persisted_and_emits_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._state(Path(tmp))
+            runtime = _Runtime(state)
+            saved = []
+            service = AgentService(
+                tool_registry_factory=lambda mode: object(),
+                save_session=lambda session: saved.append(session.sandbox_mode),
+            )
+            service.register(runtime)
+            subscription_id = self._subscribe(service, state.session_id)
+
+            service.dispatch(
+                SwitchSandboxCommand(
+                    session_id=state.session_id,
+                    mode=DANGER_FULL_ACCESS,
+                )
+            )
+            event = service.next_event(subscription_id, timeout=1)
+
+            self.assertIsInstance(event, SandboxChangedEvent)
+            self.assertEqual(event.mode, DANGER_FULL_ACCESS)
+            self.assertEqual(state.sandbox_mode, DANGER_FULL_ACCESS)
+            self.assertEqual(runtime.loop.sandbox_policy.mode, DANGER_FULL_ACCESS)
+            self.assertEqual(saved, [DANGER_FULL_ACCESS])
             service.close()
 
     def test_session_rename_is_persisted_and_emits_event(self) -> None:

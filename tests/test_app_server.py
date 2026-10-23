@@ -21,6 +21,7 @@ from my_agent.rpc import (
     response_to_dict,
 )
 from my_agent.runtime import RuntimeEvent, RuntimeState, StartTurn
+from my_agent.sandbox import DANGER_FULL_ACCESS, WORKSPACE_WRITE, SandboxPolicy
 from my_agent.service import AgentService
 from my_agent.server_instance import ServerInstanceConflictError, ServerInstanceLease
 from my_agent.session import PendingTurn, SessionState, SessionStore
@@ -36,11 +37,12 @@ class _Model:
 
 
 class _Loop:
-    def __init__(self, mode_id: str) -> None:
+    def __init__(self, mode_id: str, sandbox_mode: str, workspace: Path) -> None:
         self.model = _Model()
         self.mode = get_mode(mode_id)
         self.tools = _Tools(self.mode.tool_names)
         self.permissions = PermissionPolicy()
+        self.sandbox_policy = SandboxPolicy(sandbox_mode, workspace)
 
     def inspect_context(self, state):
         return _ContextSnapshot()
@@ -78,7 +80,7 @@ class _Tools:
 class _Runtime:
     def __init__(self, state: SessionState, mode_id: str) -> None:
         self.session = state
-        self.loop = _Loop(mode_id)
+        self.loop = _Loop(mode_id, state.sandbox_mode, Path(state.workspace))
         self.state = RuntimeState.IDLE
         self.events: queue.Queue[RuntimeEvent] = queue.Queue()
         self.commands = []
@@ -118,6 +120,9 @@ class _Runtime:
     def switch_permission_profile(self, profile_id: str) -> None:
         self.loop.permissions.switch_profile(profile_id)
 
+    def switch_sandbox(self, mode: str) -> None:
+        self.loop.sandbox_policy = SandboxPolicy(mode, Path(self.session.workspace))
+
 
 class AppServerTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -138,6 +143,8 @@ class AppServerTests(unittest.TestCase):
             state: SessionState,
             model_ref: str | None,
             mode_id: str | None,
+            permission_profile_id: str | None,
+            sandbox_mode: str | None,
         ) -> _Runtime:
             if model_ref is not None and model_ref != "test/test-model":
                 raise ValueError(f"unknown test model: {model_ref}")
@@ -146,6 +153,10 @@ class AppServerTests(unittest.TestCase):
             state.provider_id = "test"
             state.model_id = "test-model"
             state.mode_id = selected_mode
+            if permission_profile_id is not None:
+                state.permission_profile_id = permission_profile_id
+            if sandbox_mode is not None:
+                state.sandbox_mode = sandbox_mode
             runtime = _Runtime(state, selected_mode)
             self.runtimes[state.session_id] = runtime
             return runtime
@@ -259,6 +270,7 @@ class AppServerTests(unittest.TestCase):
         models = self.rpc("model.list")
         modes = self.rpc("mode.list")
         permissions = self.rpc("permission.list")
+        sandboxes = self.rpc("sandbox.list")
         context = self.rpc("context.inspect", session_id=session_id)
 
         self.assertEqual(listed.result["sessions"][0]["session_id"], session_id)
@@ -277,6 +289,12 @@ class AppServerTests(unittest.TestCase):
             [item["profile_id"] for item in permissions.result["profiles"]],
             ["supervised", "accept_edits", "trusted"],
         )
+        self.assertEqual(
+            [item["mode"] for item in sandboxes.result["profiles"]],
+            [WORKSPACE_WRITE, DANGER_FULL_ACCESS],
+        )
+        self.assertFalse(sandboxes.result["profiles"][0]["dangerous"])
+        self.assertTrue(sandboxes.result["profiles"][1]["dangerous"])
         self.assertEqual(context.result["context"]["estimated_tokens"], 125)
 
         renamed = self.rpc(
@@ -317,6 +335,28 @@ class AppServerTests(unittest.TestCase):
         self.assertEqual(
             self.store.load(session_id).permission_profile_id,
             "accept_edits",
+        )
+
+        switched_sandbox = self.rpc(
+            "sandbox.switch",
+            session_id=session_id,
+            mode=DANGER_FULL_ACCESS,
+        )
+        self.assertTrue(switched_sandbox.ok, switched_sandbox.error)
+        sandbox_event = self.app.next_event(self.subscription_id, timeout=1)
+        self.assertEqual(sandbox_event.mode, DANGER_FULL_ACCESS)
+        self.assertEqual(self.store.load(session_id).sandbox_mode, DANGER_FULL_ACCESS)
+
+    def test_session_create_accepts_sandbox_mode(self) -> None:
+        session_id = self.create_session(sandbox_mode=DANGER_FULL_ACCESS)
+
+        self.assertEqual(
+            self.rpc("session.read", session_id=session_id).result["session"]["sandbox_mode"],
+            DANGER_FULL_ACCESS,
+        )
+        self.assertEqual(
+            self.runtimes[session_id].loop.sandbox_policy.mode,
+            DANGER_FULL_ACCESS,
         )
 
     def test_two_sessions_run_concurrently_but_one_session_rejects_overlap(self) -> None:

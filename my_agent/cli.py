@@ -31,10 +31,12 @@ from .protocol import (
     PermissionProfileChangedEvent,
     ResolveApprovalCommand,
     RevisePlanCommand,
+    SandboxChangedEvent,
     StartTurnCommand,
     SwitchModeCommand,
     SwitchModelCommand,
     SwitchPermissionProfileCommand,
+    SwitchSandboxCommand,
     TurnAbortedEvent,
     TurnCompletedEvent,
     TurnContinuationRequiredEvent,
@@ -42,7 +44,12 @@ from .protocol import (
     TurnInterruptedEvent,
 )
 from .runtime import AgentRuntime
-from .sandbox import SANDBOX_MODES, SandboxPolicy
+from .sandbox import (
+    SANDBOX_MODES,
+    SANDBOX_PROFILES,
+    SandboxPolicy,
+    sandbox_availability,
+)
 from .service import AgentService
 from .session import SessionState, SessionStore
 from .terminal import (
@@ -77,6 +84,7 @@ SLASH_COMMANDS = (
     SlashCommand("/model", "Choose the model"),
     SlashCommand("/mode", "Choose Build or Plan mode"),
     SlashCommand("/permissions", "Choose the permission profile"),
+    SlashCommand("/sandbox", "Choose the command sandbox"),
     SlashCommand("/approve", "Approve the proposed plan and execute it"),
     SlashCommand("/config", "Show provider configuration"),
     SlashCommand("/retry", "Resume the pending model step"),
@@ -357,17 +365,29 @@ def _build_app_server(args: argparse.Namespace) -> AppServer:
         save_session=lambda session: _save_session_artifacts(store, session),
         event_store=EventStore(store.root),
     )
+
+    def runtime_factory(
+        state: SessionState,
+        model_ref: str | None,
+        mode_id: str | None,
+        permission_profile_id: str | None,
+        sandbox_mode: str | None,
+    ) -> AgentRuntime:
+        return _build_server_runtime(
+            args,
+            state,
+            model_ref=model_ref,
+            mode_id=mode_id,
+            permission_profile_id=permission_profile_id,
+            sandbox_mode=sandbox_mode,
+        )
+
     try:
         return AppServer(
             workspace=workspace.root,
             session_store=store,
             agent_service=service,
-            runtime_factory=lambda state, model_ref, mode_id: _build_server_runtime(
-                args,
-                state,
-                model_ref=model_ref,
-                mode_id=mode_id,
-            ),
+            runtime_factory=runtime_factory,
             models=(
                 model
                 for model in args.runtime_config.models()
@@ -482,6 +502,7 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                     _sync_session_model(state, loop)
                     _sync_session_mode(state, loop)
                     _sync_session_permission_profile(state, loop)
+                    _sync_session_sandbox(state, loop)
                     _save_session_artifacts(store, state)
                     print(f"session: {state.session_id}")
                     continue
@@ -636,6 +657,49 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                     args.permission_profile = changed.profile_id
                     print(f"permissions: {changed.profile_id}")
                     continue
+                if user_input == "/sandbox":
+                    if state.pending_turn is not None:
+                        print(
+                            "pending turn exists; use /retry or /abort before switching sandbox"
+                        )
+                        continue
+                    available_profiles = tuple(
+                        profile
+                        for profile in SANDBOX_PROFILES
+                        if sandbox_availability(profile.mode).available
+                    )
+                    if not editor.supports_interactive_selection:
+                        _print_sandbox_catalog(view.sandbox_mode)
+                        print("interactive sandbox selection requires a TTY")
+                        continue
+                    requested_sandbox = editor.select(
+                        "sandbox> ",
+                        (
+                            SelectionOption(profile.mode, profile.description)
+                            for profile in available_profiles
+                        ),
+                        current_value=view.sandbox_mode,
+                    )
+                    if requested_sandbox is None:
+                        print("sandbox selection cancelled")
+                        continue
+                    if requested_sandbox == view.sandbox_mode:
+                        print(f"already using sandbox: {requested_sandbox}")
+                        continue
+                    service.dispatch(
+                        SwitchSandboxCommand(
+                            session_id=state.session_id,
+                            mode=requested_sandbox,
+                        )
+                    )
+                    changed = service.next_event(timeout=1)
+                    if not isinstance(changed, SandboxChangedEvent):
+                        raise RuntimeError(
+                            f"expected sandbox.changed, got {changed.event_type.value}"
+                        )
+                    args.sandbox = changed.mode
+                    print(f"sandbox: {changed.mode}")
+                    continue
                 if user_input == "/approve":
                     if state.pending_turn is not None:
                         print("pending turn exists; use /retry or /abort before approving a plan")
@@ -710,6 +774,7 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                     print("/model uses Up/Down to choose, Enter to switch, and Esc to cancel.")
                     print("/mode uses the same selector.")
                     print("/permissions selects supervised, accept_edits, or trusted.")
+                    print("/sandbox selects the operating-system command boundary.")
                     print("Completed plans open Execute/Revise; /approve runs a saved proposal.")
                     continue
                 if user_input.startswith("/"):
@@ -988,6 +1053,14 @@ def _prompt_for_approval(
     if details.get("argv"):
         print(f"  argv: {details['argv']}")
         print(f"  cwd: {details.get('cwd', '.')}")
+        sandbox = details.get("sandbox")
+        if isinstance(sandbox, dict):
+            print(
+                "  sandbox: "
+                f"{sandbox.get('mode')} "
+                f"write={sandbox.get('filesystem_write')} "
+                f"network={sandbox.get('network')}"
+            )
     if details.get("patch_preview"):
         print(details["patch_preview"])
         if details.get("preview_truncated"):
@@ -1044,6 +1117,8 @@ def _build_server_runtime(
     *,
     model_ref: str | None,
     mode_id: str | None,
+    permission_profile_id: str | None,
+    sandbox_mode: str | None,
 ) -> AgentRuntime:
     session_args = copy.copy(args)
     is_new = state.provider_id is None and state.model_id is None
@@ -1055,6 +1130,10 @@ def _build_server_runtime(
         session_args.model = model_ref
     if mode_id is not None:
         session_args.mode = mode_id
+    if permission_profile_id is not None:
+        session_args.permission_profile = permission_profile_id
+    if sandbox_mode is not None:
+        session_args.sandbox = sandbox_mode
     _restore_session_model(session_args, state)
     _restore_session_mode(session_args, state)
     _restore_session_permission_profile(session_args, state)
@@ -1209,6 +1288,20 @@ def _print_permission_catalog(current_profile_id: str) -> None:
     for profile in PERMISSION_PROFILES:
         marker = "*" if profile.profile_id == current_profile_id else " "
         print(f"  {marker} {profile.profile_id:<16}{profile.description}")
+
+
+def _print_sandbox_catalog(current_mode: str) -> None:
+    print(f"Current sandbox: {current_mode}")
+    print("Available sandbox profiles")
+    for profile in SANDBOX_PROFILES:
+        availability = sandbox_availability(profile.mode)
+        marker = "*" if profile.mode == current_mode else " "
+        status = (
+            f"backend={availability.backend}"
+            if availability.available
+            else f"unavailable: {availability.unavailable_reason}"
+        )
+        print(f"  {marker} {profile.mode:<20}{profile.description} ({status})")
 
 
 def _print_runtime_config(config: RuntimeConfig) -> None:

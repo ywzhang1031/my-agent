@@ -33,11 +33,13 @@ from .protocol import (
     RenameSessionCommand,
     ResolveApprovalCommand,
     RevisePlanCommand,
+    SandboxChangedEvent,
     StartTurnCommand,
     SessionRenamedEvent,
     SwitchModeCommand,
     SwitchModelCommand,
     SwitchPermissionProfileCommand,
+    SwitchSandboxCommand,
     TurnAbortedEvent,
     TurnCompletedEvent,
     TurnContinuationRequiredEvent,
@@ -202,6 +204,9 @@ class AgentService:
             return
         if isinstance(command, SwitchPermissionProfileCommand):
             self._switch_permission_profile(handle, command.profile_id)
+            return
+        if isinstance(command, SwitchSandboxCommand):
+            self._switch_sandbox(handle, command.mode)
             return
         if isinstance(command, ExecutePlanCommand):
             self._execute_plan(handle)
@@ -460,6 +465,19 @@ class AgentService:
             AgentState.IDLE,
             turn_id=None,
             profile_id=profile.profile_id,
+        )
+
+    def _switch_sandbox(self, handle: _SessionHandle, mode: str) -> None:
+        handle.runtime.switch_sandbox(mode)
+        selected_mode = handle.runtime.loop.sandbox_policy.mode
+        handle.runtime.session.sandbox_mode = selected_mode
+        self._save_session(handle.runtime.session)
+        self._publish(
+            handle,
+            SandboxChangedEvent,
+            AgentState.IDLE,
+            turn_id=None,
+            mode=selected_mode,
         )
 
     def _execute_plan(self, handle: _SessionHandle) -> None:

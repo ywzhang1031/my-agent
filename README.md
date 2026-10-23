@@ -40,6 +40,9 @@ CLI 创建的新 session 默认使用 `--sandbox workspace-write`。在 macOS �
 和临时目录，并额外禁止写 `.git`、`.my-agent` 与网络访问。`--sandbox danger-full-access` 会显式
 关闭这层 OS 隔离；permission profile 只控制审批，`trusted` 不会自动关闭 sandbox。当前尚未实现
 Linux/Windows backend，请求 `workspace-write` 时会失败关闭而不是静默裸跑。
+运行中的 session 可通过 CLI `/sandbox` 或 Web 顶栏切换；切换会经过 typed
+`sandbox.switch -> sandbox.changed` 控制面并写回 `session.json`。running 或 pending turn 存在时
+拒绝切换，避免同一个 turn 的不同工具调用处于不同隔离边界。
 `apply_patch` 每次只允许修改一个 workspace-relative 文件，支持 `Add File`、`Update File`
 和 `Delete File`。例如：
 
@@ -143,7 +146,7 @@ DEEPSEEK_API_KEY=... .venv/bin/python cli.py ui --workspace . --open-browser
 - 流式 answer/thinking、provider retry 和 tool activity
 - `apply_patch` / `exec_command` 的 once/session/deny 审批
 - Plan mode 计划正文、执行或修改操作
-- provider/model 与 Build/Plan mode 切换；模型和权限使用紧凑、可键盘导航的弹出菜单
+- provider/model 与 Build/Plan mode 切换；模型、权限和 sandbox 使用紧凑、可键盘导航的弹出菜单
 - `supervised` / `accept_edits` / `trusted` 权限策略切换
 - 分类 context 使用量、pending turn 的 retry/abort 和运行中 turn 的 interrupt
 - 每批模型步骤达到预算后暂停并询问“继续或停止”，继续时从下一步恢复，不伪造 final answer
@@ -203,9 +206,9 @@ DEEPSEEK_API_KEY=... .venv/bin/python cli.py serve --workspace .
 control plane 提供：
 
 - `session.create/list/read/resume/close/rename`
-- `model.list`、`mode.list`、`permission.list`、`context.inspect`
+- `model.list`、`mode.list`、`permission.list`、`sandbox.list`、`context.inspect`
 - `turn.start/retry/interrupt/abort`
-- `approval.resolve`、`model.switch`、`mode.switch`、`permission.switch`
+- `approval.resolve`、`model.switch`、`mode.switch`、`permission.switch`、`sandbox.switch`
 - `plan.execute/revise`、`events.subscribe/unsubscribe`
 
 `session.close` 只停止并卸载内存 runtime，不删除磁盘记录；`session.resume` 将它重新加载。AppServer
@@ -308,6 +311,7 @@ REPL 支持这些本地命令：
 - `/model`：打开模型选择器，用上下方向键选择、`Enter` 切换、`Esc` 取消
 - `/mode`：用同样的选择器切换 Build/Plan；running 或 pending turn 存在时拒绝切换
 - `/permissions`：切换 `supervised`、`accept_edits` 或 `trusted` 权限策略
+- `/sandbox`：切换命令的 OS 隔离边界；running 或 pending turn 存在时拒绝切换
 - `/approve`：执行保留的 proposed plan，主要用于取消 selector、恢复 session 或非 TTY 场景
 - `/config`：显示实际配置/凭据路径、默认模型和已解析 provider，不显示 API key
 - `/retry`：从失败的 model step 恢复，不重复用户消息或已完成 tool
@@ -318,7 +322,7 @@ REPL 使用 `prompt_toolkit`，支持左右移动光标、行内插入和上下�
 全部 slash commands 及说明；菜单打开时用上下方向键移动，按 `Enter` 直接执行选中的命令。
 `Tab`/`Shift-Tab` 仍可用于正向或反向补全。执行 `/model` 后会直接打开模型选择器，当前模型
 默认高亮；用上下方向键移动并按 `Enter` 确认，不需要手动输入 model ID。`/mode` 和
-`/permissions` 使用相同交互。底部状态栏持续显示当前 `provider/model`、collaboration mode、
+`/permissions` 和 `/sandbox` 使用相同交互。底部状态栏持续显示当前 `provider/model`、collaboration mode、
 permission profile、context 百分比、估算用量和 pending
 状态，同时显示当前 sandbox mode。历史保存在 `.my-agent/history`，权限设为 `0600`。
 输入过程中按 `Ctrl-C` 只清空当前行；turn 运行或等待审批时按 `Ctrl-C` 会发送
@@ -470,6 +474,7 @@ Build execution -> final answer: completed
 `AppServer` 是 UI/transport 的 control-plane 边界；`AgentService` 是 session runtime 与 harness 的
 应用边界。`StartTurnCommand`、
 `InterruptTurnCommand`、`ResolveApprovalCommand`、`SwitchModelCommand`、`SwitchModeCommand`、
+`SwitchPermissionProfileCommand`、`SwitchSandboxCommand`、
 `ExecutePlanCommand`、`RevisePlanCommand` 和 `AbortTurnCommand` 都只包含可序列化字段。输出不再是
 `kind: str + data: dict`，而是 `ItemStartedEvent`、`ItemDeltaEvent`、`ItemCompletedEvent`、
 `TurnContinuationRequiredEvent`、

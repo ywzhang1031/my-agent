@@ -30,6 +30,7 @@ class CommandType(str, Enum):
     SWITCH_MODEL = "model.switch"
     SWITCH_MODE = "mode.switch"
     SWITCH_PERMISSION_PROFILE = "permission.switch"
+    SWITCH_SANDBOX = "sandbox.switch"
     EXECUTE_PLAN = "plan.execute"
     REVISE_PLAN = "plan.revise"
     ABORT_TURN = "turn.abort"
@@ -56,6 +57,7 @@ class EventType(str, Enum):
     MODEL_CHANGED = "model.changed"
     MODE_CHANGED = "mode.changed"
     PERMISSION_PROFILE_CHANGED = "permission.changed"
+    SANDBOX_CHANGED = "sandbox.changed"
     PLAN_APPROVED = "plan.approved"
     PLAN_REVISION_REQUESTED = "plan.revision_requested"
     TURN_ABORTED = "turn.aborted"
@@ -113,6 +115,12 @@ class SwitchPermissionProfileCommand(AgentCommand):
 
 
 @dataclass(frozen=True, kw_only=True)
+class SwitchSandboxCommand(AgentCommand):
+    mode: str
+    command_type: ClassVar[CommandType] = CommandType.SWITCH_SANDBOX
+
+
+@dataclass(frozen=True, kw_only=True)
 class ExecutePlanCommand(AgentCommand):
     command_type: ClassVar[CommandType] = CommandType.EXECUTE_PLAN
 
@@ -135,6 +143,7 @@ AgentCommandType: TypeAlias = (
     | SwitchModelCommand
     | SwitchModeCommand
     | SwitchPermissionProfileCommand
+    | SwitchSandboxCommand
     | ExecutePlanCommand
     | RevisePlanCommand
     | AbortTurnCommand
@@ -317,6 +326,12 @@ class PermissionProfileChangedEvent(AgentEvent):
 
 
 @dataclass(frozen=True, kw_only=True)
+class SandboxChangedEvent(AgentEvent):
+    mode: str
+    event_type: ClassVar[EventType] = EventType.SANDBOX_CHANGED
+
+
+@dataclass(frozen=True, kw_only=True)
 class PlanApprovedEvent(AgentEvent):
     plan_id: str
     mode_id: str
@@ -356,6 +371,7 @@ AgentEventType: TypeAlias = (
     | ModelChangedEvent
     | ModeChangedEvent
     | PermissionProfileChangedEvent
+    | SandboxChangedEvent
     | PlanApprovedEvent
     | PlanRevisionRequestedEvent
     | TurnAbortedEvent
@@ -372,6 +388,7 @@ _COMMAND_TYPES = {
         SwitchModelCommand,
         SwitchModeCommand,
         SwitchPermissionProfileCommand,
+        SwitchSandboxCommand,
         ExecutePlanCommand,
         RevisePlanCommand,
         AbortTurnCommand,
@@ -401,6 +418,7 @@ _EVENT_TYPES = {
         ModelChangedEvent,
         ModeChangedEvent,
         PermissionProfileChangedEvent,
+        SandboxChangedEvent,
         PlanApprovedEvent,
         PlanRevisionRequestedEvent,
         TurnAbortedEvent,
