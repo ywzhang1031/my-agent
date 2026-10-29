@@ -4,6 +4,7 @@ import json
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable
+from uuid import uuid4
 
 from .context import ContextManager, ContextSnapshot
 from .control import (
@@ -118,7 +119,8 @@ class AgentLoop:
                 raise ValueError("approved plans can only execute in build mode")
             if plan is None or plan.plan_id != approved_plan_id or plan.status != "approved":
                 raise ValueError(f"approved plan is not ready to execute: {approved_plan_id}")
-        turn_number = sum(isinstance(message, UserMessage) for message in state.messages) + 1
+        turn_number = max(state.turn_counter, sum(isinstance(message, UserMessage) for message in state.messages)) + 1
+        state.turn_counter = turn_number
         message_start = len(state.messages)
         state.messages.append(UserMessage(content=user_input))
         state.pending_turn = PendingTurn(
@@ -158,10 +160,15 @@ class AgentLoop:
         event_handler: EventHandler | None = None,
         cancel_event: threading.Event | None = None,
         approvals: ApprovalBroker | None = None,
+        recovery_confirmed: bool = False,
     ) -> TurnResult:
         pending = state.pending_turn
         if pending is None:
             raise ValueError("session has no pending turn to retry")
+        if pending.pause_reason == "recovery_required":
+            if not recovery_confirmed:
+                raise ValueError("recovery confirmation required; inspect workspace before continuing")
+            self._recover_observations(state)
         if pending.mode_id != self.mode.mode_id:
             raise ValueError(
                 f"pending turn requires mode {pending.mode_id}; current mode is {self.mode.mode_id}"
@@ -529,6 +536,7 @@ class AgentLoop:
                 )
 
             for call_index, call in enumerate(reply.tool_calls):
+                attempt_id = uuid4().hex
                 observation_recorded = False
                 try:
                     raise_if_cancelled(cancel_event)
@@ -561,6 +569,7 @@ class AgentLoop:
                                 AgentEvent(
                                     kind="tool_started",
                                     data={
+                                        "attempt_id": attempt_id,
                                         "step": step,
                                         "call_id": call.call_id,
                                         "name": call.name,
@@ -577,15 +586,27 @@ class AgentLoop:
                         {
                             **event_context,
                             "step": step,
+                            "attempt_id": attempt_id,
                             "call": call.to_dict(),
                             "result": result_payload,
                         },
                     )
+                    messages.append(
+                        ToolResultMessage(
+                            tool_call_id=call.call_id,
+                            tool_name=call.name,
+                            content=json.dumps(result_payload, ensure_ascii=False),
+                        )
+                    )
+                    observation_recorded = True
+                    if call_index == len(reply.tool_calls) - 1:
+                        pending.step = step + 1
                     self._emit(
                         event_handler,
                         AgentEvent(
                             kind="tool_finished",
                             data={
+                                "attempt_id": attempt_id,
                                 "step": step,
                                 "call_id": call.call_id,
                                 "name": call.name,
@@ -615,14 +636,6 @@ class AgentLoop:
                             event_handler,
                             AgentEvent(kind="goal_updated", data=goal_event),
                         )
-                    messages.append(
-                        ToolResultMessage(
-                            tool_call_id=call.call_id,
-                            tool_name=call.name,
-                            content=json.dumps(result_payload, ensure_ascii=False),
-                        )
-                    )
-                    observation_recorded = True
                     raise_if_cancelled(cancel_event)
                 except TurnInterrupted as exc:
                     first_unobserved = call_index + int(observation_recorded)
@@ -663,6 +676,36 @@ class AgentLoop:
             stopped_by="continuation_required",
             mode_id=self.mode.mode_id,
         )
+
+    @staticmethod
+    def _recover_observations(state: SessionState) -> None:
+        pending = state.pending_turn
+        assert pending is not None
+        unknown = {entry["call_id"] for entry in pending.pause_details.get("unknown_attempts", [])}
+        for index in range(len(state.messages) - 1, -1, -1):
+            message = state.messages[index]
+            if not isinstance(message, AssistantMessage) or not message.tool_calls:
+                continue
+            observed = {m.tool_call_id for m in state.messages[index + 1:] if isinstance(m, ToolResultMessage)}
+            missing = [call for call in message.tool_calls if call.call_id not in observed]
+            for call in missing:
+                status = "unknown" if call.call_id in unknown or pending.pause_details.get("legacy_untracked") else "not_executed"
+                result = ToolResult(
+                    ok=False,
+                    stderr=("Recovery: this operation may have run. Inspect current workspace before repeating it."
+                            if status == "unknown" else "Recovery: execution was not recorded; this call was not replayed."),
+                    metadata={"status": status, "recovered": True},
+                )
+                state.messages.append(ToolResultMessage(
+                    tool_call_id=call.call_id, tool_name=call.name,
+                    content=json.dumps(result.to_dict(), ensure_ascii=False),
+                ))
+            if missing:
+                pending.step += 1
+            break
+        pending.pause_reason = None
+        pending.pause_details = {}
+        pending.last_error = None
 
     @staticmethod
     def _update_goal(

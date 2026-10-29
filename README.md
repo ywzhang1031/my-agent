@@ -597,6 +597,15 @@ SQLite 使用默认 rollback journal，当前不引入 WAL 或网络文件系统
 迁移会保留原文件、创建带 SHA-256 manifest 的 `.legacy-backup-*`，在暂存数据库完成校验后才
 切换。损坏记录或消息数量不一致会中止，不会静默丢弃。不要把这些包含对话内容的文件提交到 Git。
 
+运行线程在关键事件等待持久化确认：状态、对应事件和工具 attempt 在同一事务提交，之后才向
+客户端发布并继续执行。文字增量仍是 live-only；事件序号按块预留，允许间隙但重启后不会重用。
+存储失败会停止启动后续工具，该运行实例只能关闭并重新恢复；退出时不会把失败检查点重新保存。
+
+未正常结束的进程会留下 `recovery_required`，不会自动续跑。CLI `/recover` 或 RPC `turn.recover`
+表示用户检查工作区后确认恢复；普通 `/retry` / `turn.retry` 不绕过这个确认。工具已经开始但结果
+未提交时标记为 `unknown`，不会重放原调用。恢复会补齐未知/未执行 observation，交回模型检查现状。
+这不是任意外部工具的 exactly-once 保证，也不恢复旧进程或 allow-session 权限。
+
 ```bash
 WORKSPACE=/path/to/repo
 SESSION_ID=20260803-120000-abcdef

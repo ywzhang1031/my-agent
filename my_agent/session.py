@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .database import Database, RevisionConflict
+from .attempt_store import AttemptStore
 from .goals import GoalState, goal_from_dict
 from .messages import AssistantMessage, Message, ToolCall, ToolResultMessage, UserMessage
 from .modes import BUILD_MODE
@@ -53,6 +54,7 @@ class SessionState:
     updated_at: str
     revision: int = 0
     turn_counter: int = 0
+    checkpoint_status: str = "idle"
     title: str = ""
     messages: list[Message] = field(default_factory=list)
     context_summary: str = ""
@@ -123,7 +125,7 @@ class SessionStore:
         self.save(state)
         return state
 
-    def load(self, session_id: str) -> SessionState:
+    def load(self, session_id: str, *, recover: bool = True) -> SessionState:
         session_dir = self._session_dir(session_id)
         with self.database.transaction() as connection:
             row = connection.execute(
@@ -131,7 +133,14 @@ class SessionStore:
             ).fetchone()
         if row is None:
             raise FileNotFoundError(f"session not found: {session_id}")
-        return session_from_dict(json.loads(row[1]), session_dir, revision=row[0])
+        state = session_from_dict(json.loads(row[1]), session_dir, revision=row[0])
+        if recover and state.checkpoint_status == "running" and state.pending_turn is not None:
+            state.pending_turn.pause_reason = "recovery_required"
+            state.pending_turn.last_error = "Previous process stopped during execution; inspect workspace before continuing."
+            state.pending_turn.pause_details = {
+                "unknown_attempts": AttemptStore(self.database).unresolved(session_id, state.pending_turn.turn_id)
+            }
+        return state
 
     def save(self, state: SessionState) -> None:
         state.session_dir.mkdir(parents=True, exist_ok=True)
@@ -187,6 +196,7 @@ def session_from_dict(metadata: dict[str, Any], session_dir: Path, *, revision: 
         created_at=metadata["created_at"],
         updated_at=metadata["updated_at"],
         revision=revision,
+        checkpoint_status=str(metadata.get("checkpoint_status", "idle")),
         turn_counter=int(metadata.get("turn_counter", sum(isinstance(m, UserMessage) for m in messages))),
         title=str(metadata.get("title", "")),
         messages=messages,
@@ -222,6 +232,7 @@ def session_to_dict(state: SessionState) -> dict[str, Any]:
         "message_count": len(state.messages),
         "messages": [message_to_dict(message) for message in state.messages],
         "turn_counter": state.turn_counter,
+        "checkpoint_status": state.checkpoint_status,
         "context_summary": state.context_summary,
         "summarized_message_count": state.summarized_message_count,
         "last_input_tokens": state.last_input_tokens,

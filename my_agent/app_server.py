@@ -170,6 +170,7 @@ class AppServer:
             "context.inspect": self._inspect_context,
             "turn.start": self._start_turn,
             "turn.retry": self._retry_turn,
+            "turn.recover": self._recover_turn,
             "turn.interrupt": self._interrupt_turn,
             "approval.resolve": self._resolve_approval,
             "model.switch": self._switch_model,
@@ -252,7 +253,8 @@ class AppServer:
 
     def _read_session(self, params: dict[str, Any]) -> dict[str, Any]:
         session_id = self._session_id(params)
-        state = self.session_store.load(session_id)
+        active = self.agent_service.has_session(session_id)
+        state = self.session_store.load(session_id, recover=not active)
         self._require_workspace(state)
         active = self.agent_service.has_session(session_id)
         return {
@@ -438,6 +440,11 @@ class AppServer:
     def _retry_turn(self, params: dict[str, Any]) -> dict[str, Any]:
         command = StartTurnCommand(session_id=self._session_id(params), retry=True)
         return self._dispatch_command(command)
+
+    def _recover_turn(self, params: dict[str, Any]) -> dict[str, Any]:
+        return self._dispatch_command(StartTurnCommand(
+            session_id=self._session_id(params), retry=True, recovery_confirmed=True,
+        ))
 
     def _interrupt_turn(self, params: dict[str, Any]) -> dict[str, Any]:
         return self._dispatch_command(

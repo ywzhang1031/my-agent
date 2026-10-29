@@ -9,7 +9,7 @@ from typing import Callable, Iterator
 
 
 DATABASE_NAME = "agent.sqlite3"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 _transactions = threading.local()
 
 
@@ -34,7 +34,7 @@ class Database:
         self.root.mkdir(parents=True, exist_ok=True)
         with self.transaction() as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, SCHEMA_VERSION):
+            if version not in (0, 1, 2, SCHEMA_VERSION):
                 raise StorageError(f"unsupported database schema: {version}")
             connection.execute("""CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, data TEXT NOT NULL
@@ -42,6 +42,14 @@ class Database:
             connection.execute("""CREATE TABLE IF NOT EXISTS events (
                 session_id TEXT NOT NULL, sequence INTEGER NOT NULL, data TEXT NOT NULL,
                 PRIMARY KEY (session_id, sequence)
+            )""")
+            connection.execute("""CREATE TABLE IF NOT EXISTS event_cursors (
+                session_id TEXT PRIMARY KEY, reserved_through INTEGER NOT NULL
+            )""")
+            connection.execute("""CREATE TABLE IF NOT EXISTS tool_attempts (
+                attempt_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, turn_id TEXT NOT NULL,
+                call_id TEXT NOT NULL, tool_name TEXT NOT NULL, arguments TEXT NOT NULL,
+                status TEXT NOT NULL, result TEXT
             )""")
             connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         os.chmod(self.path, 0o600)

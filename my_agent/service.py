@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import threading
+import copy
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping
 
 from .control import ApprovalDecision, ApprovalGrant
+from .database import StorageError
+from .attempt_store import AttemptStore
 from .event_broker import EventBroker
 from .event_store import EventStore
 from .messages import UserMessage
@@ -109,6 +113,9 @@ class _SessionHandle:
     lock: threading.Lock = field(default_factory=threading.Lock)
     operation_lock: threading.Lock = field(default_factory=threading.Lock)
     closed: bool = False
+    staged_events: list[AgentEventType] | None = None
+    persistence_error: str | None = None
+    reserved_through: int = 0
 
 
 class AgentService:
@@ -121,17 +128,20 @@ class AgentService:
         model_resolver: ModelResolver | None = None,
         save_session: SessionSaver | None = None,
         event_store: EventStore | None = None,
+        after_turn: SessionSaver | None = None,
     ) -> None:
         self._tool_registry_factory = tool_registry_factory
         self._model_resolver = model_resolver
         self._save_session = save_session or (lambda state: None)
         self._event_store = event_store
+        self._after_turn = after_turn
         self._sessions: dict[str, _SessionHandle] = {}
         self._event_broker = EventBroker()
         self._default_subscription_id: str | None = None
         self._lock = threading.Lock()
 
     def register(self, runtime: AgentRuntime) -> None:
+        runtime.checkpointing = True
         session_id = runtime.session.session_id
         with self._lock:
             if session_id in self._sessions:
@@ -144,10 +154,12 @@ class AgentService:
             )
             for event in persisted_events:
                 projection.apply(event)
+            sequence = self._event_store.reserved_sequence(session_id) if self._event_store else projection.latest_sequence
             self._sessions[session_id] = _SessionHandle(
                 runtime=runtime,
                 projection=projection,
-                sequence=projection.latest_sequence,
+                sequence=sequence,
+                reserved_through=sequence,
             )
 
     def has_session(self, session_id: str) -> bool:
@@ -173,7 +185,15 @@ class AgentService:
         with handle.operation_lock:
             if handle.closed:
                 raise ValueError(f"session is not registered: {command.session_id}")
-            self._dispatch_to_handle(handle, command)
+            if handle.persistence_error and not isinstance(command, InterruptTurnCommand):
+                raise StorageError("session storage failed; restart and recover before continuing")
+            try:
+                with self._checkpoint(handle):
+                    self._dispatch_to_handle(handle, command)
+            except (StorageError, OSError) as exc:
+                handle.persistence_error = str(exc)
+                handle.runtime.send(InterruptTurn())
+                raise
 
     def _dispatch_to_handle(
         self,
@@ -191,6 +211,7 @@ class AgentService:
                     user_input=command.user_input,
                     retry=command.retry,
                     approved_plan_id=command.approved_plan_id,
+                    recovery_confirmed=command.recovery_confirmed,
                 ),
             )
             return
@@ -372,7 +393,8 @@ class AgentService:
             handle.forwarder.join(timeout)
             if handle.forwarder.is_alive():
                 raise RuntimeError("service event forwarder did not finish")
-        self._save_session(handle.runtime.session)
+        if handle.persistence_error is None:
+            self._save_session(handle.runtime.session)
 
     def _handle(self, session_id: str) -> _SessionHandle:
         with self._lock:
@@ -389,10 +411,10 @@ class AgentService:
                 handle.current_turn_id = handle.runtime.session.pending_turn.turn_id
             elif not command.retry:
                 turn_number = (
-                    sum(
+                    max(handle.runtime.session.turn_counter, sum(
                         isinstance(message, UserMessage)
                         for message in handle.runtime.session.messages
-                    )
+                    ))
                     + 1
                 )
                 handle.current_turn_id = (
@@ -409,7 +431,6 @@ class AgentService:
             handle.forwarder.start()
 
     def _forward_runtime_events(self, handle: _SessionHandle) -> None:
-        terminal_saved = False
         try:
             while True:
                 event = handle.runtime.next_event()
@@ -419,17 +440,76 @@ class AgentService:
                     "turn_failed",
                     "turn_interrupted",
                 }
+                try:
+                    if handle.persistence_error is not None:
+                        if not terminal:
+                            raise StorageError(handle.persistence_error)
+                    elif event.kind in {"content_delta", "reasoning_delta", "tool_call_delta"}:
+                        with handle.operation_lock:
+                            self._publish_runtime_event(handle, event)
+                    else:
+                        with handle.operation_lock, self._checkpoint(handle):
+                            if event.receipt is not None or terminal:
+                                handle.runtime.session.checkpoint_status = "stopped" if terminal else "running"
+                                self._save_session(handle.runtime.session)
+                            self._publish_runtime_event(handle, event)
+                except Exception as exc:
+                    first_failure = handle.persistence_error is None
+                    handle.persistence_error = str(exc)
+                    handle.runtime.send(InterruptTurn())
+                    if event.receipt is not None and not terminal:
+                        event.receipt.error = f"Persistence failed: {exc}"
+                    if first_failure:
+                        self._publish_storage_failure(handle, str(exc))
+                finally:
+                    if event.receipt is not None:
+                        event.receipt.ready.set()
                 if terminal:
-                    self._save_session(handle.runtime.session)
-                    terminal_saved = True
-                self._publish_runtime_event(handle, event)
-                if terminal:
+                    if self._after_turn is not None:
+                        self._after_turn(handle.runtime.session)
                     break
         finally:
             with handle.lock:
                 handle.forwarding = False
-            if not terminal_saved:
-                self._save_session(handle.runtime.session)
+
+    @contextmanager
+    def _checkpoint(self, handle: _SessionHandle):
+        if handle.staged_events is not None:
+            yield
+            return
+        projection = copy.deepcopy(handle.projection)
+        sequence, turn_id = handle.sequence, handle.current_turn_id
+        reserved_through = handle.reserved_through
+        active_items, completed_items = dict(handle.active_items), set(handle.completed_items)
+        handle.staged_events = []
+        try:
+            transaction = self._event_store.database.transaction() if self._event_store else nullcontext()
+            with transaction:
+                yield
+            events = handle.staged_events
+        except BaseException:
+            handle.projection = projection
+            handle.sequence, handle.current_turn_id = sequence, turn_id
+            handle.reserved_through = reserved_through
+            handle.active_items, handle.completed_items = active_items, completed_items
+            raise
+        finally:
+            handle.staged_events = None
+        for event in events:
+            self._event_broker.publish(event)
+
+    def _publish_storage_failure(self, handle: _SessionHandle, error: str) -> None:
+        # This notification cannot claim durability when the store itself failed.
+        with handle.lock:
+            handle.sequence += 1
+            event = TurnFailedEvent(
+                session_id=handle.runtime.session.session_id,
+                turn_id=handle.current_turn_id,
+                sequence=handle.sequence, state=AgentState.FAILED, durable=False,
+                error=f"Persistence failed; restart and recover this session: {error}",
+            )
+            handle.projection.apply(event)
+        self._event_broker.publish(event)
 
     def _switch_model(self, handle: _SessionHandle, model_ref: str) -> None:
         if self._model_resolver is None:
@@ -744,6 +824,8 @@ class AgentService:
             )
         elif event.kind == "tool_started":
             turn_id = self._current_turn_id(handle)
+            if self._event_store is not None and data.get("attempt_id"):
+                AttemptStore(self._event_store.database).start(handle.runtime.session.session_id, turn_id, data)
             item_id = self._tool_item_id(turn_id, str(data["call_id"]))
             self._ensure_item(
                 handle,
@@ -768,10 +850,12 @@ class AgentService:
                 item_type="tool_call",
                 step=int(data["step"]),
                 delta="",
-                data={"phase": "running"},
+                data={"phase": "running", "attempt_id": data.get("attempt_id")},
             )
         elif event.kind == "tool_finished":
             turn_id = self._current_turn_id(handle)
+            if self._event_store is not None and data.get("attempt_id"):
+                AttemptStore(self._event_store.database).finish(handle.runtime.session.session_id, turn_id, data)
             item_id = self._tool_item_id(turn_id, str(data["call_id"]))
             self._ensure_item(
                 handle,
@@ -800,6 +884,7 @@ class AgentService:
                     "status": str(data["status"]),
                     "duration_ms": data.get("duration_ms"),
                     "result": dict(data.get("result", {})),
+                    "attempt_id": data.get("attempt_id"),
                     "phase": "completed",
                 },
             )
@@ -1074,6 +1159,10 @@ class AgentService:
     ) -> None:
         with handle.lock:
             handle.sequence += 1
+            if self._event_store is not None and handle.sequence > handle.reserved_through:
+                handle.reserved_through = self._event_store.reserve_sequences(
+                    handle.runtime.session.session_id, handle.sequence
+                )
             event = event_type(
                 session_id=handle.runtime.session.session_id,
                 turn_id=turn_id,
@@ -1082,7 +1171,10 @@ class AgentService:
                 durable=durable,
                 **payload,
             )
-            handle.projection.apply(event)
             if durable and self._event_store is not None:
                 self._event_store.append(event)
-            self._event_broker.publish(event)
+            handle.projection.apply(event)
+            if handle.staged_events is not None:
+                handle.staged_events.append(event)
+            else:
+                self._event_broker.publish(event)

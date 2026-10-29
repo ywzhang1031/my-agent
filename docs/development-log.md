@@ -538,3 +538,14 @@ Sandbox policy 从启动参数和只读状态提升为可查询、可切换的 s
   保留旧文件但不继续双写旧格式；损坏尾行和消息数量冲突需要人工处理。
 - 新增事务回滚、进程异常退出、并发陈旧写入和迁移失败测试。此提交只提供存储基础；运行检查点和
   工具崩溃恢复在后续独立提交接入。
+
+## Milestone 32: Durable Checkpoints and Explicit Crash Recovery
+
+- Runtime 对关键事件增加持久化回执；Service 在同一事务提交 session 快照、typed events 和工具
+  attempt，提交成功后发布并放行运行线程。live deltas 不保存整份快照。
+- 存储失败停止后续执行，回滚 projection 并发送非持久失败通知；关闭/导出不再重存失败的内存状态。
+- 保存工具结果前先把 observation 放入 checkpoint；attempt ID 独立于厂商 call ID。工具可能已产生
+  副作用但结果未落盘时保持未知，恢复不自动重放。
+- 新增 `/recover` 和 `turn.recover` 显式确认；重启默认暂停。工具权限仍须由新 runtime 重新审批。
+- turn counter 不因 abort 回退；事件序号预留高水位，避免重启重用已经显示过的 live sequence。
+- 新增真实子进程退出、patch 后崩溃、写盘失败阻止工具、结果提交回滚和显式恢复测试。

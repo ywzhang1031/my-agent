@@ -17,6 +17,7 @@ from .control import (
     TurnInterrupted,
     raise_if_cancelled,
 )
+from .database import StorageError
 from .model_invoker import ModelInvoker
 from .modes import CollaborationMode
 from .session import SessionState
@@ -39,6 +40,7 @@ class StartTurn:
     user_input: str = ""
     retry: bool = False
     approved_plan_id: str | None = None
+    recovery_confirmed: bool = False
 
 
 @dataclass(frozen=True)
@@ -62,6 +64,13 @@ class RuntimeEvent:
     text: str = ""
     data: dict[str, Any] = field(default_factory=dict)
     result: TurnResult | None = None
+    receipt: CheckpointReceipt | None = None
+
+
+@dataclass
+class CheckpointReceipt:
+    ready: threading.Event = field(default_factory=threading.Event)
+    error: str | None = None
 
 
 @dataclass
@@ -159,6 +168,7 @@ class AgentRuntime:
         self.loop = loop
         self.session = session
         self._events: queue.Queue[RuntimeEvent] = queue.Queue()
+        self.checkpointing = False
         self._lock = threading.Lock()
         self._state = RuntimeState.IDLE
         self._worker: threading.Thread | None = None
@@ -274,6 +284,10 @@ class AgentRuntime:
             if command.retry:
                 if self.session.pending_turn is None:
                     raise ValueError("session has no pending turn to retry")
+                if self.session.pending_turn.pause_reason == "recovery_required" and not command.recovery_confirmed:
+                    raise ValueError("recovery confirmation required; inspect workspace then use turn.recover or /recover")
+                if command.recovery_confirmed and self.session.pending_turn.pause_reason != "recovery_required":
+                    raise ValueError("session does not require crash recovery")
             elif not command.user_input.strip():
                 raise ValueError("user_input is required for a new turn")
             cancel_event = threading.Event()
@@ -300,6 +314,7 @@ class AgentRuntime:
                     event_handler=self._forward_agent_event,
                     cancel_event=cancel_event,
                     approvals=self._approvals,
+                    recovery_confirmed=command.recovery_confirmed,
                 )
             else:
                 result = self.loop.run_turn(
@@ -375,6 +390,11 @@ class AgentRuntime:
     ) -> None:
         with self._lock:
             self._state = state
+        receipt = (
+            CheckpointReceipt()
+            if self.checkpointing and kind not in {"content_delta", "reasoning_delta", "tool_call_delta"}
+            else None
+        )
         self._events.put(
             RuntimeEvent(
                 kind=kind,
@@ -382,5 +402,10 @@ class AgentRuntime:
                 text=text,
                 data=data or {},
                 result=result,
+                receipt=receipt,
             )
         )
+        if receipt is not None:
+            receipt.ready.wait()
+            if receipt.error is not None:
+                raise StorageError(receipt.error)

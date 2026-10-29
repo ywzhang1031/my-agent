@@ -72,6 +72,7 @@ def migrate_sessions(root: str | Path) -> dict[str, object]:
                                 state.turn_counter = max(state.turn_counter, int(suffix))
                     if state.pending_turn is not None:
                         state.pending_turn.pause_reason = "recovery_required"
+                        state.pending_turn.pause_details = {"legacy_untracked": True}
                         state.pending_turn.last_error = "Imported incomplete turn; inspect workspace before continuing."
                     store.save(state)
                     store.load(session_id)

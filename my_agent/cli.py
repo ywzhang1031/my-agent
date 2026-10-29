@@ -97,6 +97,7 @@ SLASH_COMMANDS = (
     SlashCommand("/approve", "Approve the proposed plan and execute it"),
     SlashCommand("/config", "Show provider configuration"),
     SlashCommand("/retry", "Resume the pending model step"),
+    SlashCommand("/recover", "Confirm crash recovery after inspecting the workspace"),
     SlashCommand("/abort", "Discard the pending turn"),
     SlashCommand("/trace", "Show the raw trace path"),
     SlashCommand("/tools", "List available tools"),
@@ -325,7 +326,7 @@ def _run_ask(args: argparse.Namespace) -> int:
             raise RuntimeError(_terminal_event_message(terminal_event))
     finally:
         service.close()
-        _save_session_artifacts(store, state)
+        _export_session_artifacts(state)
     if args.stream:
         renderer.finish(terminal_event.answer)
     else:
@@ -378,7 +379,8 @@ def _build_app_server(args: argparse.Namespace) -> AppServer:
     service = AgentService(
         tool_registry_factory=build_tool_registry,
         model_resolver=lambda model_ref: _build_model(args, model_ref=model_ref),
-        save_session=lambda session: _save_session_artifacts(store, session),
+        save_session=store.save,
+        after_turn=_export_session_artifacts,
         event_store=EventStore(store.root),
     )
 
@@ -454,7 +456,7 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
     _sync_session_mode(state, loop)
     _sync_session_permission_profile(state, loop)
     _sync_session_sandbox(state, loop)
-    _save_session_artifacts(store, state)
+    store.save(state)
     service = _build_agent_service(
         args,
         store,
@@ -495,13 +497,13 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                     continue
                 except EOFError:
                     print()
-                    _save_session_artifacts(store, state)
+                    _export_session_artifacts(state)
                     return 0
 
                 if not user_input:
                     continue
                 if user_input == "/exit":
-                    _save_session_artifacts(store, state)
+                    _export_session_artifacts(state)
                     return 0
                 if user_input == "/new":
                     service.close()
@@ -519,7 +521,7 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                     _sync_session_mode(state, loop)
                     _sync_session_permission_profile(state, loop)
                     _sync_session_sandbox(state, loop)
-                    _save_session_artifacts(store, state)
+                    store.save(state)
                     print(f"session: {state.session_id}")
                     continue
                 if user_input == "/sessions":
@@ -833,12 +835,13 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                         )
                     )
                     continue
-                if user_input == "/retry":
+                if user_input in {"/retry", "/recover"}:
                     if state.pending_turn is None:
                         print("no pending turn to retry")
                         continue
                     terminal_event = _run_chat_turn(
-                        args, store, state, service, editor, retry=True
+                        args, store, state, service, editor, retry=True,
+                        recovery_confirmed=user_input == "/recover",
                     )
                     terminal_event = _offer_continuation_action(
                         args, store, state, service, editor, terminal_event
@@ -927,7 +930,7 @@ def _approve_and_execute_plan(
         renderer,
         editor,
     )
-    _save_session_artifacts(store, state)
+    _export_session_artifacts(state)
     _render_terminal_event(args, renderer, terminal_event)
     return _offer_continuation_action(
         args, store, state, service, editor, terminal_event
@@ -1030,6 +1033,7 @@ def _run_chat_turn(
     *,
     user_input: str | None = None,
     retry: bool = False,
+    recovery_confirmed: bool = False,
 ) -> TerminalEvent:
     mode = get_mode(service.session_view(state.session_id).mode_id)
     renderer = StreamRenderer(
@@ -1042,6 +1046,7 @@ def _run_chat_turn(
                 session_id=state.session_id,
                 user_input=user_input or "",
                 retry=retry,
+                recovery_confirmed=recovery_confirmed,
             )
         )
         terminal_event = _consume_service_events(
@@ -1052,7 +1057,7 @@ def _run_chat_turn(
             editor,
         )
     finally:
-        _save_session_artifacts(store, state)
+        _export_session_artifacts(state)
     _render_terminal_event(args, renderer, terminal_event)
     return terminal_event
 
@@ -1266,7 +1271,8 @@ def _build_agent_service(
     service = AgentService(
         tool_registry_factory=build_tool_registry,
         model_resolver=lambda model_ref: _build_model(args, model_ref=model_ref),
-        save_session=lambda session: _save_session_artifacts(store, session),
+        save_session=store.save,
+        after_turn=_export_session_artifacts,
         event_store=EventStore(store.root),
     )
     service.register(runtime)
@@ -1461,13 +1467,15 @@ def _session_store(args: argparse.Namespace, workspace: Workspace) -> SessionSto
     return SessionStore(root)
 
 
-def _save_session_artifacts(store: SessionStore, state: SessionState) -> None:
-    store.save(state)
+def _export_session_artifacts(state: SessionState) -> None:
     if not state.trace_path.exists():
         return
-    events = read_jsonl_trace(state.trace_path)
-    trajectory = make_trajectory(events, source_path=state.trace_path)
-    write_trajectory_json(trajectory, state.trajectory_path)
+    try:
+        events = read_jsonl_trace(state.trace_path)
+        trajectory = make_trajectory(events, source_path=state.trace_path)
+        write_trajectory_json(trajectory, state.trajectory_path)
+    except (OSError, ValueError) as exc:
+        print(f"warning: trajectory export failed: {exc}", file=sys.stderr)
 
 
 def _read_prompt(parts: list[str]) -> str:

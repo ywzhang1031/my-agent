@@ -39,3 +39,20 @@ class EventStore:
             return connection.execute(
                 "SELECT COALESCE(MAX(sequence), 0) FROM events WHERE session_id=?", (session_id,)
             ).fetchone()[0]
+
+    def reserved_sequence(self, session_id: str) -> int:
+        with self.database.transaction() as connection:
+            row = connection.execute(
+                "SELECT reserved_through FROM event_cursors WHERE session_id=?", (session_id,)
+            ).fetchone()
+            return max(row[0] if row else 0, self.latest_sequence(session_id))
+
+    def reserve_sequences(self, session_id: str, sequence: int) -> int:
+        reserved = ((sequence - 1) // 1024 + 1) * 1024
+        with self.database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO event_cursors VALUES (?, ?) ON CONFLICT(session_id) "
+                "DO UPDATE SET reserved_through=MAX(reserved_through, excluded.reserved_through)",
+                (session_id, reserved),
+            )
+        return reserved

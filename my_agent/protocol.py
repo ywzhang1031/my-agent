@@ -87,6 +87,7 @@ class StartTurnCommand(AgentCommand):
     user_input: str = ""
     retry: bool = False
     approved_plan_id: str | None = None
+    recovery_confirmed: bool = False
     command_type: ClassVar[CommandType] = CommandType.START_TURN
 
 
