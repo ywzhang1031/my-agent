@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Any
 
 from .database import Database
@@ -13,19 +14,21 @@ class AttemptStore:
     def start(self, session_id: str, turn_id: str, data: dict[str, Any]) -> None:
         with self.database.transaction() as connection:
             connection.execute(
-                "INSERT INTO tool_attempts VALUES (?, ?, ?, ?, ?, ?, 'started', NULL)",
+                "INSERT INTO tool_attempts (attempt_id,session_id,turn_id,call_id,tool_name,arguments,status,result,started_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'started', NULL, ?)",
                 (data["attempt_id"], session_id, turn_id, data["call_id"], data["name"],
-                 json.dumps(data["arguments"], ensure_ascii=False)),
+                 json.dumps(data["arguments"], ensure_ascii=False), datetime.now(timezone.utc).isoformat()),
             )
 
     def finish(self, session_id: str, turn_id: str, data: dict[str, Any]) -> None:
         with self.database.transaction() as connection:
             connection.execute(
-                "INSERT INTO tool_attempts VALUES (?, ?, ?, ?, ?, ?, 'completed', ?) "
-                "ON CONFLICT(attempt_id) DO UPDATE SET status='completed', result=excluded.result",
+                "INSERT INTO tool_attempts (attempt_id,session_id,turn_id,call_id,tool_name,arguments,status,result,finished_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'completed', ?, ?) "
+                "ON CONFLICT(attempt_id) DO UPDATE SET status='completed', result=excluded.result, finished_at=excluded.finished_at",
                 (data["attempt_id"], session_id, turn_id, data["call_id"], data["name"],
                  json.dumps(data.get("arguments", {}), ensure_ascii=False),
-                 json.dumps(data["result"], ensure_ascii=False)),
+                 json.dumps(data["result"], ensure_ascii=False), datetime.now(timezone.utc).isoformat()),
             )
 
     def unresolved(self, session_id: str, turn_id: str) -> list[dict[str, Any]]:
