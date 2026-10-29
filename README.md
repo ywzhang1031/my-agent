@@ -336,6 +336,7 @@ REPL 支持这些本地命令：
 - `/trace`：显示当前 raw trace 路径
 - `/tools`：列出可用工具
 - `/context`：查看估算的 context 使用量和 compaction 状态
+- `/verification`：查看本轮已提交的修改与验证证据，不等于任务验收
 - `/goal`：查看当前结构化 Goal；idle 且没有 pending turn 时可以清除
 - `/model`：打开模型选择器，用上下方向键选择、`Enter` 切换、`Esc` 取消
 - `/mode`：用同样的选择器切换 Build/Plan；running 或 pending turn 存在时拒绝切换
@@ -584,6 +585,22 @@ PYTHONPATH=. .venv/bin/python -m unittest discover -s tests
 [docs/development-log.md](docs/development-log.md)。
 
 ## Persistence and Recovery
+
+Web 点击“新建”只创建当前页面的草稿，首次发送后才保存 session。空草稿不进入历史，刷新后不保留。
+首条消息提供默认标题，手动命名优先；不会自动删除已有空会话。重复点击新建不会清空当前草稿。
+
+## Verification Evidence
+
+Web inspector 和 CLI `/verification` 使用同一份从 SQLite tool attempts 派生的视图，RPC 为
+`verification.read`（`session_id`，可选 `turn_id`）。旧 session 无工具账本时不补造验证证据。
+
+- `checks_passed` 只表示记录中相应命令成功退出，不代表测试覆盖充分或任务验收。
+- `stale` 表示本 turn 记录到检查之后再次成功 apply_patch；相同命令和 cwd 重跑可以更新对应状态。
+- `unknown` 保留缺失结果、超时、中断的不确定性；拒绝或未启动的命令不算通过。
+- 新鲜度只基于本 turn 的串行 patch 顺序，不追踪外部编辑、其他 session 或命令内部的文件修改。
+- 显示的时间是工具检查点记录时间。旧账本没有时间就保持未知；没有自动执行、强制门禁或无限重试。
+
+## Storage
 
 运行状态与持久事件现在存放在 sessions root 的 `agent.sqlite3` 中，采用短事务和
 `synchronous=FULL`；消息与 session 元数据作为同一快照提交，revision 防止旧快照覆盖新状态。

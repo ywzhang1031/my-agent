@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import shlex
 import sys
 from pathlib import Path
 from queue import Empty
@@ -59,6 +60,7 @@ from .sandbox import (
 from .service import AgentService
 from .goals import GoalState
 from .session import SessionState, SessionStore
+from .verification import read_verification
 from .server_instance import ServerInstanceLease
 from .terminal import (
     LineEditor,
@@ -90,6 +92,7 @@ SLASH_COMMANDS = (
     SlashCommand("/sessions", "List saved sessions"),
     SlashCommand("/summary", "Show current session state"),
     SlashCommand("/context", "Show detailed context usage"),
+    SlashCommand("/verification", "Show committed changes and validation evidence"),
     SlashCommand("/model", "Choose the model"),
     SlashCommand("/mode", "Choose Build or Plan mode"),
     SlashCommand("/permissions", "Choose the permission profile"),
@@ -336,6 +339,9 @@ def _run_ask(args: argparse.Namespace) -> int:
     finally:
         service.close()
         _export_session_artifacts(state)
+        evidence = read_verification(store.database, state.session_id)
+        if evidence["status"] != "no_evidence":
+            _print_verification(evidence, file=sys.stderr)
     if args.stream:
         renderer.finish(terminal_event.answer)
     else:
@@ -838,6 +844,9 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                 if user_input == "/config":
                     _print_runtime_config(args.runtime_config)
                     continue
+                if user_input == "/verification":
+                    _print_verification(read_verification(store.database, state.session_id))
+                    continue
                 if user_input == "/context":
                     snapshot = service.inspect_context(state.session_id)
                     print(
@@ -1085,6 +1094,9 @@ def _run_chat_turn(
     finally:
         _export_session_artifacts(state)
     _render_terminal_event(args, renderer, terminal_event)
+    evidence = read_verification(store.database, state.session_id, terminal_event.turn_id)
+    if evidence["status"] != "no_evidence":
+        _print_verification(evidence)
     return terminal_event
 
 
@@ -1436,6 +1448,19 @@ def _print_permission_grants(grants: tuple[ApprovalGrant, ...]) -> None:
     print("Runtime permission grants (cleared when the runtime stops)")
     for grant in grants:
         print(f"  {grant.action:<16}{grant.resource} ({grant.description})")
+
+
+def _print_verification(evidence: dict, *, file=None) -> None:
+    print(f"verification: {evidence['status']} (command evidence, not task acceptance)", file=file)
+    for change in evidence["changed_files"]:
+        print(f"  changed: {change['path']}", file=file)
+    for check in evidence["checks"]:
+        command = shlex.join(check["argv"])
+        print(f"  {check['status']} / {check['freshness']}: {command} "
+              f"(cwd={check['cwd']}, exit={check['exit_code']}, recorded={check['finished_at'] or 'unknown'})", file=file)
+    for attempt in evidence["unknown_attempts"]:
+        print(f"  unknown: {attempt['tool_name']} ({attempt['call_id']})", file=file)
+    print("  Scope: this turn's tracked patches only; external and command-side edits are not observed.", file=file)
 
 
 def _print_goal(goal: GoalState | None) -> None:

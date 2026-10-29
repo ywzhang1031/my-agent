@@ -622,6 +622,37 @@ textarea:disabled {
   color: var(--muted);
 }
 
+.verification-section {
+  padding: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.verification-section summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.verification-view {
+  max-height: 300px;
+  overflow: auto;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.verification-view ul {
+  margin: 8px 0;
+  padding-left: 18px;
+}
+
+.verification-view li { margin-bottom: 8px; }
+.verification-view code { white-space: pre-wrap; }
+.verification-view small { display: block; color: var(--muted); }
+.verification-status { font-weight: 600; margin: 10px 0; }
+.verification-status[data-status="failed"] { color: #ad3434; }
+.verification-status[data-status="stale"],
+.verification-status[data-status="unknown"] { color: #94600b; }
+.verification-status[data-status="checks_passed"] { color: #16734f; }
+
 .message {
   margin: 0 0 26px;
 }

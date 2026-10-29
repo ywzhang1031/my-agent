@@ -1,10 +1,12 @@
 import json
+import io
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
 from my_agent.attempt_store import AttemptStore
+from my_agent.cli import _print_verification
 from my_agent.database import Database
 from my_agent.session import SessionStore
 from my_agent.verification import read_verification
@@ -44,6 +46,16 @@ class VerificationTests(unittest.TestCase):
 
     def test_no_tool_evidence_is_not_a_verified_result(self):
         self.assertEqual(self.view()["status"], "no_evidence")
+
+    def test_cli_does_not_report_task_acceptance(self):
+        self.patch()
+        self.check()
+        output = io.StringIO()
+        _print_verification(self.view(), file=output)
+        self.assertIn("checks_passed", output.getvalue())
+        self.assertIn("not task acceptance", output.getvalue())
+        self.assertIn("main.py", output.getvalue())
+        self.assertIn("exit=0", output.getvalue())
 
     def test_edit_requires_validation_and_later_edit_invalidates_evidence(self):
         self.patch()

@@ -64,6 +64,7 @@ const elements = {
   contextBreakdown: document.querySelector("#context-breakdown"),
   contextMeta: document.querySelector("#context-meta"),
   goalView: document.querySelector("#goal-view"),
+  verificationView: document.querySelector("#verification-view"),
   clearGoal: document.querySelector("#clear-goal"),
   permissionGrantList: document.querySelector("#permission-grant-list"),
   clearPermissionGrants: document.querySelector("#clear-permission-grants"),
@@ -84,6 +85,7 @@ const state = {
   navigationRevision: 0,
   sending: false,
   draftCreation: null,
+  verificationRequest: 0,
   busySessions: new Set(),
   attentionSessions: new Set(),
   lastSequence: new Map(),
@@ -1197,6 +1199,57 @@ async function refreshContext() {
   }
 }
 
+function renderVerification(evidence = null) {
+  const labels = {
+    no_evidence: "暂无修改或验证记录", unverified: "未验证或有检查未执行",
+    checks_passed: "已记录成功检查 · 非任务验收", failed: "检查失败",
+    stale: "检查后又发生修改", unknown: "执行结果未知",
+  };
+  const status = document.createElement("p");
+  status.className = "verification-status";
+  status.dataset.status = evidence?.status || "no_evidence";
+  status.textContent = labels[status.dataset.status] || status.dataset.status;
+  const list = document.createElement("ul");
+  for (const change of evidence?.changed_files || []) {
+    const row = document.createElement("li");
+    row.textContent = `修改：${change.path}`;
+    list.append(row);
+  }
+  const results = { passed: "成功", failed: "失败", unknown: "未知", not_run: "未执行" };
+  for (const check of evidence?.checks || []) {
+    const row = document.createElement("li");
+    const command = document.createElement("code");
+    command.textContent = check.argv.map(arg => /[\s"']/.test(arg) ? JSON.stringify(arg) : arg).join(" ");
+    const detail = document.createElement("small");
+    detail.textContent = `${results[check.status] || check.status} · exit ${check.exit_code ?? "未知"} · ${check.cwd}`;
+    const time = document.createElement("small");
+    time.textContent = `${check.finished_at ? `记录于 ${formatTime(check.finished_at)}` : "时间未记录"}${check.freshness === "stale" ? " · 此后有修改" : ""}`;
+    row.append(command, detail, time);
+    list.append(row);
+  }
+  for (const attempt of evidence?.unknown_attempts || []) {
+    const row = document.createElement("li");
+    row.textContent = `结果未确认：${attempt.tool_name} · ${attempt.call_id}`;
+    list.append(row);
+  }
+  const scope = document.createElement("small");
+  scope.textContent = evidence?.turn_id
+    ? `Turn ${evidence.turn_id.split(":").pop()} · 仅本轮已追踪的 patch；外部、命令内修改及测试覆盖未知。` : "";
+  elements.verificationView.replaceChildren(status, list, scope);
+}
+
+async function refreshVerification() {
+  const sessionID = selectedSessionID();
+  const request = ++state.verificationRequest;
+  if (!sessionID) return renderVerification();
+  try {
+    const result = await rpc("verification.read", { session_id: sessionID });
+    if (sessionID === selectedSessionID() && request === state.verificationRequest) renderVerification(result.verification);
+  } catch (error) {
+    addActivity("验证证据读取失败", error.message, "warning");
+  }
+}
+
 async function refreshPermissionGrants() {
   const sessionID = selectedSessionID();
   if (!sessionID) {
@@ -1293,6 +1346,8 @@ async function selectSession(sessionID) {
     if (navigation !== state.navigationRevision) return;
     state.selectedSession = result.session;
     state.draftCreation = null;
+    state.verificationRequest += 1;
+    renderVerification(result.verification);
     state.currentGoal = null;
     renderGoal();
     state.permissionGrants = [];
@@ -1345,6 +1400,8 @@ function createSession() {
   closeSessionMenu();
   renderMessages([]);
   resetContext();
+  state.verificationRequest += 1;
+  renderVerification();
   renderGoal();
   renderPermissionGrants();
   updateControls();
@@ -1517,11 +1574,14 @@ async function startTurn(userInput) {
     state.itemElements.clear();
     state.credentialRequest = null;
     state.busySessions.add(sessionID);
+    state.verificationRequest += 1;
+    renderVerification();
     updateControls();
     renderSessionList();
     await rpc("turn.start", { session_id: sessionID, user_input: text });
   } catch (error) {
     state.busySessions.delete(sessionID);
+    if (!sessionID && error.code === "invalid_params") state.draftCreation = null;
     if (!elements.promptInput.value) elements.promptInput.value = text;
     resizePrompt();
     addActivity("Turn 启动失败", error.message, "danger");
@@ -1812,6 +1872,8 @@ async function handleTerminalEvent(event, tone, detail) {
       if (sessionID !== selectedSessionID()) return;
       state.selectedSession = result.session;
       loadProjection(result.projection);
+      state.verificationRequest += 1;
+      renderVerification(result.verification);
       syncCredentialRequest(state.selectedSession);
       renderMessages(result.messages || []);
       updateControls();
@@ -1856,6 +1918,7 @@ async function handleEvent(event) {
       break;
     case "item.completed":
       applyItemEvent(event, "completed");
+      if (sessionID === selectedSessionID() && payload.item_type === "tool_call") await refreshVerification();
       break;
     case "item.failed":
       applyItemEvent(event, payload.status || "failed");

@@ -58,10 +58,21 @@ const { chromium } = require('playwright');
     await page.locator('#send-prompt').click();
     await page.waitForFunction(() => !state.sending && state.selectedSession?.message_count === 2);
     assert.equal(await page.locator('#session-title-text').innerText(), 'Manual draft title');
+    assert.match(await page.locator('#verification-view').innerText(), /暂无修改或验证记录/);
+    // Rendering check only: authoritative projection behavior is covered by Python tests.
+    await page.evaluate(() => renderVerification({
+      turn_id: `${selectedSessionID()}:1`, status: 'stale',
+      changed_files: [{ path: 'src/a-very-long-workspace-relative-filename-for-wrapping.py' }],
+      checks: [{ argv: ['python', '-m', 'unittest', 'discover', '-s', 'tests'], cwd: '.',
+        status: 'passed', exit_code: 0, finished_at: new Date().toISOString(), freshness: 'stale' }],
+      unknown_attempts: [],
+    }));
+    assert.match(await page.locator('#verification-view').innerText(), /检查后又发生修改/);
     const out = path.join(root, '.my-agent/ui-checks');
     mkdirSync(out, { recursive: true });
     await page.screenshot({ path: path.join(out, 'desktop.png') });
     await page.setViewportSize({ width: 390, height: 844 });
+    await page.locator('#inspector-toggle').click();
     assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
     await page.screenshot({ path: path.join(out, 'mobile.png') });
     assert.deepEqual(errors, []);

@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from my_agent.agent_loop import TurnResult
+from my_agent.attempt_store import AttemptStore
 from my_agent.app_server import AppServer
 from my_agent.config import ConfiguredModel
 from my_agent.control import ApprovalGrant
@@ -254,6 +255,21 @@ class AppServerTests(unittest.TestCase):
         result = self.rpc("session.create", title="bad\ntitle")
         self.assertFalse(result.ok)
         self.assertEqual(self.store.list_sessions(), [])
+
+    def test_verification_is_available_for_inactive_sessions(self):
+        session_id = self.create_session()
+        state = self.runtimes[session_id].session
+        state.turn_counter = 1
+        self.store.save(state)
+        data = {"attempt_id": "evidence", "call_id": "check", "name": "exec_command", "arguments": {"argv": ["pytest"]},
+                "result": {"ok": False, "exit_code": 1, "metadata": {"category": "test", "status": "nonzero_exit"}}}
+        AttemptStore(self.store.database).finish(session_id, session_id + ":1", data)
+        self.assertTrue(self.rpc("session.close", session_id=session_id).ok)
+        response = self.rpc("verification.read", session_id=session_id)
+        self.assertTrue(response.ok)
+        self.assertEqual(response.result["verification"]["status"], "failed")
+        self.assertEqual(self.rpc("session.read", session_id=session_id).result["verification"], response.result["verification"])
+        self.assertFalse(self.rpc("verification.read", session_id=session_id, turn_id="other:1").ok)
 
     def complete_turn(self, session_id: str, answer: str) -> None:
         self.runtimes[session_id].events.put(

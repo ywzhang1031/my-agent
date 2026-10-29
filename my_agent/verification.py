@@ -64,8 +64,11 @@ def read_verification(database: Database, session_id: str, turn_id: str | None =
             check_status = "passed"
         else:
             check_status = "failed"
+        argv = metadata.get("normalized_argv", args.get("argv", []))
+        if not isinstance(argv, list) or not all(isinstance(arg, str) for arg in argv):
+            argv = []
         checks.append({**base, "order": order, "status": check_status,
-                       "argv": metadata.get("normalized_argv", args.get("argv", [])),
+                       "argv": argv,
                        "cwd": metadata.get("cwd", args.get("cwd", ".")),
                        "category": metadata.get("category"), "exit_code": exit_code,
                        "duration_ms": metadata.get("duration_ms")})

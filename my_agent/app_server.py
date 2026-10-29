@@ -34,6 +34,7 @@ from .sandbox import SANDBOX_PROFILES, get_sandbox_profile, sandbox_availability
 from .service import AgentService, ServiceSessionView
 from .server_instance import ServerInstanceLease
 from .session import SessionState, SessionStore, message_to_dict, normalize_session_title
+from .verification import read_verification
 from .database import StorageError
 from .request_store import MUTATING_METHODS, RequestStore
 
@@ -173,6 +174,7 @@ class AppServer:
             "session.create": self._create_session,
             "session.list": self._list_sessions,
             "session.read": self._read_session,
+            "verification.read": self._read_verification,
             "session.resume": self._resume_session,
             "session.close": self._close_session,
             "session.rename": self._rename_session,
@@ -292,7 +294,16 @@ class AppServer:
             ),
             "messages": [message_to_dict(message) for message in state.messages],
             "projection": self.agent_service.projection(session_id),
+            "verification": read_verification(self.session_store.database, session_id),
         }
+
+    def _read_verification(self, params: dict[str, Any]) -> dict[str, Any]:
+        self._check_params(params, required={"session_id"}, optional={"turn_id"})
+        session_id = self._required_string(params, "session_id")
+        self._require_workspace(self.session_store.load(session_id, recover=False))
+        return {"verification": read_verification(
+            self.session_store.database, session_id, self._optional_string(params, "turn_id"),
+        )}
 
     def _resume_session(self, params: dict[str, Any]) -> dict[str, Any]:
         session_id = self._session_id(params)

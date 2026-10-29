@@ -586,3 +586,11 @@ Sandbox policy 从启动参数和只读状态提升为可查询、可切换的 s
   命令自身和其他 session 的文件修改不在此新鲜度判断范围内。
 - schema v5 为 attempt 增加检查点记录时间；旧数据保持 NULL，不伪造历史时间。投影没有独立持久状态。
 - 增加回滚不可见、数据库重开、turn 隔离、版本迁移、未知结果、失败重试与过期判定测试。
+
+## Milestone 37: Verification in CLI and Web
+
+- `session.read` 返回本轮验证投影，新增只读 `verification.read` RPC，支持已关闭会话与指定 turn。
+- CLI `/verification` 查看记录，运行后有证据时自动展示；Web inspector 展示文件、命令、退出码与
+  记录时间，工具完成和会话刷新后更新。明确标注范围和未追踪的修改。
+- 保持 `turn.completed`、Goal 和 Plan 的现有运行语义，不增加强制测试、自动续跑或完成门禁。
+- 增加 inactive session RPC、CLI 输出与浏览器长文本/窄屏检查。
