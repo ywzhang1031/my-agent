@@ -528,8 +528,7 @@ class AppServerTests(unittest.TestCase):
         )
         self.assertNotIn("new-secret", str(response.result))
         persisted_session = self.store.load(session_id)
-        self.assertNotIn("new-secret", persisted_session.metadata_path.read_text())
-        self.assertNotIn("new-secret", persisted_session.messages_path.read_text())
+        self.assertNotIn(b"new-secret", self.store.database.path.read_bytes())
 
     def test_closing_an_active_session_interrupts_and_flushes_its_event(self) -> None:
         session_id = self.create_session()

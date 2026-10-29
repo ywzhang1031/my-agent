@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .database import Database, RevisionConflict
 from .goals import GoalState, goal_from_dict
 from .messages import AssistantMessage, Message, ToolCall, ToolResultMessage, UserMessage
 from .modes import BUILD_MODE
@@ -50,6 +51,8 @@ class SessionState:
     session_dir: Path
     created_at: str
     updated_at: str
+    revision: int = 0
+    turn_counter: int = 0
     title: str = ""
     messages: list[Message] = field(default_factory=list)
     context_summary: str = ""
@@ -64,14 +67,6 @@ class SessionState:
     goal: GoalState | None = None
     proposed_plan: ProposedPlan | None = None
     pending_turn: PendingTurn | None = None
-
-    @property
-    def metadata_path(self) -> Path:
-        return self.session_dir / "session.json"
-
-    @property
-    def messages_path(self) -> Path:
-        return self.session_dir / "messages.jsonl"
 
     @property
     def trace_path(self) -> Path:
@@ -104,6 +99,7 @@ class SessionSummary:
 class SessionStore:
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root).expanduser().resolve()
+        self.database = Database(self.root)
 
     def create(self, workspace: str | Path) -> SessionState:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -129,111 +125,116 @@ class SessionStore:
 
     def load(self, session_id: str) -> SessionState:
         session_dir = self._session_dir(session_id)
-        metadata_path = session_dir / "session.json"
-        messages_path = session_dir / "messages.jsonl"
-        if not metadata_path.is_file():
+        with self.database.transaction() as connection:
+            row = connection.execute(
+                "SELECT revision, data FROM sessions WHERE session_id=?", (session_id,)
+            ).fetchone()
+        if row is None:
             raise FileNotFoundError(f"session not found: {session_id}")
-
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        messages: list[Message] = []
-        if messages_path.exists():
-            for line_number, line in enumerate(
-                messages_path.read_text(encoding="utf-8").splitlines(), start=1
-            ):
-                if not line.strip():
-                    continue
-                try:
-                    messages.append(message_from_dict(json.loads(line)))
-                except (json.JSONDecodeError, TypeError, ValueError) as exc:
-                    raise ValueError(
-                        f"invalid message in {messages_path} line {line_number}: {exc}"
-                    ) from exc
-
-        return SessionState(
-            session_id=metadata["session_id"],
-            workspace=metadata["workspace"],
-            session_dir=session_dir,
-            created_at=metadata["created_at"],
-            updated_at=metadata["updated_at"],
-            title=str(metadata.get("title", "")),
-            messages=messages,
-            context_summary=metadata.get("context_summary", ""),
-            summarized_message_count=int(metadata.get("summarized_message_count", 0)),
-            last_input_tokens=int(metadata.get("last_input_tokens", 0)),
-            last_output_tokens=int(metadata.get("last_output_tokens", 0)),
-            provider_id=metadata.get("provider_id"),
-            model_id=metadata.get("model_id"),
-            mode_id=str(metadata.get("mode_id", BUILD_MODE.mode_id)),
-            permission_profile_id=get_permission_profile(
-                str(
-                    metadata.get(
-                        "permission_profile_id",
-                        DEFAULT_PERMISSION_PROFILE_ID,
-                    )
-                )
-            ).profile_id,
-            sandbox_mode=_sandbox_mode(metadata.get("sandbox_mode")),
-            goal=goal_from_dict(metadata.get("goal")),
-            proposed_plan=_proposed_plan_from_dict(metadata.get("proposed_plan")),
-            pending_turn=_pending_turn_from_dict(metadata.get("pending_turn")),
-        )
+        return session_from_dict(json.loads(row[1]), session_dir, revision=row[0])
 
     def save(self, state: SessionState) -> None:
         state.session_dir.mkdir(parents=True, exist_ok=True)
-        state.updated_at = _now()
-        metadata = {
-            "session_id": state.session_id,
-            "title": state.title,
-            "workspace": state.workspace,
-            "created_at": state.created_at,
-            "updated_at": state.updated_at,
-            "message_count": len(state.messages),
-            "context_summary": state.context_summary,
-            "summarized_message_count": state.summarized_message_count,
-            "last_input_tokens": state.last_input_tokens,
-            "last_output_tokens": state.last_output_tokens,
-            "provider_id": state.provider_id,
-            "model_id": state.model_id,
-            "mode_id": state.mode_id,
-            "permission_profile_id": state.permission_profile_id,
-            "sandbox_mode": state.sandbox_mode,
-            "goal": state.goal.to_dict() if state.goal is not None else None,
-            "proposed_plan": _proposed_plan_to_dict(state.proposed_plan),
-            "pending_turn": _pending_turn_to_dict(state.pending_turn),
-        }
-        state.metadata_path.write_text(
-            json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        state.messages_path.write_text(
-            "".join(
-                json.dumps(message_to_dict(message), ensure_ascii=False) + "\n"
-                for message in state.messages
-            ),
-            encoding="utf-8",
-        )
+        updated_at = _now()
+        data = session_to_dict(state)
+        data["updated_at"] = updated_at
+        with self.database.transaction() as connection:
+            if state.revision == 0:
+                row = connection.execute(
+                    "INSERT OR IGNORE INTO sessions VALUES (?, 1, ?)",
+                    (state.session_id, json.dumps(data, ensure_ascii=False)),
+                )
+            else:
+                row = connection.execute(
+                    "UPDATE sessions SET revision=revision+1, data=? "
+                    "WHERE session_id=? AND revision=?",
+                    (json.dumps(data, ensure_ascii=False), state.session_id, state.revision),
+                )
+            if row.rowcount != 1:
+                raise RevisionConflict(f"stale session revision: {state.session_id}")
+            old_revision, old_updated_at = state.revision, state.updated_at
+            def restore() -> None:
+                state.revision, state.updated_at = old_revision, old_updated_at
+            self.database.on_rollback(restore)
+            state.revision += 1
+            state.updated_at = updated_at
 
     def list_sessions(self) -> list[SessionSummary]:
-        if not self.root.exists():
-            return []
-        sessions: list[SessionSummary] = []
-        for metadata_path in self.root.glob("*/session.json"):
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            sessions.append(
-                SessionSummary(
-                    session_id=metadata["session_id"],
-                    title=str(metadata.get("title", "")),
-                    workspace=metadata["workspace"],
-                    updated_at=metadata["updated_at"],
-                    message_count=int(metadata.get("message_count", 0)),
-                )
-            )
+        with self.database.transaction() as connection:
+            rows = connection.execute("SELECT data FROM sessions").fetchall()
+        sessions = []
+        for row in rows:
+            metadata = json.loads(row[0])
+            sessions.append(SessionSummary(
+                session_id=metadata["session_id"], title=metadata.get("title", ""),
+                workspace=metadata["workspace"], updated_at=metadata["updated_at"],
+                message_count=len(metadata["messages"]),
+            ))
         return sorted(sessions, key=lambda item: item.updated_at, reverse=True)
 
     def _session_dir(self, session_id: str) -> Path:
-        if not re.fullmatch(r"[A-Za-z0-9._-]+", session_id):
+        if not re.fullmatch(r"[A-Za-z0-9_-][A-Za-z0-9._-]*", session_id):
             raise ValueError(f"invalid session id: {session_id}")
         return self.root / session_id
+
+
+def session_from_dict(metadata: dict[str, Any], session_dir: Path, *, revision: int = 0) -> SessionState:
+    messages = [message_from_dict(message) for message in metadata["messages"]]
+    return SessionState(
+        session_id=metadata["session_id"],
+        workspace=metadata["workspace"],
+        session_dir=session_dir,
+        created_at=metadata["created_at"],
+        updated_at=metadata["updated_at"],
+        revision=revision,
+        turn_counter=int(metadata.get("turn_counter", sum(isinstance(m, UserMessage) for m in messages))),
+        title=str(metadata.get("title", "")),
+        messages=messages,
+        context_summary=metadata.get("context_summary", ""),
+        summarized_message_count=int(metadata.get("summarized_message_count", 0)),
+        last_input_tokens=int(metadata.get("last_input_tokens", 0)),
+        last_output_tokens=int(metadata.get("last_output_tokens", 0)),
+        provider_id=metadata.get("provider_id"),
+        model_id=metadata.get("model_id"),
+        mode_id=str(metadata.get("mode_id", BUILD_MODE.mode_id)),
+        permission_profile_id=get_permission_profile(
+            str(
+                metadata.get(
+                    "permission_profile_id",
+                    DEFAULT_PERMISSION_PROFILE_ID,
+                )
+            )
+        ).profile_id,
+        sandbox_mode=_sandbox_mode(metadata.get("sandbox_mode")),
+        goal=goal_from_dict(metadata.get("goal")),
+        proposed_plan=_proposed_plan_from_dict(metadata.get("proposed_plan")),
+        pending_turn=_pending_turn_from_dict(metadata.get("pending_turn")),
+    )
+
+
+def session_to_dict(state: SessionState) -> dict[str, Any]:
+    return {
+        "session_id": state.session_id,
+        "title": state.title,
+        "workspace": state.workspace,
+        "created_at": state.created_at,
+        "updated_at": state.updated_at,
+        "message_count": len(state.messages),
+        "messages": [message_to_dict(message) for message in state.messages],
+        "turn_counter": state.turn_counter,
+        "context_summary": state.context_summary,
+        "summarized_message_count": state.summarized_message_count,
+        "last_input_tokens": state.last_input_tokens,
+        "last_output_tokens": state.last_output_tokens,
+        "provider_id": state.provider_id,
+        "model_id": state.model_id,
+        "mode_id": state.mode_id,
+        "permission_profile_id": state.permission_profile_id,
+        "sandbox_mode": state.sandbox_mode,
+        "goal": state.goal.to_dict() if state.goal is not None else None,
+        "proposed_plan": _proposed_plan_to_dict(state.proposed_plan),
+        "pending_turn": _pending_turn_to_dict(state.pending_turn),
+    }
 
 
 def normalize_session_title(value: str) -> str:

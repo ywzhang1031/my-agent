@@ -127,6 +127,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a minimal coding agent.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    migrate = subparsers.add_parser("migrate", help="Back up and migrate stopped legacy session storage to SQLite.")
+    migrate.add_argument("--sessions-dir", required=True)
+
     ask = subparsers.add_parser("ask", help="Run one persisted conversation turn.")
     _add_runtime_options(ask)
     ask.add_argument("prompt", nargs="*", help="Task for the agent. Reads stdin if omitted.")
@@ -166,6 +169,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.command == "migrate":
+            from .migration import migrate_sessions
+            print(json.dumps(migrate_sessions(args.sessions_dir), ensure_ascii=False, indent=2))
+            return 0
         args.runtime_config = load_runtime_config(args.config, args.credentials)
         if args.command == "ask":
             return _run_ask(args)

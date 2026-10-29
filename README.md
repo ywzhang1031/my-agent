@@ -584,6 +584,19 @@ PYTHONPATH=. .venv/bin/python -m unittest discover -s tests
 
 ## Export Trajectory
 
+运行状态与持久事件现在存放在 sessions root 的 `agent.sqlite3` 中，采用短事务和
+`synchronous=FULL`；消息与 session 元数据作为同一快照提交，revision 防止旧快照覆盖新状态。
+SQLite 使用默认 rollback journal，当前不引入 WAL 或网络文件系统部署。
+
+旧版 JSON 会话需要先停止使用该 sessions root 的服务，然后显式迁移：
+
+```bash
+.venv/bin/python cli.py migrate --sessions-dir .my-agent/sessions
+```
+
+迁移会保留原文件、创建带 SHA-256 manifest 的 `.legacy-backup-*`，在暂存数据库完成校验后才
+切换。损坏记录或消息数量不一致会中止，不会静默丢弃。不要把这些包含对话内容的文件提交到 Git。
+
 ```bash
 WORKSPACE=/path/to/repo
 SESSION_ID=20260803-120000-abcdef

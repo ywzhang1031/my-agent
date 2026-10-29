@@ -429,8 +429,8 @@ class MyAgentTests(unittest.TestCase):
             self.assertEqual(loaded.goal, state.goal)
             self.assertEqual(loaded.proposed_plan, state.proposed_plan)
             self.assertEqual(loaded.pending_turn, state.pending_turn)
-            self.assertTrue(loaded.metadata_path.exists())
-            self.assertTrue(loaded.messages_path.exists())
+            self.assertTrue(store.database.path.exists())
+            self.assertGreater(loaded.revision, 0)
             self.assertEqual(store.list_sessions()[0].session_id, state.session_id)
 
     def test_agent_loop_run_turn_reuses_history_and_records_turn_ids(self):
