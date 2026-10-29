@@ -14,6 +14,7 @@ from .control import (
     TurnInterrupted,
     raise_if_cancelled,
 )
+from .goals import GoalState, format_goal_context, update_goal
 from .messages import AssistantMessage, Message, ToolCall, ToolResultMessage, UserMessage
 from .model_invoker import ModelInvoker, RetryScheduled
 from .modes import BUILD_MODE, CollaborationMode, extract_proposed_plan
@@ -88,6 +89,12 @@ class AgentLoop:
     @property
     def instructions(self) -> str:
         return self.mode.instructions
+
+    def _instructions_for(self, state: SessionState) -> str:
+        goal_context = format_goal_context(state.goal)
+        if not goal_context:
+            return self.instructions
+        return f"{self.instructions.rstrip()}\n\n{goal_context}\n"
 
     def run_turn(
         self,
@@ -180,7 +187,7 @@ class AgentLoop:
         return self.context_manager.inspect(
             state=state,
             tools=self.tools.specs(),
-            system_prompt=self.instructions,
+            system_prompt=self._instructions_for(state),
         )
 
     def switch_model(self, model: ModelInvoker) -> None:
@@ -200,6 +207,19 @@ class AgentLoop:
 
     def switch_sandbox(self, mode: str) -> None:
         self.sandbox_policy = SandboxPolicy(mode=mode, workspace=self.workspace.root)
+
+    def clear_goal(self, state: SessionState) -> GoalState | None:
+        goal = state.goal
+        state.goal = None
+        if goal is not None:
+            self.trace.write(
+                "goal_cleared",
+                {
+                    "session_id": state.session_id,
+                    "goal_id": goal.goal_id,
+                },
+            )
+        return goal
 
     def approve_plan(self, state: SessionState) -> ProposedPlan:
         if state.pending_turn is not None:
@@ -273,6 +293,7 @@ class AgentLoop:
             approvals=approvals or AutoApproveBroker(),
             cancel_event=cancel_event,
             sandbox_policy=self.sandbox_policy,
+            goal_updater=lambda arguments: self._update_goal(state, arguments),
         )
         event_context = {
             "session_id": state.session_id,
@@ -290,7 +311,7 @@ class AgentLoop:
                 snapshot = self.context_manager.prepare(
                     state=state,
                     tools=self.tools.specs(),
-                    system_prompt=self.instructions,
+                    system_prompt=self._instructions_for(state),
                 )
                 if snapshot.compacted_messages:
                     self.trace.write(
@@ -577,6 +598,23 @@ class AgentLoop:
                             },
                         ),
                     )
+                    goal_payload = tool_result.metadata.get("goal")
+                    if (
+                        tool_result.ok
+                        and tool_result.metadata.get("status") == "goal_updated"
+                        and isinstance(goal_payload, dict)
+                    ):
+                        goal_event = {
+                            **event_context,
+                            "step": step,
+                            "call_id": call.call_id,
+                            "goal": goal_payload,
+                        }
+                        self.trace.write("goal_updated", goal_event)
+                        self._emit(
+                            event_handler,
+                            AgentEvent(kind="goal_updated", data=goal_event),
+                        )
                     messages.append(
                         ToolResultMessage(
                             tool_call_id=call.call_id,
@@ -625,6 +663,15 @@ class AgentLoop:
             stopped_by="continuation_required",
             mode_id=self.mode.mode_id,
         )
+
+    @staticmethod
+    def _update_goal(
+        state: SessionState,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        goal = update_goal(state.goal, arguments)
+        state.goal = goal
+        return goal.to_dict()
 
     def _finish_plan_execution(
         self,

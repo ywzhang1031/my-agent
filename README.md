@@ -1,8 +1,8 @@
 # My Agent
 
 一个从只读诊断 loop 逐步生长出来的最小 coding agent。它现在具备 Plan/Build collaboration
-mode、可持久化 permission profile、流式模型输出、tool 进度、交互审批、可中断/恢复 turn、命令行历史和自动 context
-compaction。Build 主循环是：
+mode、结构化 Goal、可持久化 permission profile、流式模型输出、tool 进度、交互审批、可中断/恢复
+turn、命令行历史和自动 context compaction。Build 主循环是：
 
 ```text
 user task -> model -> tool proposal -> approval -> tool result -> model -> final answer
@@ -16,6 +16,10 @@ Build mode 暴露这些工具：
 - `apply_patch`
 - `git_diff`
 - `exec_command`
+- `update_goal`
+
+`update_goal` 把跨 turn 的任务目标和步骤进度写入 `session.json`。它是 Build mode 中的 harness
+工具，不会直接产生文件或进程副作用，也不向 Plan mode 暴露。
 
 `exec_command` 接受结构化 `argv`、workspace-relative `cwd` 和受 harness 上限约束的
 `timeout_seconds`，不接受 shell command string。例如：
@@ -146,6 +150,7 @@ DEEPSEEK_API_KEY=... .venv/bin/python cli.py ui --workspace . --open-browser
 - 流式 answer/thinking、provider retry 和 tool activity
 - `apply_patch` / `exec_command` 的 once/session/deny 审批
 - Plan mode 计划正文、执行或修改操作
+- 当前 Goal 的目标、步骤和状态，以及 idle 时的显式清除操作
 - provider/model 与 Build/Plan mode 切换；模型、权限和 sandbox 使用紧凑、可键盘导航的弹出菜单
 - `supervised` / `accept_edits` / `trusted` 权限策略切换
 - 分类 context 使用量、pending turn 的 retry/abort 和运行中 turn 的 interrupt
@@ -206,11 +211,12 @@ DEEPSEEK_API_KEY=... .venv/bin/python cli.py serve --workspace .
 control plane 提供：
 
 - `session.create/list/read/resume/close/rename`
-- `model.list`、`mode.list`、`permission.list`、`permission.grants.list`、`sandbox.list`、`context.inspect`
+- `model.list`、`mode.list`、`permission.list`、`permission.grants.list`、`sandbox.list`、`context.inspect`、
+  `goal.read`
 - `turn.start/retry/interrupt/abort`
 - `approval.resolve`、`model.switch`、`mode.switch`、`permission.switch`、
   `permission.grant.revoke`、`permission.grants.clear`、`sandbox.switch`
-- `plan.execute/revise`、`events.subscribe/unsubscribe`
+- `plan.execute/revise`、`goal.clear`、`events.subscribe/unsubscribe`
 
 `session.close` 只停止并卸载内存 runtime，不删除磁盘记录；`session.resume` 将它重新加载。AppServer
 保证同一 session 同时只有一个 active turn，不同 session 可以并发运行。客户端断线后调用
@@ -241,8 +247,8 @@ WebSocket/SSE 时可以继续复用同一 AppServer、subscription 和 projectio
 - `plan`：`plan mode` 是一种 mode；模型产出的具体计划则是跨 turn 保存、可修改和审批的 artifact。
 - `subagent`：拥有独立 context、turn 和执行状态的子 runtime，通常通过父子关系和主 agent 协作；
   它是一种执行拓扑，不是 mode。
-- `goal`：跨多个 turn 持续存在的目标与进度状态，可由不同 mode 或 subagent 推进；它是持久状态，
-  也不是 mode。
+- `goal`：跨多个 turn 持续存在的目标与进度状态，是 `SessionState` 的持久字段，不是 mode。当前 v1
+  每个 session 只保存一个 Goal，包含 objective、最多 12 个有序 step 和派生的 active/completed 状态。
 
 ## Collaboration Modes
 
@@ -250,8 +256,10 @@ WebSocket/SSE 时可以继续复用同一 AppServer、subscription 和 projectio
 是否写代码：
 
 - `build`：默认模式，暴露全部读写和受控命令工具，继续执行 model -> tool -> observation loop。
+- Build 中的 `update_goal` 允许模型提交完整 Goal 快照；成功结果既成为下一次模型请求的 observation，
+  也立即持久化并发布 `goal.updated` typed event。
 - `plan`：只暴露 `list_files`、`read_file`、`search`、`git_diff`，不向模型提供 `apply_patch` 或
-  `exec_command`。模型可以多轮探索和澄清，但不能执行实现。
+  `exec_command`、`update_goal`。模型可以多轮探索和澄清，但不能执行实现或修改执行进度。
 
 可以启动时指定，也可以在 idle session 中用 `/mode` 的上下方向键选择：
 
@@ -312,6 +320,7 @@ REPL 支持这些本地命令：
 - `/trace`：显示当前 raw trace 路径
 - `/tools`：列出可用工具
 - `/context`：查看估算的 context 使用量和 compaction 状态
+- `/goal`：查看当前结构化 Goal；idle 且没有 pending turn 时可以清除
 - `/model`：打开模型选择器，用上下方向键选择、`Enter` 切换、`Esc` 取消
 - `/mode`：用同样的选择器切换 Build/Plan；running 或 pending turn 存在时拒绝切换
 - `/permissions`：切换 `supervised`、`accept_edits` 或 `trusted` 权限策略
@@ -340,6 +349,8 @@ permission profile、context 百分比、估算用量和 pending
 `Conversation summary`、`Conversation` 和 `Protocol overhead`。它还会显示完整 context limit、
 输入预算、输出预留、最近一次 provider input usage，以及 active/summarized message 数量。没有
 注入 request 的 Rules、Skills、MCP 或 subagent 不会为了界面效果显示成虚构分类。
+当前 Goal 会以结构化 JSON 追加到 system instructions，因此计入 `System prompt`，不会另造一个
+无法与实际请求对齐的 token 类别。
 
 默认启用流式输出；`--no-stream` 可以只在本轮结束时显示完整答案。thinking 默认仍会发给
 DeepSeek，但 CLI 只显示 `thinking...` 状态；使用 `--show-thinking` 才会流式打印
@@ -405,6 +416,7 @@ OpenAI reasoning 默认使用配置中的 `medium` effort 和 `auto` summary，�
 - `session.py`：序列化统一 `Message`、context 状态和可重试的 `PendingTurn`
 - `config.py`：合并内置模型目录、用户 provider 配置和独立凭据，并解析 `provider/model`
 - `context.py`：估算 token、保留 active turn，并摘要压缩较老的 completed turns
+- `goals.py`：校验单一当前 Goal 的完整快照、派生状态，并生成模型可读的结构化 context
 - `modes.py`：定义 collaboration mode 的 system instructions、tool allowlist 和 plan completion protocol
 - `agent_loop.py`：维护 model -> tool -> observation -> model 循环，并发出统一 `AgentEvent`
 - `provider.py`：定义厂商无关的 request、typed event、ordered output、usage、metadata、
@@ -437,6 +449,7 @@ CLI or AppServer loads SessionState
   -> AgentRuntime starts one worker and publishes lifecycle events
   -> AgentLoop appends UserMessage
   -> PendingTurn records the stable turn_id, step, and completed tool calls
+  -> current Goal is appended to the mode instructions when present
   -> ContextManager estimates the next request
      -> if needed, summarize old completed turns and keep recent raw messages
   -> AgentLoop creates one provider-neutral ModelRequest
@@ -459,7 +472,9 @@ CLI or AppServer loads SessionState
      -> the same suspended tool call resumes; the model is not called again first
   -> approved call executes; denied call becomes a failed ToolResult
      -> exec_command applies the persisted sandbox policy before spawning the process
+     -> update_goal validates and replaces the persisted Goal snapshot without approval
   -> ToolResult becomes ToolResultMessage
+     -> goal changes also publish durable goal.updated events for every client projection
   -> next model request sees the new observation
   -> after edits, git_diff exposes the actual working-tree delta
   -> exec_command runs the narrowest allowlisted validation
@@ -479,11 +494,12 @@ Build execution -> final answer: completed
 `AppServer` 是 UI/transport 的 control-plane 边界；`AgentService` 是 session runtime 与 harness 的
 应用边界。`StartTurnCommand`、
 `InterruptTurnCommand`、`ResolveApprovalCommand`、`SwitchModelCommand`、`SwitchModeCommand`、
-`SwitchPermissionProfileCommand`、`SwitchSandboxCommand`、
+`SwitchPermissionProfileCommand`、`SwitchSandboxCommand`、`ClearGoalCommand`、
 `ExecutePlanCommand`、`RevisePlanCommand` 和 `AbortTurnCommand` 都只包含可序列化字段。输出不再是
 `kind: str + data: dict`，而是 `ItemStartedEvent`、`ItemDeltaEvent`、`ItemCompletedEvent`、
 `TurnContinuationRequiredEvent`、
-`ApprovalRequestedEvent`、`TurnCompletedEvent` 等具体 dataclass；每个事件包含协议版本、event ID、
+`ApprovalRequestedEvent`、`GoalUpdatedEvent`、`GoalClearedEvent`、`TurnCompletedEvent` 等具体
+dataclass；每个事件包含协议版本、event ID、
 session ID、可选 turn ID、单 session 递增序号、durable 标记和显式状态，并可转换为 JSON object。
 
 `AgentRuntime` 降为 service 内部的单 session 执行器，状态机仍使用 `idle`、`running_model`、
@@ -560,8 +576,8 @@ PYTHONPATH=. python3 scripts/export_trajectory.py \
   --output "$WORKSPACE/.my-agent/sessions/$SESSION_ID/trajectory.json"
 ```
 
-`trace.jsonl` 是原始事件流；导出的 `trajectory.json` 使用 `my-agent.trajectory.v6`，先按 turn
+`trace.jsonl` 是原始事件流；导出的 `trajectory.json` 使用 `my-agent.trajectory.v7`，先按 turn
 分组，再按 step 分组，避免不同 turn 中相同 step 编号发生碰撞。每轮结束后会自动刷新
-`trajectory.json`，手动导出主要用于重新生成或校验现有 session trajectory。v5 为每个 turn
-增加 `mode_id`、`approved_plan_id`、`stopped_by`、`plan_events` 和 plan lifecycle metrics；
-approval、interruption 和 context 字段继续保留。
+`trajectory.json`，手动导出主要用于重新生成或校验现有 session trajectory。v7 增加 turn 级和
+session 级 `goal_events`，以及 `goal_updates` / `goal_clears` metrics；approval、interruption、
+plan、continuation 和 context 字段继续保留。

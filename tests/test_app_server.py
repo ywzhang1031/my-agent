@@ -11,6 +11,7 @@ from my_agent.app_server import AppServer
 from my_agent.config import ConfiguredModel
 from my_agent.control import ApprovalGrant
 from my_agent.event_store import EventStore
+from my_agent.goals import GoalState, GoalStep
 from my_agent.modes import BUILD_MODE, COLLABORATION_MODES, get_mode
 from my_agent.permissions import PermissionPolicy
 from my_agent.rpc import (
@@ -141,6 +142,11 @@ class _Runtime:
         removed = len(self.grants)
         self.grants.clear()
         return removed
+
+    def clear_goal(self) -> str | None:
+        goal = self.session.goal
+        self.session.goal = None
+        return goal.goal_id if goal is not None else None
 
 
 class AppServerTests(unittest.TestCase):
@@ -414,6 +420,29 @@ class AppServerTests(unittest.TestCase):
         self.rpc("session.resume", session_id=session_id)
         resumed = self.rpc("permission.grants.list", session_id=session_id)
         self.assertEqual(resumed.result["grants"], [])
+
+    def test_goal_rpc_reads_and_clears_persisted_state(self) -> None:
+        session_id = self.create_session()
+        runtime = self.runtimes[session_id]
+        runtime.session.goal = GoalState(
+            goal_id="goal-1",
+            objective="Update app.py",
+            steps=(GoalStep("Edit app.py", "in_progress"),),
+            status="active",
+            updated_at="2026-10-24T00:00:00+00:00",
+        )
+
+        read = self.rpc("goal.read", session_id=session_id)
+        self.assertEqual(read.result["goal"]["goal_id"], "goal-1")
+
+        cleared = self.rpc("goal.clear", session_id=session_id)
+        self.assertTrue(cleared.ok, cleared.error)
+        event = self.app.next_event(self.subscription_id, timeout=1)
+        self.assertEqual(event.goal_id, "goal-1")
+        self.assertIsNone(self.store.load(session_id).goal)
+        self.assertIsNone(
+            self.rpc("session.read", session_id=session_id).result["session"]["goal"]
+        )
 
     def test_two_sessions_run_concurrently_but_one_session_rejects_overlap(self) -> None:
         first = self.create_session()

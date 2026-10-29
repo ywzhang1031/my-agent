@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
-from typing import Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from .control import ApprovalDecision, ApprovalGrant
 from .event_broker import EventBroker
 from .event_store import EventStore
 from .messages import UserMessage
+from .goals import GoalState
 from .model_invoker import ModelInvoker
 from .modes import BUILD_MODE, CollaborationMode, get_mode
 from .protocol import (
@@ -17,9 +18,12 @@ from .protocol import (
     AgentState,
     ApprovalRequestedEvent,
     ApprovalResolvedEvent,
+    ClearGoalCommand,
     ClearPermissionGrantsCommand,
     ContextCompactedEvent,
     ExecutePlanCommand,
+    GoalClearedEvent,
+    GoalUpdatedEvent,
     InterruptTurnCommand,
     ItemCompletedEvent,
     ItemDeltaEvent,
@@ -85,6 +89,7 @@ class ServiceSessionView:
     mode_id: str
     permission_profile_id: str
     sandbox_mode: str
+    goal: dict[str, Any] | None
     runtime_state: str
     pending_turn_id: str | None
     proposed_plan_id: str | None
@@ -215,6 +220,9 @@ class AgentService:
         if isinstance(command, ClearPermissionGrantsCommand):
             self._clear_permission_grants(handle)
             return
+        if isinstance(command, ClearGoalCommand):
+            self._clear_goal(handle)
+            return
         if isinstance(command, SwitchSandboxCommand):
             self._switch_sandbox(handle, command.mode)
             return
@@ -312,6 +320,9 @@ class AgentService:
     def permission_grants(self, session_id: str) -> tuple[ApprovalGrant, ...]:
         return self._handle(session_id).runtime.permission_grants()
 
+    def current_goal(self, session_id: str) -> GoalState | None:
+        return self._handle(session_id).runtime.session.goal
+
     def session_view(self, session_id: str) -> ServiceSessionView:
         runtime = self._handle(session_id).runtime
         state = runtime.session
@@ -325,6 +336,7 @@ class AgentService:
             mode_id=runtime.loop.mode.mode_id,
             permission_profile_id=state.permission_profile_id,
             sandbox_mode=state.sandbox_mode,
+            goal=state.goal.to_dict() if state.goal is not None else None,
             runtime_state=runtime.state.value,
             pending_turn_id=(state.pending_turn.turn_id if state.pending_turn else None),
             proposed_plan_id=(plan.plan_id if plan else None),
@@ -512,6 +524,17 @@ class AgentService:
             handle,
             reason="cleared",
             removed_count=removed_count,
+        )
+
+    def _clear_goal(self, handle: _SessionHandle) -> None:
+        goal_id = handle.runtime.clear_goal()
+        self._save_session(handle.runtime.session)
+        self._publish(
+            handle,
+            GoalClearedEvent,
+            AgentState.IDLE,
+            turn_id=None,
+            goal_id=goal_id,
         )
 
     def _publish_permission_grants_changed(
@@ -794,6 +817,16 @@ class AgentService:
                 resource=str(data["resource"]),
                 description=str(data["description"]),
                 details=dict(data.get("details", {})),
+            )
+        elif event.kind == "goal_updated":
+            goal = dict(data["goal"])
+            self._save_session(handle.runtime.session)
+            self._publish(
+                handle,
+                GoalUpdatedEvent,
+                state,
+                turn_id=self._current_turn_id(handle),
+                goal=goal,
             )
         elif event.kind == "approval_resolved":
             self._publish(

@@ -33,6 +33,7 @@ class CommandType(str, Enum):
     REVOKE_PERMISSION_GRANT = "permission.grant.revoke"
     CLEAR_PERMISSION_GRANTS = "permission.grants.clear"
     SWITCH_SANDBOX = "sandbox.switch"
+    CLEAR_GOAL = "goal.clear"
     EXECUTE_PLAN = "plan.execute"
     REVISE_PLAN = "plan.revise"
     ABORT_TURN = "turn.abort"
@@ -61,6 +62,8 @@ class EventType(str, Enum):
     PERMISSION_PROFILE_CHANGED = "permission.changed"
     PERMISSION_GRANTS_CHANGED = "permission.grants.changed"
     SANDBOX_CHANGED = "sandbox.changed"
+    GOAL_UPDATED = "goal.updated"
+    GOAL_CLEARED = "goal.cleared"
     PLAN_APPROVED = "plan.approved"
     PLAN_REVISION_REQUESTED = "plan.revision_requested"
     TURN_ABORTED = "turn.aborted"
@@ -130,6 +133,11 @@ class ClearPermissionGrantsCommand(AgentCommand):
 
 
 @dataclass(frozen=True, kw_only=True)
+class ClearGoalCommand(AgentCommand):
+    command_type: ClassVar[CommandType] = CommandType.CLEAR_GOAL
+
+
+@dataclass(frozen=True, kw_only=True)
 class SwitchSandboxCommand(AgentCommand):
     mode: str
     command_type: ClassVar[CommandType] = CommandType.SWITCH_SANDBOX
@@ -160,6 +168,7 @@ AgentCommandType: TypeAlias = (
     | SwitchPermissionProfileCommand
     | RevokePermissionGrantCommand
     | ClearPermissionGrantsCommand
+    | ClearGoalCommand
     | SwitchSandboxCommand
     | ExecutePlanCommand
     | RevisePlanCommand
@@ -351,6 +360,18 @@ class PermissionGrantsChangedEvent(AgentEvent):
 
 
 @dataclass(frozen=True, kw_only=True)
+class GoalUpdatedEvent(AgentEvent):
+    goal: dict[str, Any]
+    event_type: ClassVar[EventType] = EventType.GOAL_UPDATED
+
+
+@dataclass(frozen=True, kw_only=True)
+class GoalClearedEvent(AgentEvent):
+    goal_id: str | None
+    event_type: ClassVar[EventType] = EventType.GOAL_CLEARED
+
+
+@dataclass(frozen=True, kw_only=True)
 class SandboxChangedEvent(AgentEvent):
     mode: str
     event_type: ClassVar[EventType] = EventType.SANDBOX_CHANGED
@@ -397,6 +418,8 @@ AgentEventType: TypeAlias = (
     | ModeChangedEvent
     | PermissionProfileChangedEvent
     | PermissionGrantsChangedEvent
+    | GoalUpdatedEvent
+    | GoalClearedEvent
     | SandboxChangedEvent
     | PlanApprovedEvent
     | PlanRevisionRequestedEvent
@@ -416,6 +439,7 @@ _COMMAND_TYPES = {
         SwitchPermissionProfileCommand,
         RevokePermissionGrantCommand,
         ClearPermissionGrantsCommand,
+        ClearGoalCommand,
         SwitchSandboxCommand,
         ExecutePlanCommand,
         RevisePlanCommand,
@@ -447,6 +471,8 @@ _EVENT_TYPES = {
         ModeChangedEvent,
         PermissionProfileChangedEvent,
         PermissionGrantsChangedEvent,
+        GoalUpdatedEvent,
+        GoalClearedEvent,
         SandboxChangedEvent,
         PlanApprovedEvent,
         PlanRevisionRequestedEvent,

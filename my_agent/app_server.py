@@ -14,6 +14,7 @@ from .protocol import (
     AbortTurnCommand,
     AgentCommandType,
     AgentEventType,
+    ClearGoalCommand,
     ClearPermissionGrantsCommand,
     ExecutePlanCommand,
     InterruptTurnCommand,
@@ -165,6 +166,7 @@ class AppServer:
             "permission.list": self._list_permission_profiles,
             "permission.grants.list": self._list_permission_grants,
             "sandbox.list": self._list_sandbox_profiles,
+            "goal.read": self._read_goal,
             "context.inspect": self._inspect_context,
             "turn.start": self._start_turn,
             "turn.retry": self._retry_turn,
@@ -176,6 +178,7 @@ class AppServer:
             "permission.grant.revoke": self._revoke_permission_grant,
             "permission.grants.clear": self._clear_permission_grants,
             "sandbox.switch": self._switch_sandbox,
+            "goal.clear": self._clear_goal,
             "plan.execute": self._execute_plan,
             "plan.revise": self._revise_plan,
             "turn.abort": self._abort_turn,
@@ -413,6 +416,12 @@ class AppServer:
             )
         return {"profiles": profiles}
 
+    def _read_goal(self, params: dict[str, Any]) -> dict[str, Any]:
+        session_id = self._session_id(params)
+        self._require_active_session(session_id)
+        goal = self.agent_service.current_goal(session_id)
+        return {"goal": goal.to_dict() if goal is not None else None}
+
     def _inspect_context(self, params: dict[str, Any]) -> dict[str, Any]:
         session_id = self._session_id(params)
         self._require_active_session(session_id)
@@ -490,6 +499,11 @@ class AppServer:
     def _clear_permission_grants(self, params: dict[str, Any]) -> dict[str, Any]:
         return self._dispatch_command(
             ClearPermissionGrantsCommand(session_id=self._session_id(params))
+        )
+
+    def _clear_goal(self, params: dict[str, Any]) -> dict[str, Any]:
+        return self._dispatch_command(
+            ClearGoalCommand(session_id=self._session_id(params))
         )
 
     def _switch_sandbox(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -638,6 +652,7 @@ class AppServer:
             "mode_id": state.mode_id,
             "permission_profile_id": state.permission_profile_id,
             "sandbox_mode": state.sandbox_mode,
+            "goal": state.goal.to_dict() if state.goal is not None else None,
             "runtime_state": runtime_state,
             "pending_turn_id": state.pending_turn.turn_id if state.pending_turn else None,
             "pending_turn_error": (

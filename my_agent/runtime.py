@@ -239,6 +239,15 @@ class AgentRuntime:
             return 0
         return self._approvals.clear()
 
+    def clear_goal(self) -> str | None:
+        with self._lock:
+            if self._worker is not None and self._worker.is_alive():
+                raise RuntimeError("cannot clear goal while a turn is running")
+        if self.session.pending_turn is not None:
+            raise RuntimeError("cannot clear goal while a turn is pending")
+        goal = self.loop.clear_goal(self.session)
+        return goal.goal_id if goal is not None else None
+
     def wait(self, timeout: float = 5.0) -> None:
         with self._lock:
             worker = self._worker

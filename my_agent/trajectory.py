@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = "my-agent.trajectory.v6"
+SCHEMA_VERSION = "my-agent.trajectory.v7"
 
 
 def read_jsonl_trace(path: str | Path) -> list[dict[str, Any]]:
@@ -75,6 +75,7 @@ def _make_session_trajectory(
                 ],
                 "final_answer": final.get("answer", "") if final else "",
                 "plan_events": _make_plan_events(turn_events),
+                "goal_events": _make_goal_events(turn_events),
                 "continuation_events": [
                     {
                         "steps_completed": event.get("steps_completed"),
@@ -140,6 +141,7 @@ def _make_session_trajectory(
             else "incomplete",
             "turn_count": len(turns),
         },
+        "goal_events": _make_goal_events(events),
         "metrics": _make_metrics(events, _first_ts(events), _last_ts(events)),
     }
 
@@ -210,6 +212,20 @@ def _make_plan_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         }
         for event in events
         if event.get("event") in lifecycle
+    ]
+
+
+def _make_goal_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "event": event.get("event"),
+            "goal": event.get("goal"),
+            "goal_id": event.get("goal_id"),
+            "step": event.get("step"),
+            "ts": event.get("ts"),
+        }
+        for event in events
+        if event.get("event") in {"goal_updated", "goal_cleared"}
     ]
 
 
@@ -329,6 +345,12 @@ def _make_metrics(events: list[dict[str, Any]], started_at: float | None, ended_
         ),
         "plan_completions": sum(
             1 for event in events if event.get("event") == "plan_completed"
+        ),
+        "goal_updates": sum(
+            1 for event in events if event.get("event") == "goal_updated"
+        ),
+        "goal_clears": sum(
+            1 for event in events if event.get("event") == "goal_cleared"
         ),
         "incomplete_plan_executions": sum(
             1 for event in events if event.get("event") == "plan_execution_incomplete"

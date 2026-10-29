@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .goals import GoalState, goal_from_dict
 from .messages import AssistantMessage, Message, ToolCall, ToolResultMessage, UserMessage
 from .modes import BUILD_MODE
 from .permissions import DEFAULT_PERMISSION_PROFILE_ID, get_permission_profile
@@ -60,6 +61,7 @@ class SessionState:
     mode_id: str = BUILD_MODE.mode_id
     permission_profile_id: str = DEFAULT_PERMISSION_PROFILE_ID
     sandbox_mode: str = DEFAULT_SANDBOX_MODE
+    goal: GoalState | None = None
     proposed_plan: ProposedPlan | None = None
     pending_turn: PendingTurn | None = None
 
@@ -171,6 +173,7 @@ class SessionStore:
                 )
             ).profile_id,
             sandbox_mode=_sandbox_mode(metadata.get("sandbox_mode")),
+            goal=goal_from_dict(metadata.get("goal")),
             proposed_plan=_proposed_plan_from_dict(metadata.get("proposed_plan")),
             pending_turn=_pending_turn_from_dict(metadata.get("pending_turn")),
         )
@@ -194,6 +197,7 @@ class SessionStore:
             "mode_id": state.mode_id,
             "permission_profile_id": state.permission_profile_id,
             "sandbox_mode": state.sandbox_mode,
+            "goal": state.goal.to_dict() if state.goal is not None else None,
             "proposed_plan": _proposed_plan_to_dict(state.proposed_plan),
             "pending_turn": _pending_turn_to_dict(state.pending_turn),
         }

@@ -37,6 +37,7 @@ from my_agent.control import (
     PermissionRequest,
     raise_if_cancelled,
 )
+from my_agent.goals import GoalState, GoalStep, update_goal
 from my_agent.messages import AssistantMessage, ToolCall, ToolResultMessage, UserMessage
 from my_agent.model_invoker import ModelInvoker, RetryPolicy, RetryScheduled
 from my_agent.modes import BUILD_MODE, PLAN_MODE, extract_proposed_plan, get_mode
@@ -368,6 +369,17 @@ class MyAgentTests(unittest.TestCase):
             state.mode_id = "build"
             state.permission_profile_id = "accept_edits"
             state.sandbox_mode = DANGER_FULL_ACCESS
+            state.goal = GoalState(
+                goal_id="goal-1",
+                objective="Update and verify app.py",
+                steps=(
+                    GoalStep("Inspect app.py", "completed"),
+                    GoalStep("Update app.py", "in_progress"),
+                    GoalStep("Run tests", "pending"),
+                ),
+                status="active",
+                updated_at="2026-10-24T00:00:00+00:00",
+            )
             state.proposed_plan = ProposedPlan(
                 plan_id=f"{state.session_id}:1:plan",
                 source_turn_id=f"{state.session_id}:1",
@@ -414,6 +426,7 @@ class MyAgentTests(unittest.TestCase):
             self.assertEqual(loaded.mode_id, "build")
             self.assertEqual(loaded.permission_profile_id, "accept_edits")
             self.assertEqual(loaded.sandbox_mode, DANGER_FULL_ACCESS)
+            self.assertEqual(loaded.goal, state.goal)
             self.assertEqual(loaded.proposed_plan, state.proposed_plan)
             self.assertEqual(loaded.pending_turn, state.pending_turn)
             self.assertTrue(loaded.metadata_path.exists())
@@ -537,7 +550,7 @@ class MyAgentTests(unittest.TestCase):
                 {state.session_id + ":1"},
             )
             trajectory = make_trajectory(trace_events, source_path=state.trace_path)
-            self.assertEqual(trajectory["schema_version"], "my-agent.trajectory.v6")
+            self.assertEqual(trajectory["schema_version"], "my-agent.trajectory.v7")
             self.assertEqual(trajectory["turns"][0]["outcome"]["status"], "completed")
             self.assertEqual(len(trajectory["turns"][0]["errors"]), 1)
             self.assertEqual(trajectory["metrics"]["turn_errors"], 1)
@@ -835,7 +848,7 @@ class MyAgentTests(unittest.TestCase):
             self.assertEqual(built.stopped_by, "final_answer")
             self.assertEqual(state.proposed_plan.status, "completed")
             trajectory = make_trajectory(events, state.trace_path)
-            self.assertEqual(trajectory["schema_version"], "my-agent.trajectory.v6")
+            self.assertEqual(trajectory["schema_version"], "my-agent.trajectory.v7")
             self.assertEqual(trajectory["turns"][0]["mode_id"], "plan")
             self.assertEqual(
                 trajectory["turns"][0]["outcome"]["stopped_by"],
@@ -2038,7 +2051,7 @@ class MyAgentTests(unittest.TestCase):
                     "--credentials",
                     str(Path(tmpdir, "credentials.json")),
                 ],
-                input="/grants\n/sandbox\n/help\n/exit\n",
+                input="/goal\n/grants\n/sandbox\n/help\n/exit\n",
                 text=True,
                 capture_output=True,
                 cwd=Path(__file__).resolve().parents[1],
@@ -2047,9 +2060,11 @@ class MyAgentTests(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("Current sandbox: workspace-write", completed.stdout)
+        self.assertIn("No current goal", completed.stdout)
         self.assertIn("No runtime permission grants", completed.stdout)
         self.assertIn("/help       Show slash commands", completed.stdout)
         self.assertIn("/grants", completed.stdout)
+        self.assertIn("/goal", completed.stdout)
         self.assertIn("/sandbox", completed.stdout)
         self.assertIn("use Up/Down and Enter to run", completed.stdout)
 
@@ -2559,7 +2574,15 @@ class MyAgentTests(unittest.TestCase):
     def test_default_tool_registry_exposes_current_tools(self):
         self.assertEqual(
             build_tool_registry().names(),
-            ["apply_patch", "exec_command", "git_diff", "list_files", "read_file", "search"],
+            [
+                "apply_patch",
+                "exec_command",
+                "git_diff",
+                "list_files",
+                "read_file",
+                "search",
+                "update_goal",
+            ],
         )
 
     def test_plan_mode_exposes_only_read_only_tools_and_extracts_wrapped_protocol(self):
@@ -2581,6 +2604,111 @@ class MyAgentTests(unittest.TestCase):
         self.assertIsNone(extract_proposed_plan("<proposed_plan>missing end tag"))
         with self.assertRaisesRegex(ValueError, "unknown collaboration mode"):
             get_mode("review")
+
+    def test_update_goal_tool_persists_state_and_updates_next_model_context(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace_path = Path(tmpdir, "workspace")
+            workspace_path.mkdir()
+            state = SessionStore(Path(tmpdir, "sessions")).create(workspace_path)
+            provider = ScriptedProviderAdapter(
+                [
+                    _model_response(
+                        tool_calls=[
+                            ToolCall(
+                                call_id="call_goal",
+                                name="update_goal",
+                                arguments={
+                                    "objective": "Inspect and verify the repository",
+                                    "steps": [
+                                        {
+                                            "description": "Inspect files",
+                                            "status": "completed",
+                                        },
+                                        {
+                                            "description": "Run validation",
+                                            "status": "in_progress",
+                                        },
+                                    ],
+                                },
+                            )
+                        ],
+                        finish_reason="tool_calls",
+                    ),
+                    _model_response(content="Goal recorded."),
+                ]
+            )
+            loop = AgentLoop(
+                workspace=Workspace(workspace_path),
+                model=_model(provider),
+                tools=build_tool_registry(BUILD_MODE),
+                permissions=PermissionPolicy(),
+                trace=TraceRecorder(state.trace_path),
+                max_steps=3,
+            )
+            events = []
+
+            result = loop.run_turn(
+                state,
+                "Inspect and verify the repository",
+                event_handler=events.append,
+            )
+
+            self.assertEqual(result.answer, "Goal recorded.")
+            self.assertIsNotNone(state.goal)
+            self.assertEqual(state.goal.objective, "Inspect and verify the repository")
+            self.assertEqual(state.goal.steps[1].status, "in_progress")
+            self.assertTrue(any(event.kind == "goal_updated" for event in events))
+            self.assertNotIn("<current_goal>", provider.requests[0].system_prompt)
+            self.assertIn("<current_goal>", provider.requests[1].system_prompt)
+            self.assertIn("Run validation", provider.requests[1].system_prompt)
+            trajectory = make_trajectory(
+                read_jsonl_trace(state.trace_path),
+                source_path=state.trace_path,
+            )
+            self.assertEqual(
+                trajectory["turns"][0]["goal_events"][0]["event"],
+                "goal_updated",
+            )
+            self.assertEqual(trajectory["metrics"]["goal_updates"], 1)
+
+    def test_goal_rejects_multiple_in_progress_steps(self):
+        with self.assertRaisesRegex(ValueError, "more than one in_progress"):
+            update_goal(
+                None,
+                {
+                    "objective": "Invalid goal",
+                    "steps": [
+                        {"description": "First", "status": "in_progress"},
+                        {"description": "Second", "status": "in_progress"},
+                    ],
+                },
+            )
+
+    def test_goal_identity_changes_only_for_a_different_objective(self):
+        initial = update_goal(
+            None,
+            {
+                "objective": "Update app.py",
+                "steps": [{"description": "Inspect", "status": "in_progress"}],
+            },
+        )
+        progressed = update_goal(
+            initial,
+            {
+                "objective": "Update app.py",
+                "steps": [{"description": "Inspect", "status": "completed"}],
+            },
+        )
+        replacement = update_goal(
+            progressed,
+            {
+                "objective": "Update tests.py",
+                "steps": [{"description": "Inspect tests", "status": "pending"}],
+            },
+        )
+
+        self.assertEqual(progressed.goal_id, initial.goal_id)
+        self.assertNotEqual(replacement.goal_id, initial.goal_id)
 
     def test_agent_loop_exposes_only_session_turn_entrypoint(self):
         self.assertFalse(hasattr(AgentLoop, "run"))
@@ -4032,7 +4160,7 @@ class MyAgentTests(unittest.TestCase):
 
         self.assertEqual(
             trajectory["schema_version"],
-            "my-agent.trajectory.v6",
+            "my-agent.trajectory.v7",
         )
         self.assertEqual(trajectory["workspace"], "/tmp/repo")
         turn = trajectory["turns"][0]
@@ -4142,7 +4270,7 @@ class MyAgentTests(unittest.TestCase):
 
         self.assertEqual(
             trajectory["schema_version"],
-            "my-agent.trajectory.v6",
+            "my-agent.trajectory.v7",
         )
         self.assertEqual(trajectory["session_id"], "session-1")
         self.assertEqual(len(trajectory["turns"]), 2)

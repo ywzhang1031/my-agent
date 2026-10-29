@@ -7,9 +7,10 @@ import subprocess
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from .execution import ProcessRunner
+from .goals import MAX_GOAL_STEPS
 from .messages import ToolCall
 from .control import ApprovalBroker, AutoApproveBroker, PermissionRequest
 from .patches import MAX_PATCH_CHARS, apply_patch, parse_patch
@@ -62,6 +63,7 @@ class ToolContext:
     approvals: ApprovalBroker = field(default_factory=AutoApproveBroker)
     cancel_event: threading.Event | None = None
     sandbox_policy: SandboxPolicy | None = None
+    goal_updater: Callable[[dict[str, Any]], dict[str, Any]] | None = None
 
 
 class BaseTool(Protocol):
@@ -130,6 +132,64 @@ class ToolRegistry:
         if tool is None:
             return None
         return tool.permission_request(call.arguments, ctx)
+
+
+class UpdateGoalTool(ToolBase):
+    name = "update_goal"
+    description = (
+        "Create or replace the current structured goal snapshot for multi-step work. "
+        "Keep at most one step in_progress and mark steps completed only after evidence."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "objective": {
+                "type": "string",
+                "description": "Concise objective for the current multi-step task.",
+            },
+            "steps": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": MAX_GOAL_STEPS,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "description": {"type": "string"},
+                        "status": {
+                            "type": "string",
+                            "enum": ["pending", "in_progress", "completed"],
+                        },
+                    },
+                    "required": ["description", "status"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["objective", "steps"],
+        "additionalProperties": False,
+    }
+    required = ["objective", "steps"]
+
+    def run(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        if ctx.goal_updater is None:
+            return ToolResult(
+                ok=False,
+                stderr="goal updates are unavailable in this runtime",
+                metadata={"status": "unavailable"},
+            )
+        try:
+            goal = ctx.goal_updater(arguments)
+        except ValueError as exc:
+            return ToolResult(
+                ok=False,
+                stderr=str(exc),
+                metadata={"status": "invalid_goal"},
+            )
+        return ToolResult(
+            ok=True,
+            stdout=json.dumps(goal, ensure_ascii=False),
+            metadata={"status": "goal_updated", "goal": goal},
+        )
 
 
 class ListFilesTool(ToolBase):

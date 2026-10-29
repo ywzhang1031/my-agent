@@ -9,6 +9,9 @@ test, check, or build processes with exec_command.
 Each apply_patch call must change exactly one workspace-relative file.
 Do not modify .git, .my-agent, or paths outside the workspace.
 Pass exec_command one structured argv array; shell operators and command strings are unsupported.
+For multi-step work, call update_goal early with a concise objective and ordered steps. Keep at
+most one step in_progress, update the snapshot after meaningful progress, and mark all steps
+completed only after validation. Do not create a goal for a trivial single-action request.
 After editing, inspect the actual changes with git_diff and run the narrowest relevant validation.
 Use read_file when you need the contents of an untracked file reported by git_diff.
 Return a concise result only after checking the changes and test evidence.
@@ -51,6 +54,7 @@ BUILD_MODE = CollaborationMode(
         "read_file",
         "search",
         "exec_command",
+        "update_goal",
     ),
 )
 

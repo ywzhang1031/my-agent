@@ -8,13 +8,17 @@ from pathlib import Path
 
 from my_agent.agent_loop import TurnResult
 from my_agent.control import ApprovalDecision, ApprovalGrant
+from my_agent.goals import GoalState, GoalStep
 from my_agent.modes import BUILD_MODE, PLAN_MODE
 from my_agent.permissions import PermissionPolicy
 from my_agent.protocol import (
     AgentState,
     ApprovalResolvedEvent,
     ClearPermissionGrantsCommand,
+    ClearGoalCommand,
     ExecutePlanCommand,
+    GoalClearedEvent,
+    GoalUpdatedEvent,
     ItemCompletedEvent,
     ItemDeltaEvent,
     RenameSessionCommand,
@@ -119,6 +123,11 @@ class _Runtime:
         self.grants.clear()
         return removed
 
+    def clear_goal(self) -> str | None:
+        goal = self.session.goal
+        self.session.goal = None
+        return goal.goal_id if goal is not None else None
+
     def wait(self, timeout=5.0) -> None:
         return None
 
@@ -197,6 +206,31 @@ class ProtocolTests(unittest.TestCase):
             ],
             reason="revoked",
             removed_count=1,
+        )
+
+        self.assertEqual(command_from_dict(command_to_dict(command)), command)
+        self.assertEqual(event_from_dict(event_to_dict(event)), event)
+
+    def test_goal_protocol_round_trip(self) -> None:
+        command = ClearGoalCommand(
+            session_id="session-1",
+            command_id="command-1",
+        )
+        event = GoalUpdatedEvent(
+            session_id="session-1",
+            turn_id="session-1:1",
+            sequence=7,
+            state=AgentState.RUNNING_TOOL,
+            event_id="event-1",
+            goal={
+                "goal_id": "goal-1",
+                "objective": "Update app.py",
+                "steps": [
+                    {"description": "Edit app.py", "status": "in_progress"}
+                ],
+                "status": "active",
+                "updated_at": "2026-10-24T00:00:00+00:00",
+            },
         )
 
         self.assertEqual(command_from_dict(command_to_dict(command)), command)
@@ -496,6 +530,81 @@ class AgentServiceTests(unittest.TestCase):
             self.assertEqual(cleared.reason, "cleared")
             self.assertEqual(cleared.removed_count, 1)
             self.assertEqual(cleared.grants, [])
+            service.close()
+
+    def test_goal_update_is_persisted_and_can_be_cleared(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = self._state(Path(tmp))
+            state.goal = GoalState(
+                goal_id="goal-1",
+                objective="Update app.py",
+                steps=(GoalStep("Edit app.py", "in_progress"),),
+                status="active",
+                updated_at="2026-10-24T00:00:00+00:00",
+            )
+            runtime = _Runtime(state)
+            runtime.events.put(
+                RuntimeEvent(
+                    kind="turn_started",
+                    state=RuntimeState.RUNNING_MODEL,
+                    data={"turn_id": "session-1:1", "task": "Update app.py"},
+                )
+            )
+            runtime.events.put(
+                RuntimeEvent(
+                    kind="goal_updated",
+                    state=RuntimeState.RUNNING_TOOL,
+                    data={
+                        "step": 1,
+                        "call_id": "call-goal",
+                        "goal": state.goal.to_dict(),
+                    },
+                )
+            )
+            runtime.events.put(
+                RuntimeEvent(
+                    kind="turn_completed",
+                    state=RuntimeState.COMPLETED,
+                    text="done",
+                    data={
+                        "steps": 1,
+                        "stopped_by": "final_answer",
+                        "mode_id": "build",
+                        "plan_id": None,
+                    },
+                    result=TurnResult(
+                        answer="done",
+                        messages=[],
+                        steps=1,
+                        stopped_by="final_answer",
+                    ),
+                )
+            )
+            saved = []
+            service = AgentService(
+                tool_registry_factory=lambda mode: object(),
+                save_session=lambda session: saved.append(session.goal),
+            )
+            service.register(runtime)
+            subscription_id = self._subscribe(service, state.session_id)
+
+            service.dispatch(
+                StartTurnCommand(session_id=state.session_id, user_input="Update app.py")
+            )
+            events, _ = self._next_terminal(service, subscription_id)
+            updated = next(
+                event for event in events if isinstance(event, GoalUpdatedEvent)
+            )
+            self.assertEqual(updated.goal, state.goal.to_dict())
+            self.assertTrue(updated.durable)
+            self.assertIn(state.goal, saved)
+            self.assertEqual(service.current_goal(state.session_id), state.goal)
+
+            service.dispatch(ClearGoalCommand(session_id=state.session_id))
+            cleared = service.next_event(subscription_id, timeout=1)
+            self.assertIsInstance(cleared, GoalClearedEvent)
+            self.assertEqual(cleared.goal_id, "goal-1")
+            self.assertIsNone(state.goal)
             service.close()
 
     def test_session_rename_is_persisted_and_emits_event(self) -> None:

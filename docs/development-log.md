@@ -425,6 +425,8 @@ Web UI 支持多页面连接，但 session 存储目录不再允许多个 AppSer
 - `/abort` 只清理 conversation state，不回滚已经执行的文件修改或进程副作用。
 - Plan mode 不暴露 `exec_command`，因此也不运行可能写 cache/build artifact 的测试命令；审批后由
   Build mode 执行验证。
+- 每个 session 当前只支持一个结构化 Goal；没有 Goal 依赖图、deadline、blocked 状态或自动
+  subagent 调度。
 - 本地 `.my-agent/`、`trace.jsonl` 和 `trajectory.json` 默认不提交到 Git。
 - 当前实现 DeepSeek Chat Completions 和 OpenAI Responses adapter；其他厂商仍需实现并测试自己的
   wire adapter。
@@ -483,3 +485,20 @@ Sandbox policy 从启动参数和只读状态提升为可查询、可切换的 s
   `permission.grants.clear`。查询结果显式返回 `lifetime=runtime`、`persistent=false`。
 - CLI `/grants` 与 Web inspector 使用同一 Service 控制面，可逐项撤销或全部清空。
 - 本里程碑不增加 project/global 永久授权。撤销只约束后续工具调用，已开始执行的工具不会被追溯中断。
+
+## Milestone 28: Structured Goal State
+
+跨 turn 目标不再只存在于自然语言历史中，而是成为 session 的结构化、可持久化状态。
+
+- `GoalState` 保存稳定 ID、objective、有序 steps、派生状态和更新时间；v1 每个 session 只有一个当前
+  Goal，最多 12 个 step，且最多一个 step 处于 `in_progress`。
+- Build mode 新增 `update_goal` harness tool。模型提交完整快照，harness 统一校验并替换旧状态；Plan
+  mode 不暴露该工具，仍只产出可审批的 `ProposedPlan` artifact。
+- 当前 Goal 会追加到每次模型请求的 system instructions；tool observation 仍反馈本次更新结果，下一
+  step 因而同时看到即时 observation 和持久状态。
+- session 保存 Goal，trace 记录 `goal_updated` / `goal_cleared`，trajectory schema 升级到 v7，并提供
+  Goal event 与 metrics。
+- typed protocol 增加 `goal.updated`、`goal.cleared` 和 `goal.clear`；AppServer 提供 `goal.read` /
+  `goal.clear`。CLI `/goal` 和 Web inspector 使用同一 service 边界。
+- v1 不实现多个并行 Goal、依赖图、deadline、blocked 状态或 subagent 调度；Goal 也不改变原有
+  model -> tool -> observation loop。

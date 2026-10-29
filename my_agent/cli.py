@@ -22,8 +22,10 @@ from .providers.factory import (
 from .protocol import (
     AbortTurnCommand,
     ApprovalRequestedEvent,
+    ClearGoalCommand,
     ClearPermissionGrantsCommand,
     ExecutePlanCommand,
+    GoalClearedEvent,
     InterruptTurnCommand,
     ModeChangedEvent,
     ModelChangedEvent,
@@ -54,6 +56,7 @@ from .sandbox import (
     sandbox_availability,
 )
 from .service import AgentService
+from .goals import GoalState
 from .session import SessionState, SessionStore
 from .terminal import (
     LineEditor,
@@ -72,6 +75,7 @@ from .tools import (
     ReadFileTool,
     SearchTool,
     ToolRegistry,
+    UpdateGoalTool,
 )
 from .trace import TraceRecorder
 from .trajectory import make_trajectory, read_jsonl_trace, write_trajectory_json
@@ -88,6 +92,7 @@ SLASH_COMMANDS = (
     SlashCommand("/mode", "Choose Build or Plan mode"),
     SlashCommand("/permissions", "Choose the permission profile"),
     SlashCommand("/grants", "Review runtime permission grants"),
+    SlashCommand("/goal", "Show or clear the current goal"),
     SlashCommand("/sandbox", "Choose the command sandbox"),
     SlashCommand("/approve", "Approve the proposed plan and execute it"),
     SlashCommand("/config", "Show provider configuration"),
@@ -524,6 +529,11 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                         if state.proposed_plan is not None
                         else "none"
                     )
+                    goal = (
+                        f"{state.goal.status}:{state.goal.goal_id}"
+                        if state.goal is not None
+                        else "none"
+                    )
                     print(
                         f"session={state.session_id} workspace={state.workspace} "
                         f"model={view.provider_id}/{view.model_id} "
@@ -532,6 +542,7 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                         f"sandbox={view.sandbox_mode} "
                         f"messages={len(state.messages)} summarized="
                         f"{state.summarized_message_count} pending={pending} plan={plan}"
+                        f" goal={goal}"
                     )
                     continue
                 if user_input == "/model":
@@ -713,6 +724,37 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                         f"grant{'s' if changed.removed_count != 1 else ''}"
                     )
                     continue
+                if user_input == "/goal":
+                    goal = service.current_goal(state.session_id)
+                    _print_goal(goal)
+                    if goal is None:
+                        continue
+                    if state.pending_turn is not None:
+                        print("pending turn exists; use /retry or /abort before clearing goal")
+                        continue
+                    if not editor.supports_interactive_selection:
+                        print("interactive goal clearing requires a TTY")
+                        continue
+                    selected = editor.select(
+                        "goal> ",
+                        (
+                            SelectionOption(
+                                "Clear current goal",
+                                "Remove the persisted goal and step state",
+                            ),
+                        ),
+                    )
+                    if selected is None:
+                        print("goal action cancelled")
+                        continue
+                    service.dispatch(ClearGoalCommand(session_id=state.session_id))
+                    cleared = service.next_event(timeout=1)
+                    if not isinstance(cleared, GoalClearedEvent):
+                        raise RuntimeError(
+                            f"expected goal.cleared, got {cleared.event_type.value}"
+                        )
+                    print(f"cleared goal: {cleared.goal_id}")
+                    continue
                 if user_input == "/sandbox":
                     if state.pending_turn is not None:
                         print(
@@ -831,6 +873,7 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                     print("/mode uses the same selector.")
                     print("/permissions selects supervised, accept_edits, or trusted.")
                     print("/grants reviews exact allow-session grants for this runtime.")
+                    print("/goal shows or clears persisted multi-step progress.")
                     print("/sandbox selects the operating-system command boundary.")
                     print("Completed plans open Execute/Revise; /approve runs a saved proposal.")
                     continue
@@ -1356,6 +1399,16 @@ def _print_permission_grants(grants: tuple[ApprovalGrant, ...]) -> None:
         print(f"  {grant.action:<16}{grant.resource} ({grant.description})")
 
 
+def _print_goal(goal: GoalState | None) -> None:
+    if goal is None:
+        print("No current goal.")
+        return
+    print(f"Goal [{goal.status}] {goal.objective}")
+    markers = {"pending": " ", "in_progress": ">", "completed": "x"}
+    for step in goal.steps:
+        print(f"  [{markers[step.status]}] {step.description}")
+
+
 def _print_sandbox_catalog(current_mode: str) -> None:
     print(f"Current sandbox: {current_mode}")
     print("Available sandbox profiles")
@@ -1390,6 +1443,7 @@ def build_tool_registry(mode: CollaborationMode = BUILD_MODE) -> ToolRegistry:
             ReadFileTool(),
             SearchTool(),
             ExecCommandTool(),
+            UpdateGoalTool(),
         )
     }
     return ToolRegistry([tools[name] for name in mode.tool_names])

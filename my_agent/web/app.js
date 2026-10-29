@@ -60,6 +60,8 @@ const elements = {
   usageFill: document.querySelector("#usage-fill"),
   contextBreakdown: document.querySelector("#context-breakdown"),
   contextMeta: document.querySelector("#context-meta"),
+  goalView: document.querySelector("#goal-view"),
+  clearGoal: document.querySelector("#clear-goal"),
   permissionGrantList: document.querySelector("#permission-grant-list"),
   clearPermissionGrants: document.querySelector("#clear-permission-grants"),
   activityList: document.querySelector("#activity-list"),
@@ -73,6 +75,7 @@ const state = {
   modes: [],
   permissionProfiles: [],
   sandboxProfiles: [],
+  currentGoal: null,
   permissionGrants: [],
   selectedSession: null,
   busySessions: new Set(),
@@ -635,6 +638,7 @@ function updateControls() {
   elements.credentialKey.disabled = state.credentialSaving;
   elements.credentialSave.disabled = state.credentialSaving;
   elements.credentialAbort.disabled = state.credentialSaving;
+  renderGoal();
 }
 
 function syncCredentialRequest(session) {
@@ -1062,6 +1066,39 @@ function resetContext() {
   renderContext({ breakdown: {} });
 }
 
+function renderGoal() {
+  const fragment = document.createDocumentFragment();
+  const sessionID = selectedSessionID();
+  const busy = sessionID ? state.busySessions.has(sessionID) : false;
+  const pending = Boolean(state.selectedSession?.pending_turn_id);
+  elements.clearGoal.disabled = !state.currentGoal || busy || pending;
+  if (!state.selectedSession || !state.currentGoal) {
+    const empty = document.createElement("div");
+    empty.className = "goal-empty";
+    empty.textContent = state.selectedSession ? "没有当前目标" : "选择会话后显示";
+    fragment.append(empty);
+  } else {
+    const objective = document.createElement("strong");
+    objective.className = "goal-objective";
+    objective.textContent = state.currentGoal.objective;
+    const status = document.createElement("span");
+    status.className = "goal-status";
+    status.dataset.status = state.currentGoal.status;
+    status.textContent = state.currentGoal.status === "completed" ? "已完成" : "进行中";
+    const steps = document.createElement("div");
+    steps.className = "goal-steps";
+    for (const goalStep of state.currentGoal.steps || []) {
+      const step = document.createElement("div");
+      step.className = "goal-step";
+      step.dataset.status = goalStep.status;
+      step.textContent = goalStep.description;
+      steps.append(step);
+    }
+    fragment.append(objective, status, steps);
+  }
+  elements.goalView.replaceChildren(fragment);
+}
+
 function renderPermissionGrants() {
   const fragment = document.createDocumentFragment();
   elements.clearPermissionGrants.disabled = !state.selectedSession || !state.permissionGrants.length;
@@ -1125,6 +1162,35 @@ async function refreshPermissionGrants() {
   }
 }
 
+async function refreshGoal() {
+  const sessionID = selectedSessionID();
+  if (!sessionID) {
+    state.currentGoal = null;
+    renderGoal();
+    return;
+  }
+  try {
+    const result = await rpc("goal.read", { session_id: sessionID });
+    if (sessionID === selectedSessionID()) {
+      state.currentGoal = result.goal || null;
+      renderGoal();
+    }
+  } catch (error) {
+    addActivity("目标读取失败", error.message, "warning");
+  }
+}
+
+async function clearGoal() {
+  const sessionID = selectedSessionID();
+  if (!sessionID || !state.currentGoal) return;
+  try {
+    await rpc("goal.clear", { session_id: sessionID });
+    await refreshGoal();
+  } catch (error) {
+    showToast(`无法清除目标：${error.message}`);
+  }
+}
+
 async function revokePermissionGrant(grant) {
   const sessionID = selectedSessionID();
   if (!sessionID) return;
@@ -1170,6 +1236,8 @@ async function selectSession(sessionID) {
     }
     const result = await rpc("session.read", { session_id: sessionID });
     state.selectedSession = result.session;
+    state.currentGoal = null;
+    renderGoal();
     state.permissionGrants = [];
     renderPermissionGrants();
     loadProjection(result.projection);
@@ -1181,6 +1249,7 @@ async function selectSession(sessionID) {
     updateControls();
     renderSessionList();
     await refreshContext();
+    await refreshGoal();
     await refreshPermissionGrants();
     closeOverlays();
   } catch (error) {
@@ -1778,6 +1847,22 @@ async function handleEvent(event) {
         "neutral",
       );
       break;
+    case "goal.updated":
+      if (sessionID === selectedSessionID()) {
+        state.currentGoal = payload.goal || null;
+        renderGoal();
+        refreshContext();
+      }
+      addActivity(eventLabel(sessionID, "目标进度已更新"), payload.goal?.objective || "", "neutral");
+      break;
+    case "goal.cleared":
+      if (sessionID === selectedSessionID()) {
+        state.currentGoal = null;
+        renderGoal();
+        refreshContext();
+      }
+      addActivity(eventLabel(sessionID, "目标已清除"), payload.goal_id || "", "warning");
+      break;
     case "sandbox.changed":
       if (sessionID === selectedSessionID()) {
         state.selectedSession.sandbox_mode = payload.mode;
@@ -1948,6 +2033,7 @@ function bindUI() {
     renderActivities();
   });
   elements.clearPermissionGrants.addEventListener("click", clearPermissionGrants);
+  elements.clearGoal.addEventListener("click", clearGoal);
   for (const button of elements.approvalPanel.querySelectorAll("[data-approval]")) {
     button.addEventListener("click", () => resolveApproval(button.dataset.approval));
   }
@@ -1968,6 +2054,7 @@ async function initialize() {
   }
   bindUI();
   resetContext();
+  renderGoal();
   renderPermissionGrants();
   try {
     const [models, modes, permissions, sandboxes, sessions] = await Promise.all([
