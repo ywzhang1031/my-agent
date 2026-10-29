@@ -549,3 +549,11 @@ Sandbox policy 从启动参数和只读状态提升为可查询、可切换的 s
 - 新增 `/recover` 和 `turn.recover` 显式确认；重启默认暂停。工具权限仍须由新 runtime 重新审批。
 - turn counter 不因 abort 回退；事件序号预留高水位，避免重启重用已经显示过的 live sequence。
 - 新增真实子进程退出、patch 后崩溃、写盘失败阻止工具、结果提交回滚和显式恢复测试。
+
+## Milestone 33: Persistent RPC Admission and Deduplication
+
+- 对创建会话、启动/恢复 turn、审批、计划执行等有副作用的 RPC，在 dispatch 前持久登记 request ID
+  与参数摘要；完成后保存响应，重复请求重放响应而不重复操作。
+- 同一 ID 携带不同参数明确冲突；登记后崩溃或响应未保存时保持 outcome unknown，不自动再 dispatch。
+- 读操作和运行时订阅不缓存，避免返回重启后已失效的 subscription。参数只保存摘要，凭据不写入请求表。
+- 增加重复创建/启动、参数冲突、未知结果和重新打开数据库后响应重放测试。

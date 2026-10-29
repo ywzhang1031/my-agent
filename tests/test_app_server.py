@@ -266,6 +266,41 @@ class AppServerTests(unittest.TestCase):
             )
         )
 
+    def test_duplicate_mutation_returns_saved_response_without_running_again(self) -> None:
+        request = RequestEnvelope(method="session.create", request_id="create-once")
+        first = self.app.handle(request)
+        second = self.app.handle(request)
+        self.assertTrue(first.ok)
+        self.assertEqual(first, second)
+        self.assertEqual(len(self.store.list_sessions()), 1)
+        session_id = first.result["session"]["session_id"]
+        start = RequestEnvelope(method="turn.start", request_id="start-once",
+                                params={"session_id": session_id, "user_input": "Hello"})
+        accepted = self.app.handle(start)
+        self.assertTrue(accepted.ok)
+        self.assertEqual(self.app.handle(start), accepted)
+        self.assertEqual(len(self.runtimes[session_id].commands), 1)
+        self.complete_turn(session_id, "Done")
+        self.service.wait(session_id)
+
+    def test_request_id_conflict_and_unknown_outcome_do_not_dispatch(self) -> None:
+        from my_agent.request_store import RequestStore
+        request = RequestEnvelope(method="session.create", request_id="unfinished-request")
+        self.assertIsNone(RequestStore(self.store.database).begin(request))
+        result = self.app.handle(request)
+        self.assertEqual(result.error.code, "request_outcome_unknown")
+        conflict = self.app.handle(RequestEnvelope(method="session.create", request_id=request.request_id,
+                                                  params={"mode_id": "plan"}))
+        self.assertEqual(conflict.error.code, "idempotency_conflict")
+        self.assertEqual(self.store.list_sessions(), [])
+
+    def test_response_replay_survives_reopening_database(self) -> None:
+        from my_agent.request_store import RequestStore
+        request = RequestEnvelope(method="session.create", request_id="saved-request")
+        response = self.app.handle(request)
+        reopened = SessionStore(self.store.root)
+        self.assertEqual(RequestStore(reopened.database).begin(request), response)
+
     def test_rpc_envelopes_round_trip_success_and_error(self) -> None:
         request = RequestEnvelope(
             request_id="request-1",

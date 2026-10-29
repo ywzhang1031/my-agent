@@ -34,6 +34,8 @@ from .sandbox import SANDBOX_PROFILES, get_sandbox_profile, sandbox_availability
 from .service import AgentService, ServiceSessionView
 from .server_instance import ServerInstanceLease
 from .session import SessionState, SessionStore, message_to_dict
+from .database import StorageError
+from .request_store import MUTATING_METHODS, RequestStore
 
 
 RuntimeFactory = Callable[
@@ -93,6 +95,20 @@ class AppServer:
         )
 
     def handle(self, request: RequestEnvelope) -> ResponseEnvelope:
+        if request.method not in MUTATING_METHODS:
+            return self._handle_request(request)
+        requests = RequestStore(self.session_store.database)
+        try:
+            previous = requests.begin(request)
+            if previous is not None:
+                return previous
+            response = self._handle_request(request)
+            requests.finish(response)
+            return response
+        except (StorageError, OSError) as exc:
+            return ResponseEnvelope.failure(request.request_id, code="storage_error", message=str(exc))
+
+    def _handle_request(self, request: RequestEnvelope) -> ResponseEnvelope:
         try:
             result = self._dispatch(request)
         except _RpcCallError as exc:

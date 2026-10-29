@@ -606,6 +606,11 @@ SQLite 使用默认 rollback journal，当前不引入 WAL 或网络文件系统
 未提交时标记为 `unknown`，不会重放原调用。恢复会补齐未知/未执行 observation，交回模型检查现状。
 这不是任意外部工具的 exactly-once 保证，也不恢复旧进程或 allow-session 权限。
 
+有副作用的 RPC 以 `request_id` 去重：相同 ID 和参数返回原响应，不重复 dispatch；相同 ID 换参数
+返回 `idempotency_conflict`。已登记但响应未保存的请求返回 `request_outcome_unknown`，需要查询会话
+确认，不能换一个 ID 盲目重发。记录只保存参数摘要，不保存原始 API Key。客户端应区分“重发同一
+请求”和“用户主动发起新的操作”；不同 request ID 不会被合并。
+
 ```bash
 WORKSPACE=/path/to/repo
 SESSION_ID=20260803-120000-abcdef
