@@ -502,3 +502,17 @@ Sandbox policy 从启动参数和只读状态提升为可查询、可切换的 s
   `goal.clear`。CLI `/goal` 和 Web inspector 使用同一 service 边界。
 - v1 不实现多个并行 Goal、依赖图、deadline、blocked 状态或 subagent 调度；Goal 也不改变原有
   model -> tool -> observation loop。
+
+## Milestone 29: Goal Validation and Lifecycle Boundaries
+
+本轮只补 Goal 契约，不新增 mode、调度机制或验证证据模块。
+
+- 修复 `status: []` / `status: {}` 导致 `TypeError` 的问题；先检查类型再判断枚举，非法输入返回
+  `invalid_goal` observation，允许模型在同一 turn 内纠正。
+- 校验根参数对象、拒绝 schema 之外的字段；objective 的校验由工具更新和 session 恢复共用。
+  tool schema 同步公开长度上限。校验完成前不替换当前 Goal。
+- 磁盘 Goal 必须具有有效的 ID、更新时间和显式派生 status；不再隐式补齐缺失的 status。
+- 明确 Goal completed 是模型报告的步骤状态，而非测试通过证明；讨论型 final answer 不会强制完成
+  Goal，旧 Goal 也不构成自动执行授权。
+- 新增 11 项测试，覆盖参数边界、同 turn 修正、Goal ID、恢复/重试/中止、running/pending 清除限制，
+  以及 Plan mode 即使收到模型误发的 `update_goal` 也不能修改状态。

@@ -250,6 +250,22 @@ WebSocket/SSE 时可以继续复用同一 AppServer、subscription 和 projectio
 - `goal`：跨多个 turn 持续存在的目标与进度状态，是 `SessionState` 的持久字段，不是 mode。当前 v1
   每个 session 只保存一个 Goal，包含 objective、最多 12 个有序 step 和派生的 active/completed 状态。
 
+## Goal Boundaries
+
+`update_goal` 只接受 `objective` 和完整的 `steps` 数组，每步只接受 `description` 和 `status`。
+objective 去除首尾空白后最多 500 字符；step description 最多 240 字符且不能重复；status 必须是
+`pending`、`in_progress` 或 `completed` 字符串，同时最多一个 step 为 `in_progress`，也允许没有。
+非法参数返回 `invalid_goal` tool observation，不修改旧 Goal，模型可在同一个 turn 中修正参数。
+磁盘中的 Goal 使用相同的内容校验，并要求显式 status 与步骤一致；损坏状态会报错，不会静默清空。
+
+同一 objective 的更新保留 Goal ID；修改 objective 会替换当前 Goal 并生成新 ID。所有步骤均为
+`completed` 时 Goal 才派生为 `completed`，否则为 `active`；重新提交未完成步骤会重新激活同一目标。
+这是模型报告的进度，不是 harness 对验收证据的独立认证。
+
+Goal 是 context，不是自动调度指令。turn 可以因讨论或澄清而正常结束，未完成 Goal 保持 active；
+失败、重试、恢复或 `/abort` 不会自动完成或回滚已经更新的 Goal。清除必须显式通过 `/goal` 或
+`goal.clear`，且仅允许在没有 running/pending turn 时执行。Plan mode 可以看到当前 Goal，但不能更新它。
+
 ## Collaboration Modes
 
 当前 collaboration mode 是两个显式的 harness 策略，不是让模型在一个无限 ReAct loop 中自行决定

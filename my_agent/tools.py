@@ -10,7 +10,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Protocol
 
 from .execution import ProcessRunner
-from .goals import MAX_GOAL_STEPS
+from .goals import MAX_GOAL_OBJECTIVE_CHARS, MAX_GOAL_STEP_CHARS, MAX_GOAL_STEPS
 from .messages import ToolCall
 from .control import ApprovalBroker, AutoApproveBroker, PermissionRequest
 from .patches import MAX_PATCH_CHARS, apply_patch, parse_patch
@@ -138,13 +138,17 @@ class UpdateGoalTool(ToolBase):
     name = "update_goal"
     description = (
         "Create or replace the current structured goal snapshot for multi-step work. "
-        "Keep at most one step in_progress and mark steps completed only after evidence."
+        "Keep the objective unchanged when updating the same goal; a different objective "
+        "replaces it with a new goal. Keep at most one step in_progress and mark steps "
+        "completed only after evidence."
     )
     parameters = {
         "type": "object",
         "properties": {
             "objective": {
                 "type": "string",
+                "minLength": 1,
+                "maxLength": MAX_GOAL_OBJECTIVE_CHARS,
                 "description": "Concise objective for the current multi-step task.",
             },
             "steps": {
@@ -154,7 +158,11 @@ class UpdateGoalTool(ToolBase):
                 "items": {
                     "type": "object",
                     "properties": {
-                        "description": {"type": "string"},
+                        "description": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": MAX_GOAL_STEP_CHARS,
+                        },
                         "status": {
                             "type": "string",
                             "enum": ["pending", "in_progress", "completed"],
