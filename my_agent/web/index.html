@@ -125,6 +125,11 @@
             <span class="panel-label" id="recovery-label">Turn 未完成</span>
             <strong id="recovery-title">重试或放弃当前 turn</strong>
             <p class="panel-message" id="recovery-error"></p>
+            <ul class="recovery-attempts" id="recovery-attempts" hidden></ul>
+            <label class="recovery-confirmation" id="recovery-confirmation" hidden>
+              <input type="checkbox" id="recovery-confirmed">
+              我已检查工作区，确认继续
+            </label>
           </div>
           <div class="action-buttons">
             <button type="button" id="abort-turn" class="button secondary">放弃</button>

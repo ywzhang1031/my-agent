@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import sys
 from pathlib import Path
 from queue import Empty
@@ -58,6 +59,7 @@ from .sandbox import (
 from .service import AgentService
 from .goals import GoalState
 from .session import SessionState, SessionStore
+from .server_instance import ServerInstanceLease
 from .terminal import (
     LineEditor,
     SelectionOption,
@@ -169,12 +171,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    lease = None
     try:
         if args.command == "migrate":
             from .migration import migrate_sessions
             print(json.dumps(migrate_sessions(args.sessions_dir), ensure_ascii=False, indent=2))
             return 0
         args.runtime_config = load_runtime_config(args.config, args.credentials)
+        if args.command in {"ask", "chat", "resume"}:
+            root = Path(args.sessions_dir) if args.sessions_dir else Path(args.workspace) / ".my-agent" / "sessions"
+            lease = ServerInstanceLease.acquire(root, instance_id="cli", workspace=args.workspace)
         if args.command == "ask":
             return _run_ask(args)
         if args.command == "chat":
@@ -189,6 +195,9 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    finally:
+        if lease is not None:
+            lease.release()
 
 
 def _add_runtime_options(
@@ -465,6 +474,10 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
         interactive_approvals=True,
     )
     print(f"session: {state.session_id}")
+    if state.pending_turn and state.pending_turn.pause_reason == "recovery_required":
+        print("Previous process stopped unexpectedly. Inspect the workspace, then /recover or /abort.")
+        for attempt in state.pending_turn.pause_details.get("unknown_attempts", []):
+            print(f"unknown tool outcome: {attempt['tool_name']} ({attempt['call_id']})")
 
     history_path = store.root.parent / "history"
     toolbar = []
@@ -838,6 +851,19 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                 if user_input in {"/retry", "/recover"}:
                     if state.pending_turn is None:
                         print("no pending turn to retry")
+                        continue
+                    if state.pending_turn.pause_reason == "recovery_required":
+                        if user_input != "/recover":
+                            print("Recovery requires confirmation. Inspect the workspace, then /recover or /abort.")
+                            continue
+                        action = editor.select("recover> ", (
+                            SelectionOption("Keep paused", "Do not resume this turn"),
+                            SelectionOption("Confirm recovery", "Workspace inspected; continue without replaying old calls"),
+                        ), current_value="Keep paused")
+                        if action != "Confirm recovery":
+                            continue
+                    elif user_input == "/recover":
+                        print("This turn does not require crash recovery; use /retry.")
                         continue
                     terminal_event = _run_chat_turn(
                         args, store, state, service, editor, retry=True,

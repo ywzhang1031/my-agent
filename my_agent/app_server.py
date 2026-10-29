@@ -277,6 +277,7 @@ class AppServer:
             "session": self._state_to_dict(
                 state,
                 active=active,
+                persistence_error=(self.agent_service.session_view(session_id).persistence_error if active else None),
                 runtime_state=(
                     self.agent_service.session_view(session_id).runtime_state
                     if active
@@ -658,6 +659,7 @@ class AppServer:
         *,
         active: bool,
         runtime_state: str = "inactive",
+        persistence_error: str | None = None,
     ) -> dict[str, Any]:
         plan = state.proposed_plan
         return {
@@ -677,6 +679,7 @@ class AppServer:
             "sandbox_mode": state.sandbox_mode,
             "goal": state.goal.to_dict() if state.goal is not None else None,
             "runtime_state": runtime_state,
+            "persistence_error": persistence_error,
             "pending_turn_id": state.pending_turn.turn_id if state.pending_turn else None,
             "pending_turn_error": (
                 state.pending_turn.last_error if state.pending_turn else None

@@ -228,7 +228,7 @@ stdio transport 适合本地 UI 子进程并持有一个连接级 subscription�
 提供独立 long-poll subscription。它们仍只服务本地进程，不提供远程用户鉴权；未来换成
 WebSocket/SSE 时可以继续复用同一 AppServer、subscription 和 projection 边界。
 
-`events-v2.jsonl` 与 `trace.jsonl` 用途不同：前者只保存客户端 UI 恢复所需的 durable terminal facts，
+SQLite 的 `events` 表与 `trace.jsonl` 用途不同：前者只保存客户端 UI 恢复所需的 durable terminal facts，
 例如完整的 `item.completed` 和 turn 终态；`item.started` / `item.delta` 只实时 fan-out，不逐 token
 落盘。后者记录更详细的 model request/response、tool call/result 和 plan lifecycle，供 trajectory
 和调试使用。
@@ -321,7 +321,7 @@ Profile 选择保存在 `session.json`，可以按 session 独立切换；runnin
 
 `apply_patch` 的 session resource 是同一 workspace-relative path；`exec_command` 是同一组
 normalized `argv`。`/grants` 可以查看这些精确授权，并逐项撤销或全部清空。grant 只存在于当前
-runtime 内存中，不写入 `session.json`，关闭/恢复 session、`/new` 或重启 AppServer 都会清空。
+runtime 内存中，不写入 session 快照，关闭/恢复 session、`/new` 或重启 AppServer 都会清空。
 撤销只影响后续权限判断，不会中断已经开始执行的工具。审批事实仍会进入 trace 和 durable
 `approval.resolved` event；grant 快照使用 live-only event，不会被 event replay 恢复。
 非交互 `ask` 无法展示审批 UI，因此 `supervised` / `accept_edits` 中需要询问的操作会被拒绝；
@@ -345,6 +345,7 @@ REPL 支持这些本地命令：
 - `/approve`：执行保留的 proposed plan，主要用于取消 selector、恢复 session 或非 TTY 场景
 - `/config`：显示实际配置/凭据路径、默认模型和已解析 provider，不显示 API key
 - `/retry`：从失败的 model step 恢复，不重复用户消息或已完成 tool
+- `/recover`：检查异常退出的工具记录后，显式确认恢复；默认选项仍是保持暂停
 - `/abort`：丢弃 pending turn 的消息；已经产生的文件或进程副作用不会回滚
 - `/help`：显示命令帮助
 
@@ -382,11 +383,11 @@ DeepSeek，但 CLI 只显示 `thinking...` 状态；使用 `--show-thinking` 才
 默认 session 目录是：
 
 ```text
-<workspace>/.my-agent/sessions/<session_id>/
-  session.json
-  messages.jsonl
-  trace.jsonl
-  trajectory.json
+<workspace>/.my-agent/sessions/
+  agent.sqlite3
+  <session_id>/
+    trace.jsonl
+    trajectory.json
 <workspace>/.my-agent/history
 ```
 
@@ -582,7 +583,7 @@ PYTHONPATH=. .venv/bin/python -m unittest discover -s tests
 逐步演进到 session-aware runtime 和受控文件编辑。完整里程碑和设计决策见
 [docs/development-log.md](docs/development-log.md)。
 
-## Export Trajectory
+## Persistence and Recovery
 
 运行状态与持久事件现在存放在 sessions root 的 `agent.sqlite3` 中，采用短事务和
 `synchronous=FULL`；消息与 session 元数据作为同一快照提交，revision 防止旧快照覆盖新状态。
@@ -606,10 +607,23 @@ SQLite 使用默认 rollback journal，当前不引入 WAL 或网络文件系统
 未提交时标记为 `unknown`，不会重放原调用。恢复会补齐未知/未执行 observation，交回模型检查现状。
 这不是任意外部工具的 exactly-once 保证，也不恢复旧进程或 allow-session 权限。
 
+Web 会展示待确认的工具名称、call ID 和参数；只有勾选已检查工作区，才能点击“确认恢复”。
+运行中的服务发生存储故障时，界面会禁用继续执行，要求修复存储并重启。
+`unknown` 不表示工具失败，不能据此再次执行付款、部署、文件修改等不可重复操作。
+恢复仍允许模型根据观察重新规划；这不能阻止模型主动提出语义相同的新调用，需继续依赖权限审批。
+
+`turn.start` / `turn.recover` 在首个检查点提交后才返回接受成功。投影读取不会看见未提交的修改。
+同一 sessions root 同时只允许一个 CLI 或 AppServer 写入；多个 Web 页面连接同一 AppServer 不受影响。
+数据库文件权限为 `0600`，但不是加密存储；本轮不提供自动备份轮换、远程多节点写入或磁盘损坏修复。
+
 有副作用的 RPC 以 `request_id` 去重：相同 ID 和参数返回原响应，不重复 dispatch；相同 ID 换参数
 返回 `idempotency_conflict`。已登记但响应未保存的请求返回 `request_outcome_unknown`，需要查询会话
 确认，不能换一个 ID 盲目重发。记录只保存参数摘要，不保存原始 API Key。客户端应区分“重发同一
 请求”和“用户主动发起新的操作”；不同 request ID 不会被合并。
+Web 遇到网络异常时，针对服务端声明支持去重的写操作，只额外重发一次相同 ID 的请求。
+`request_outcome_unknown` 不会自动换新 ID 重试；请先查询会话实际状态。
+
+## Export Trajectory
 
 ```bash
 WORKSPACE=/path/to/repo

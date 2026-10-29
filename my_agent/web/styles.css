@@ -838,6 +838,30 @@ textarea:disabled {
   overflow-wrap: anywhere;
 }
 
+.recovery-attempts {
+  max-height: 140px;
+  overflow: auto;
+  margin: 8px 0;
+  padding-left: 18px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.recovery-confirmation {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  font-size: 12px;
+}
+
+.recovery-confirmation input {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+}
+
 .credential-error {
   color: var(--danger);
 }

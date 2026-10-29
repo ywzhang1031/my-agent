@@ -11,6 +11,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from .app_server import AppServer
 from .protocol import PROTOCOL_VERSION, event_to_dict
+from .request_store import MUTATING_METHODS
 from .rpc import (
     RPC_VERSION,
     ResponseEnvelope,
@@ -115,6 +116,7 @@ class LocalWebServer:
                             "instanceID": owner.app_server.instance_id,
                             "rpcVersion": RPC_VERSION,
                             "protocolVersion": PROTOCOL_VERSION,
+                            "deduplicatedMethods": sorted(MUTATING_METHODS),
                         },
                         ensure_ascii=False,
                         separators=(",", ":"),

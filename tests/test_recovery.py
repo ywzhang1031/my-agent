@@ -2,7 +2,9 @@ import tempfile
 import json
 import subprocess
 import sys
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
 from unittest.mock import patch
 
@@ -31,6 +33,71 @@ def response(text="", calls=()):
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_admission_receipt_is_not_overwritten_by_next_turn(self):
+        service, subscription = self.service([response("First turn complete")])
+        runtime = service._handle(self.state.session_id).runtime
+        wait = runtime.wait_for_admission
+        entered, release = threading.Event(), threading.Event()
+        receipts = []
+
+        def delay_first_receipt(receipt):
+            receipts.append(receipt)
+            if len(receipts) == 1:
+                entered.set()
+                if not release.wait(5):
+                    raise TimeoutError("test did not release admission")
+            wait(receipt)
+
+        with patch.object(runtime, "wait_for_admission", side_effect=delay_first_receipt), ThreadPoolExecutor(1) as pool:
+            first = pool.submit(service.dispatch, StartTurnCommand(
+                session_id=self.state.session_id, user_input="First",
+            ))
+            try:
+                self.assertTrue(entered.wait(2))
+                self.assertIsInstance(self.terminal(service, subscription), TurnCompletedEvent)
+                service.wait(self.state.session_id, timeout=2)
+                with patch.object(service, "_save_session", side_effect=OSError("second checkpoint failed")):
+                    with self.assertRaisesRegex(StorageError, "second checkpoint failed"):
+                        service.dispatch(StartTurnCommand(session_id=self.state.session_id, user_input="Second"))
+                    service.wait(self.state.session_id, timeout=2)
+            finally:
+                release.set()
+            first.result(timeout=2)
+        self.assertEqual(len(receipts), 2)
+        self.assertIsNot(receipts[0], receipts[1])
+        self.assertIsNone(receipts[0].error)
+
+    def test_projection_reader_cannot_observe_rolled_back_checkpoint(self):
+        service, _ = self.service([])
+        before = service.projection(self.state.session_id)
+        entered, release, reading = threading.Event(), threading.Event(), threading.Event()
+
+        def fail_append(event):
+            entered.set()
+            if not release.wait(3):
+                raise TimeoutError("test did not release checkpoint")
+            raise OSError("commit failed")
+
+        def read_projection():
+            reading.set()
+            return service.projection(self.state.session_id)
+
+        with patch.object(self.events, "append", side_effect=fail_append), ThreadPoolExecutor(2) as pool:
+            writer = pool.submit(service.dispatch, RenameSessionCommand(
+                session_id=self.state.session_id, title="Uncommitted",
+            ))
+            try:
+                self.assertTrue(entered.wait(2))
+                reader = pool.submit(read_projection)
+                self.assertTrue(reading.wait(2))
+                with self.assertRaises(TimeoutError):
+                    reader.result(timeout=0.05)
+            finally:
+                release.set()
+            with self.assertRaisesRegex(OSError, "commit failed"):
+                writer.result(timeout=2)
+            self.assertEqual(reader.result(timeout=2), before)
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -72,6 +139,15 @@ class RecoveryTests(unittest.TestCase):
         self.assertIsNone(restored.pending_turn)
         self.assertEqual(restored.messages[-1].content, "Committed answer")
         self.assertEqual(self.events.replay(self.state.session_id)[-1].event_id, terminal.event_id)
+
+    def test_start_is_not_acknowledged_before_first_checkpoint(self):
+        service, _ = self.service([response("Must not be requested")])
+        with patch.object(service, "_save_session", side_effect=OSError("first checkpoint failed")):
+            with self.assertRaises(StorageError):
+                service.dispatch(StartTurnCommand(session_id=self.state.session_id, user_input="Hello"))
+            service.wait(self.state.session_id)
+        self.assertEqual(self.provider.requests, [])
+        self.assertEqual(self.store.load(self.state.session_id).messages, [])
 
     def test_failed_checkpoint_prevents_tool_side_effect(self):
         call = ToolCall("patch-1", "apply_patch", {"patch":

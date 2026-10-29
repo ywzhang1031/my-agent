@@ -142,9 +142,9 @@ class SessionStore:
             }
         return state
 
-    def save(self, state: SessionState) -> None:
+    def save(self, state: SessionState, *, touch_updated_at: bool = True) -> None:
         state.session_dir.mkdir(parents=True, exist_ok=True)
-        updated_at = _now()
+        updated_at = _now() if touch_updated_at else state.updated_at
         data = session_to_dict(state)
         data["updated_at"] = updated_at
         with self.database.transaction() as connection:

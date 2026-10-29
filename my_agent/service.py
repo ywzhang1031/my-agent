@@ -98,6 +98,7 @@ class ServiceSessionView:
     pending_turn_id: str | None
     proposed_plan_id: str | None
     proposed_plan_status: str | None
+    persistence_error: str | None
 
 
 @dataclass
@@ -110,7 +111,7 @@ class _SessionHandle:
     completed_items: set[str] = field(default_factory=set)
     forwarding: bool = False
     forwarder: threading.Thread | None = None
-    lock: threading.Lock = field(default_factory=threading.Lock)
+    lock: threading.RLock = field(default_factory=threading.RLock)
     operation_lock: threading.Lock = field(default_factory=threading.Lock)
     closed: bool = False
     staged_events: list[AgentEventType] | None = None
@@ -182,6 +183,7 @@ class AgentService:
 
     def dispatch(self, command: AgentCommandType) -> None:
         handle = self._handle(command.session_id)
+        admission = None
         with handle.operation_lock:
             if handle.closed:
                 raise ValueError(f"session is not registered: {command.session_id}")
@@ -190,7 +192,16 @@ class AgentService:
             try:
                 with self._checkpoint(handle):
                     self._dispatch_to_handle(handle, command)
+                if isinstance(command, (StartTurnCommand, ExecutePlanCommand)) and isinstance(handle.runtime, AgentRuntime):
+                    admission = handle.runtime.admission_receipt
             except (StorageError, OSError) as exc:
+                handle.persistence_error = str(exc)
+                handle.runtime.send(InterruptTurn())
+                raise
+        if admission is not None:
+            try:
+                handle.runtime.wait_for_admission(admission)
+            except StorageError as exc:
                 handle.persistence_error = str(exc)
                 handle.runtime.send(InterruptTurn())
                 raise
@@ -345,10 +356,12 @@ class AgentService:
         return self._handle(session_id).runtime.session.goal
 
     def session_view(self, session_id: str) -> ServiceSessionView:
-        runtime = self._handle(session_id).runtime
+        handle = self._handle(session_id)
+        runtime = handle.runtime
         state = runtime.session
         plan = state.proposed_plan
         return ServiceSessionView(
+            persistence_error=handle.persistence_error,
             session_id=state.session_id,
             title=state.title,
             workspace=state.workspace,
@@ -474,29 +487,30 @@ class AgentService:
 
     @contextmanager
     def _checkpoint(self, handle: _SessionHandle):
-        if handle.staged_events is not None:
-            yield
-            return
-        projection = copy.deepcopy(handle.projection)
-        sequence, turn_id = handle.sequence, handle.current_turn_id
-        reserved_through = handle.reserved_through
-        active_items, completed_items = dict(handle.active_items), set(handle.completed_items)
-        handle.staged_events = []
-        try:
-            transaction = self._event_store.database.transaction() if self._event_store else nullcontext()
-            with transaction:
+        with handle.lock:
+            if handle.staged_events is not None:
                 yield
-            events = handle.staged_events
-        except BaseException:
-            handle.projection = projection
-            handle.sequence, handle.current_turn_id = sequence, turn_id
-            handle.reserved_through = reserved_through
-            handle.active_items, handle.completed_items = active_items, completed_items
-            raise
-        finally:
-            handle.staged_events = None
-        for event in events:
-            self._event_broker.publish(event)
+                return
+            projection = copy.deepcopy(handle.projection)
+            sequence, turn_id = handle.sequence, handle.current_turn_id
+            reserved_through = handle.reserved_through
+            active_items, completed_items = dict(handle.active_items), set(handle.completed_items)
+            handle.staged_events = []
+            try:
+                transaction = self._event_store.database.transaction() if self._event_store else nullcontext()
+                with transaction:
+                    yield
+                events = handle.staged_events
+            except BaseException:
+                handle.projection = projection
+                handle.sequence, handle.current_turn_id = sequence, turn_id
+                handle.reserved_through = reserved_through
+                handle.active_items, handle.completed_items = active_items, completed_items
+                raise
+            finally:
+                handle.staged_events = None
+            for event in events:
+                self._event_broker.publish(event)
 
     def _publish_storage_failure(self, handle: _SessionHandle, error: str) -> None:
         # This notification cannot claim durability when the store itself failed.

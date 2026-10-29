@@ -46,6 +46,9 @@ const elements = {
   recoveryLabel: document.querySelector("#recovery-label"),
   recoveryTitle: document.querySelector("#recovery-title"),
   recoveryError: document.querySelector("#recovery-error"),
+  recoveryAttempts: document.querySelector("#recovery-attempts"),
+  recoveryConfirmation: document.querySelector("#recovery-confirmation"),
+  recoveryConfirmed: document.querySelector("#recovery-confirmed"),
   retryTurn: document.querySelector("#retry-turn"),
   abortTurn: document.querySelector("#abort-turn"),
   credentialPanel: document.querySelector("#credential-panel"),
@@ -135,7 +138,7 @@ function verifyServerInstance(response) {
 }
 
 async function rpc(method, params = {}) {
-  const response = await fetch("/api/rpc", {
+  const request = {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -148,7 +151,15 @@ async function rpc(method, params = {}) {
       method,
       params,
     }),
-  });
+  };
+  let response;
+  try {
+    response = await fetch("/api/rpc", request);
+  } catch (error) {
+    if (!bootstrap.deduplicatedMethods?.includes(method)) throw error;
+    // A transport retry must retain the same request ID and body.
+    response = await fetch("/api/rpc", request);
+  }
   verifyServerInstance(response);
   if (!response.ok) {
     throw new Error(`HTTP ${response.status}`);
@@ -156,6 +167,9 @@ async function rpc(method, params = {}) {
   const envelope = await response.json();
   if (!envelope.ok) {
     const error = new Error(envelope.error?.message || "RPC failed");
+    if (envelope.error?.code === "request_outcome_unknown") {
+      error.message = "请求已登记，但执行结果尚不明确。请检查会话状态，不要重复提交新任务。";
+    }
     error.code = envelope.error?.code;
     error.data = envelope.error?.data;
     throw error;
@@ -561,10 +575,11 @@ function updateControls() {
   const sessionID = selectedSessionID();
   const busy = sessionID ? state.busySessions.has(sessionID) : false;
   const pending = Boolean(session?.pending_turn_id);
+  const storageFailure = session?.persistence_error;
   const credentialNeeded = Boolean(
     pending && state.credentialRequest?.sessionID === sessionID,
   );
-  const enabled = Boolean(session);
+  const enabled = Boolean(session) && !storageFailure;
 
   elements.sessionTitleText.textContent = session ? sessionDisplayName(session) : "未选择会话";
   elements.sessionTitle.title = session ? `重命名“${sessionDisplayName(session)}”` : "重命名会话";
@@ -612,19 +627,53 @@ function updateControls() {
 
   const proposed = session?.proposed_plan_status === "proposed";
   const continuationRequired = session?.pending_turn_pause_reason === "step_budget";
+  const recoveryRequired = session?.pending_turn_pause_reason === "recovery_required";
   const pauseDetails = session?.pending_turn_pause_details || {};
   elements.planPanel.hidden = !proposed || busy;
-  elements.recoveryPanel.hidden = !pending || busy || credentialNeeded;
-  elements.recoveryLabel.textContent = continuationRequired ? "需要你的决定" : "Turn 未完成";
-  elements.recoveryTitle.textContent = continuationRequired
+  elements.recoveryPanel.hidden = (!pending && !storageFailure) || busy || credentialNeeded;
+  elements.recoveryLabel.textContent = recoveryRequired ? "上次运行意外中断" : continuationRequired ? "需要你的决定" : "Turn 未完成";
+  elements.recoveryTitle.textContent = recoveryRequired ? "检查工作区后恢复"
+    : continuationRequired
     ? `已完成 ${pauseDetails.steps_completed || 0} 个模型步骤`
     : "重试或放弃当前 turn";
-  elements.recoveryError.textContent = continuationRequired
+  const unknownAttempts = pauseDetails.unknown_attempts || [];
+  elements.recoveryError.textContent = recoveryRequired
+    ? unknownAttempts.length
+      ? `${unknownAttempts.length} 个工具的执行结果未知，工作区可能已经被修改。原调用不会自动重放。`
+      : "上次运行未正常结束。已完成的修改不会撤销，请确认工作区现状。"
+    : continuationRequired
     ? "模型仍希望继续调用工具。当前状态已保存，是否继续执行？"
     : session?.pending_turn_error || "";
-  elements.retryTurn.textContent = continuationRequired
+  const confirmationKey = `${sessionID}:${session?.pending_turn_id}`;
+  if (!recoveryRequired || elements.recoveryConfirmed.dataset.turn !== confirmationKey) {
+    elements.recoveryConfirmed.checked = false;
+    elements.recoveryConfirmed.dataset.turn = confirmationKey;
+  }
+  elements.recoveryConfirmation.hidden = !recoveryRequired;
+  elements.recoveryAttempts.hidden = !recoveryRequired || !unknownAttempts.length;
+  elements.recoveryAttempts.replaceChildren(...unknownAttempts.map((attempt) => {
+    const item = document.createElement("li");
+    const details = document.createElement("details");
+    const label = document.createElement("summary");
+    label.textContent = `${attempt.tool_name} · ${attempt.call_id}`;
+    const argumentsView = document.createElement("pre");
+    argumentsView.textContent = JSON.stringify(attempt.arguments, null, 2);
+    details.append(label, argumentsView);
+    item.append(details);
+    return item;
+  }));
+  elements.retryTurn.disabled = busy || (recoveryRequired && !elements.recoveryConfirmed.checked);
+  elements.retryTurn.textContent = recoveryRequired ? "确认恢复" : continuationRequired
     ? `继续 ${pauseDetails.step_budget || 0} 步`
     : "重试";
+  elements.retryTurn.hidden = Boolean(storageFailure);
+  elements.abortTurn.hidden = Boolean(storageFailure);
+  if (storageFailure) {
+    elements.recoveryLabel.textContent = "存储故障";
+    elements.recoveryTitle.textContent = "修复存储后重启服务";
+    elements.recoveryError.textContent = storageFailure;
+    elements.recoveryConfirmation.hidden = true;
+  }
   elements.credentialPanel.hidden = !credentialNeeded || busy;
   elements.credentialTitle.textContent = credentialNeeded
     ? `配置 ${state.credentialRequest.providerID} API Key`
@@ -1564,13 +1613,15 @@ async function revisePlan() {
 async function retryTurn() {
   const sessionID = selectedSessionID();
   if (!sessionID) return;
+  const recoveryRequired = state.selectedSession?.pending_turn_pause_reason === "recovery_required";
+  if (recoveryRequired && !elements.recoveryConfirmed.checked) return;
   try {
     state.busySessions.add(sessionID);
     state.liveItems.set(sessionID, new Map());
     state.itemElements.clear();
     updateControls();
     renderSessionList();
-    await rpc("turn.retry", { session_id: sessionID });
+    await rpc(recoveryRequired ? "turn.recover" : "turn.retry", { session_id: sessionID });
   } catch (error) {
     state.busySessions.delete(sessionID);
     updateControls();
@@ -2025,6 +2076,7 @@ function bindUI() {
   elements.executePlan.addEventListener("click", executePlan);
   elements.revisePlan.addEventListener("click", revisePlan);
   elements.retryTurn.addEventListener("click", retryTurn);
+  elements.recoveryConfirmed.addEventListener("change", updateControls);
   elements.abortTurn.addEventListener("click", abortTurn);
   elements.credentialPanel.addEventListener("submit", saveCredential);
   elements.credentialAbort.addEventListener("click", abortTurn);

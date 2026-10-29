@@ -169,6 +169,7 @@ class AgentRuntime:
         self.session = session
         self._events: queue.Queue[RuntimeEvent] = queue.Queue()
         self.checkpointing = False
+        self.admission_receipt = CheckpointReceipt()
         self._lock = threading.Lock()
         self._state = RuntimeState.IDLE
         self._worker: threading.Thread | None = None
@@ -267,6 +268,12 @@ class AgentRuntime:
         if worker.is_alive():
             raise RuntimeError("runtime worker did not finish")
 
+    def wait_for_admission(self, receipt: CheckpointReceipt, timeout: float = 10.0) -> None:
+        if not receipt.ready.wait(timeout):
+            raise StorageError("turn admission outcome unknown; inspect session before retrying")
+        if receipt.error:
+            raise StorageError(receipt.error)
+
     def close(self, timeout: float = 5.0) -> None:
         with self._lock:
             worker = self._worker
@@ -291,6 +298,7 @@ class AgentRuntime:
             elif not command.user_input.strip():
                 raise ValueError("user_input is required for a new turn")
             cancel_event = threading.Event()
+            self.admission_receipt = CheckpointReceipt()
             self._cancel_event = cancel_event
             self._state = RuntimeState.RUNNING_MODEL
             self._worker = threading.Thread(
@@ -407,5 +415,8 @@ class AgentRuntime:
         )
         if receipt is not None:
             receipt.ready.wait()
+            if kind.startswith("turn_") and not self.admission_receipt.ready.is_set():
+                self.admission_receipt.error = receipt.error or (text if kind == "turn_failed" else None)
+                self.admission_receipt.ready.set()
             if receipt.error is not None:
                 raise StorageError(receipt.error)

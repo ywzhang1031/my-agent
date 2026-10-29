@@ -15,6 +15,16 @@ from my_agent.session import SessionStore, session_to_dict
 
 
 class PersistenceTests(unittest.TestCase):
+    def test_migration_cli_prints_json_result(self):
+        destination = self.root / "cli-sessions"
+        result = subprocess.run(
+            [sys.executable, "cli.py", "migrate", "--sessions-dir", str(destination)],
+            cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["status"], "migrated")
+        self.assertTrue((destination / DATABASE_NAME).is_file())
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -100,6 +110,8 @@ with store.database.transaction():
         result = migrate_sessions(root)
         loaded = SessionStore(root).load(self.state.session_id)
         self.assertEqual(loaded.messages[0].content, "Legacy question")
+        self.assertEqual(loaded.created_at, self.state.created_at)
+        self.assertEqual(loaded.updated_at, self.state.updated_at)
         self.assertEqual((directory / "messages.jsonl").read_bytes(), original)
         self.assertEqual((Path(result["backup"]) / self.state.session_id / "messages.jsonl").read_bytes(), original)
         self.assertEqual(migrate_sessions(root)["status"], "already_migrated")
