@@ -81,6 +81,9 @@ const state = {
   currentGoal: null,
   permissionGrants: [],
   selectedSession: null,
+  navigationRevision: 0,
+  sending: false,
+  draftCreation: null,
   busySessions: new Set(),
   attentionSessions: new Set(),
   lastSequence: new Map(),
@@ -137,7 +140,7 @@ function verifyServerInstance(response) {
   throw new Error("Agent server instance changed");
 }
 
-async function rpc(method, params = {}) {
+async function rpc(method, params = {}, id = requestID()) {
   const request = {
     method: "POST",
     headers: {
@@ -147,7 +150,7 @@ async function rpc(method, params = {}) {
     body: JSON.stringify({
       channel: "request",
       rpc_version: bootstrap.rpcVersion,
-      request_id: requestID(),
+      request_id: id,
       method,
       params,
     }),
@@ -197,7 +200,7 @@ function shortSessionID(sessionID) {
 }
 
 function sessionDisplayName(session) {
-  return session?.title?.trim() || shortSessionID(session?.session_id || "");
+  return session?.title?.trim() || (session?.message_count ? shortSessionID(session.session_id) : "新对话");
 }
 
 function formatTime(value) {
@@ -573,7 +576,7 @@ function bindChoiceMenu(trigger, menu) {
 function updateControls() {
   const session = state.selectedSession;
   const sessionID = selectedSessionID();
-  const busy = sessionID ? state.busySessions.has(sessionID) : false;
+  const busy = state.sending || (sessionID ? state.busySessions.has(sessionID) : false);
   const pending = Boolean(session?.pending_turn_id);
   const storageFailure = session?.persistence_error;
   const credentialNeeded = Boolean(
@@ -583,10 +586,11 @@ function updateControls() {
 
   elements.sessionTitleText.textContent = session ? sessionDisplayName(session) : "未选择会话";
   elements.sessionTitle.title = session ? `重命名“${sessionDisplayName(session)}”` : "重命名会话";
-  elements.sessionTitle.disabled = !enabled;
+  elements.sessionTitle.disabled = !enabled || state.sending;
+  elements.newSession.disabled = state.sending;
   elements.promptInput.disabled = !enabled || busy || pending;
   elements.sendPrompt.disabled = !enabled || busy || pending;
-  elements.stopTurn.hidden = !busy;
+  elements.stopTurn.hidden = !sessionID || !state.busySessions.has(sessionID);
   elements.modelMenuTrigger.disabled = !enabled || busy || pending;
   elements.permissionMenuTrigger.disabled = !enabled || busy || pending;
   elements.sandboxMenuTrigger.disabled = busy || pending || !state.sandboxProfiles.length;
@@ -1273,8 +1277,10 @@ async function refreshSessions() {
 }
 
 async function selectSession(sessionID) {
+  if (state.sending) return;
   const summary = sessionSummary(sessionID);
   if (!summary) return;
+  const navigation = ++state.navigationRevision;
   state.renamingSessionID = null;
   closeSessionMenu();
   cancelSessionRename();
@@ -1284,7 +1290,9 @@ async function selectSession(sessionID) {
       summary.active = true;
     }
     const result = await rpc("session.read", { session_id: sessionID });
+    if (navigation !== state.navigationRevision) return;
     state.selectedSession = result.session;
+    state.draftCreation = null;
     state.currentGoal = null;
     renderGoal();
     state.permissionGrants = [];
@@ -1306,27 +1314,43 @@ async function selectSession(sessionID) {
   }
 }
 
-async function createSession() {
-  const params = {};
-  if (elements.modelMenuTrigger.dataset.value) {
-    params.model_ref = elements.modelMenuTrigger.dataset.value;
-  }
-  if (elements.permissionMenuTrigger.dataset.value) {
-    params.permission_profile_id = elements.permissionMenuTrigger.dataset.value;
-  }
-  if (elements.sandboxMenuTrigger.dataset.value) {
-    params.sandbox_mode = elements.sandboxMenuTrigger.dataset.value;
-  }
-  const selectedMode = elements.modeSelector.querySelector('[aria-pressed="true"]');
-  if (selectedMode?.dataset.modeId) params.mode_id = selectedMode.dataset.modeId;
-  try {
-    const result = await rpc("session.create", params);
-    await refreshSessions();
-    await selectSession(result.session.session_id);
+function createSession() {
+  if (state.sending) return;
+  // Repeated clicks on New must not discard an unsent draft.
+  if (state.selectedSession && !selectedSessionID()) {
+    closeOverlays();
     elements.promptInput.focus();
-  } catch (error) {
-    showToast(`无法新建会话：${error.message}`);
+    return;
   }
+  state.navigationRevision += 1;
+  const model = state.models.find((item) => item.ref === elements.modelMenuTrigger.dataset.value) || state.models[0];
+  const previous = state.selectedSession;
+  state.selectedSession = {
+    session_id: null, title: "", message_count: 0,
+    provider_id: model?.provider_id, model_id: model?.model_id,
+    mode_id: previous?.mode_id || "build",
+    permission_profile_id: elements.permissionMenuTrigger.dataset.value,
+    sandbox_mode: elements.sandboxMenuTrigger.dataset.value,
+  };
+  state.draftCreation = null;
+  state.currentGoal = null;
+  state.permissionGrants = [];
+  state.pendingApproval = null;
+  state.credentialRequest = null;
+  state.renamingSessionID = null;
+  elements.approvalPanel.hidden = true;
+  elements.promptInput.value = "";
+  resizePrompt();
+  cancelSessionRename();
+  closeSessionMenu();
+  renderMessages([]);
+  resetContext();
+  renderGoal();
+  renderPermissionGrants();
+  updateControls();
+  renderSessionList();
+  closeOverlays();
+  elements.promptInput.focus();
 }
 
 function beginSessionRename() {
@@ -1422,13 +1446,19 @@ async function renameSession(event) {
   const sessionID = selectedSessionID();
   const title = elements.sessionTitleInput.value.trim();
   const error = validateSessionTitle(title);
-  if (!sessionID || error) {
+  if (!state.selectedSession || error) {
     showToast(error || "未选择会话");
     elements.sessionTitleInput.focus();
     return;
   }
   if (title === state.selectedSession.title) {
     cancelSessionRename();
+    return;
+  }
+  if (!sessionID) {
+    state.selectedSession.title = title;
+    cancelSessionRename();
+    updateControls();
     return;
   }
 
@@ -1460,31 +1490,56 @@ function visiblePlanContent(raw) {
 }
 
 async function startTurn(userInput) {
-  const sessionID = selectedSessionID();
-  if (!sessionID || !userInput.trim()) return;
+  let sessionID = selectedSessionID();
+  if (!state.selectedSession || state.sending || state.busySessions.has(sessionID) || state.selectedSession.pending_turn_id || !userInput.trim()) return;
   const text = userInput.trim();
-  elements.promptInput.value = "";
-  resizePrompt();
-  appendMessage("user", text);
-  state.liveItems.set(sessionID, new Map());
-  state.itemElements.clear();
-  state.credentialRequest = null;
-  state.busySessions.add(sessionID);
+  state.sending = true;
   updateControls();
-  renderSessionList();
   try {
+    if (!sessionID) {
+      const draft = state.selectedSession;
+      state.draftCreation ||= { id: requestID(), params: {
+        title: draft.title || Array.from(text.replace(/\s+/g, " ")).slice(0, 60).join(""),
+        model_ref: `${draft.provider_id}/${draft.model_id}`,
+        mode_id: draft.mode_id, permission_profile_id: draft.permission_profile_id,
+        sandbox_mode: draft.sandbox_mode,
+      }};
+      const result = await rpc("session.create", state.draftCreation.params, state.draftCreation.id);
+      state.selectedSession = result.session;
+      sessionID = result.session.session_id;
+      state.draftCreation = null;
+      await refreshSessions();
+    }
+    elements.promptInput.value = "";
+    resizePrompt();
+    appendMessage("user", text);
+    state.liveItems.set(sessionID, new Map());
+    state.itemElements.clear();
+    state.credentialRequest = null;
+    state.busySessions.add(sessionID);
+    updateControls();
+    renderSessionList();
     await rpc("turn.start", { session_id: sessionID, user_input: text });
   } catch (error) {
     state.busySessions.delete(sessionID);
-    updateControls();
-    renderSessionList();
+    if (!elements.promptInput.value) elements.promptInput.value = text;
+    resizePrompt();
     addActivity("Turn 启动失败", error.message, "danger");
     showToast(error.message);
+  } finally {
+    state.sending = false;
+    updateControls();
+    renderSessionList();
   }
 }
 
 async function switchMode(modeID) {
   const sessionID = selectedSessionID();
+  if (!sessionID && state.selectedSession) {
+    state.selectedSession.mode_id = modeID;
+    updateControls();
+    return;
+  }
   if (!sessionID || modeID === state.selectedSession.mode_id) return;
   try {
     await rpc("mode.switch", { session_id: sessionID, mode_id: modeID });
@@ -1495,6 +1550,12 @@ async function switchMode(modeID) {
 
 async function switchModel(modelRef) {
   const sessionID = selectedSessionID();
+  if (!sessionID && state.selectedSession) {
+    const model = state.models.find((item) => item.ref === modelRef);
+    if (model) Object.assign(state.selectedSession, { provider_id: model.provider_id, model_id: model.model_id });
+    updateControls();
+    return;
+  }
   if (!sessionID) return;
   try {
     await rpc("model.switch", { session_id: sessionID, model_ref: modelRef });
@@ -1506,6 +1567,11 @@ async function switchModel(modelRef) {
 
 async function switchPermissionProfile(profileID) {
   const sessionID = selectedSessionID();
+  if (!sessionID && state.selectedSession) {
+    state.selectedSession.permission_profile_id = profileID;
+    updateControls();
+    return;
+  }
   if (!sessionID || profileID === state.selectedSession.permission_profile_id) return;
   try {
     await rpc("permission.switch", { session_id: sessionID, profile_id: profileID });
@@ -1518,6 +1584,7 @@ async function switchPermissionProfile(profileID) {
 async function switchSandbox(mode) {
   const sessionID = selectedSessionID();
   if (!sessionID) {
+    if (state.selectedSession) state.selectedSession.sandbox_mode = mode;
     setChoiceMenuValue(
       elements.sandboxMenuTrigger,
       elements.sandboxMenuValue,
@@ -1742,6 +1809,7 @@ async function handleTerminalEvent(event, tone, detail) {
   if (sessionID === selectedSessionID()) {
     try {
       const result = await rpc("session.read", { session_id: sessionID });
+      if (sessionID !== selectedSessionID()) return;
       state.selectedSession = result.session;
       loadProjection(result.projection);
       syncCredentialRequest(state.selectedSession);
@@ -1941,7 +2009,7 @@ async function handleEvent(event) {
         updateControls();
       }
       addActivity(eventLabel(sessionID, "Turn 已放弃"), payload.turn_id, "warning");
-      await selectSession(sessionID);
+      if (sessionID === selectedSessionID()) await selectSession(sessionID);
       break;
     default:
       addActivity(eventLabel(sessionID, event.type), "", "neutral");
@@ -2132,6 +2200,7 @@ async function initialize() {
     pollEvents();
     setConnection("已连接", "online");
     if (state.sessions.length) await selectSession(state.sessions[0].session_id);
+    else createSession();
   } catch (error) {
     setConnection("初始化失败", "offline");
     showToast(`初始化失败：${error.message}`);

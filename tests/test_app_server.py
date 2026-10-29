@@ -245,6 +245,16 @@ class AppServerTests(unittest.TestCase):
         self.assertTrue(response.ok, response.error)
         return response.result["session"]["session_id"]
 
+    def test_session_create_persists_initial_title(self):
+        session_id = self.create_session(title="First task")
+        self.assertEqual(self.store.load(session_id).title, "First task")
+        self.assertEqual(self.rpc("session.read", session_id=session_id).result["session"]["title"], "First task")
+
+    def test_invalid_initial_title_does_not_create_session(self):
+        result = self.rpc("session.create", title="bad\ntitle")
+        self.assertFalse(result.ok)
+        self.assertEqual(self.store.list_sessions(), [])
+
     def complete_turn(self, session_id: str, answer: str) -> None:
         self.runtimes[session_id].events.put(
             RuntimeEvent(

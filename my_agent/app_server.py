@@ -33,7 +33,7 @@ from .runtime import AgentRuntime
 from .sandbox import SANDBOX_PROFILES, get_sandbox_profile, sandbox_availability
 from .service import AgentService, ServiceSessionView
 from .server_instance import ServerInstanceLease
-from .session import SessionState, SessionStore, message_to_dict
+from .session import SessionState, SessionStore, message_to_dict, normalize_session_title
 from .database import StorageError
 from .request_store import MUTATING_METHODS, RequestStore
 
@@ -218,8 +218,12 @@ class AppServer:
                 "mode_id",
                 "permission_profile_id",
                 "sandbox_mode",
+                "title",
             },
         )
+        title = self._optional_string(params, "title")
+        if title is not None:
+            title = normalize_session_title(title)
         model_ref = self._optional_string(params, "model_ref")
         mode_id = self._optional_string(params, "mode_id")
         permission_profile_id = self._optional_string(
@@ -243,6 +247,8 @@ class AppServer:
                 )
         with self._lifecycle_lock:
             state = self.session_store.create(self.workspace)
+            if title is not None:
+                state.title = title
             if permission_profile_id is not None:
                 state.permission_profile_id = permission_profile_id
             if sandbox_mode is not None:
