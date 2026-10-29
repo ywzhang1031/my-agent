@@ -4,9 +4,10 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from my_agent.attempt_store import AttemptStore
-from my_agent.cli import _print_verification
+from my_agent.cli import _print_verification, _report_verification
 from my_agent.database import Database
 from my_agent.session import SessionStore
 from my_agent.verification import read_verification
@@ -56,6 +57,12 @@ class VerificationTests(unittest.TestCase):
         self.assertIn("not task acceptance", output.getvalue())
         self.assertIn("main.py", output.getvalue())
         self.assertIn("exit=0", output.getvalue())
+
+    def test_reporting_failure_does_not_replace_the_turn_result(self):
+        output = io.StringIO()
+        with patch("my_agent.cli.read_verification", side_effect=OSError("disk unavailable")):
+            _report_verification(self.store, self.state.session_id, file=output)
+        self.assertIn("verification unavailable", output.getvalue())
 
     def test_edit_requires_validation_and_later_edit_invalidates_evidence(self):
         self.patch()

@@ -58,6 +58,29 @@ const { chromium } = require('playwright');
     await page.locator('#send-prompt').click();
     await page.waitForFunction(() => !state.sending && state.selectedSession?.message_count === 2);
     assert.equal(await page.locator('#session-title-text').innerText(), 'Manual draft title');
+    await page.locator('#new-session').click();
+    await page.locator('.mode-button[data-mode-id="plan"]').click();
+    assert.equal(requests.filter(r => r.method === 'mode.switch').length, 0);
+    await page.locator('.mode-button[data-mode-id="build"]').click();
+    await page.locator('#prompt-input').fill('Retry after a lost creation response');
+    const beforeRetry = requests.length;
+    let createAttempts = 0;
+    await page.route('**/api/rpc', async route => {
+      if (route.request().postDataJSON().method !== 'session.create') return route.continue();
+      createAttempts += 1;
+      if (createAttempts === 1) await route.fetch();
+      if (createAttempts <= 2) return route.abort('failed');
+      return route.continue();
+    });
+    await page.locator('#send-prompt').click();
+    await page.waitForFunction(() => !state.sending && state.draftCreation !== null);
+    assert.equal(await page.locator('#prompt-input').inputValue(), 'Retry after a lost creation response');
+    await page.locator('#send-prompt').click();
+    await page.waitForFunction(() => !state.sending && state.selectedSession?.message_count === 2);
+    const creations = requests.slice(beforeRetry).filter(r => r.method === 'session.create');
+    assert.equal(creations.length, 3);
+    assert.equal(new Set(creations.map(r => r.request_id)).size, 1);
+    assert.equal(await page.evaluate(async () => (await rpc('session.list')).sessions.length), 3);
     assert.match(await page.locator('#verification-view').innerText(), /暂无修改或验证记录/);
     // Rendering check only: authoritative projection behavior is covered by Python tests.
     await page.evaluate(() => renderVerification({
@@ -76,7 +99,7 @@ const { chromium } = require('playwright');
     assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
     await page.screenshot({ path: path.join(out, 'mobile.png') });
     assert.deepEqual(errors, []);
-    console.log(JSON.stringify({ passed: true, realModelCalls: 0, checks: ['draft', 'double-send', 'title', 'reload', 'mobile'], screenshots: out }));
+    console.log(JSON.stringify({ passed: true, realModelCalls: 0, checks: ['draft', 'double-send', 'title', 'reload', 'same-id-retry', 'verification', 'mobile'], screenshots: out }));
   } catch (error) {
     if (page) console.error(await page.evaluate(() => ({ session: state.selectedSession, toast: elements.toast.textContent, activities: state.activities })));
     console.error(stderr);
@@ -84,6 +107,6 @@ const { chromium } = require('playwright');
   } finally {
     if (browser) await browser.close();
     child.kill('SIGTERM');
-    await new Promise(resolve => child.exitCode !== null ? resolve() : child.once('exit', resolve));
+    await new Promise(resolve => child.exitCode !== null || child.signalCode !== null ? resolve() : child.once('exit', resolve));
   }
 })().catch(error => { console.error(error); process.exitCode = 1; });

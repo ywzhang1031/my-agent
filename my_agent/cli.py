@@ -12,6 +12,7 @@ from .agent_loop import AgentLoop
 from .app_server import AppServer
 from .config import RuntimeConfig, load_runtime_config, save_provider_credential
 from .control import ApprovalDecision, ApprovalGrant
+from .database import StorageError
 from .event_store import EventStore
 from .model_invoker import ModelInvoker
 from .modes import BUILD_MODE, COLLABORATION_MODES, CollaborationMode, get_mode
@@ -339,9 +340,7 @@ def _run_ask(args: argparse.Namespace) -> int:
     finally:
         service.close()
         _export_session_artifacts(state)
-        evidence = read_verification(store.database, state.session_id)
-        if evidence["status"] != "no_evidence":
-            _print_verification(evidence, file=sys.stderr)
+        _report_verification(store, state.session_id, file=sys.stderr)
     if args.stream:
         renderer.finish(terminal_event.answer)
     else:
@@ -967,6 +966,7 @@ def _approve_and_execute_plan(
     )
     _export_session_artifacts(state)
     _render_terminal_event(args, renderer, terminal_event)
+    _report_verification(store, state.session_id, terminal_event.turn_id)
     return _offer_continuation_action(
         args, store, state, service, editor, terminal_event
     )
@@ -1094,9 +1094,7 @@ def _run_chat_turn(
     finally:
         _export_session_artifacts(state)
     _render_terminal_event(args, renderer, terminal_event)
-    evidence = read_verification(store.database, state.session_id, terminal_event.turn_id)
-    if evidence["status"] != "no_evidence":
-        _print_verification(evidence)
+    _report_verification(store, state.session_id, terminal_event.turn_id)
     return terminal_event
 
 
@@ -1448,6 +1446,16 @@ def _print_permission_grants(grants: tuple[ApprovalGrant, ...]) -> None:
     print("Runtime permission grants (cleared when the runtime stops)")
     for grant in grants:
         print(f"  {grant.action:<16}{grant.resource} ({grant.description})")
+
+
+def _report_verification(store: SessionStore, session_id: str, turn_id: str | None = None, *, file=None) -> None:
+    try:
+        evidence = read_verification(store.database, session_id, turn_id)
+    except (StorageError, OSError) as exc:
+        print(f"verification unavailable: {exc}", file=file or sys.stderr)
+        return
+    if evidence["status"] != "no_evidence":
+        _print_verification(evidence, file=file)
 
 
 def _print_verification(evidence: dict, *, file=None) -> None:

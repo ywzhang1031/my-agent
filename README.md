@@ -574,6 +574,8 @@ structured output 等当前统一 request 尚未表达的能力，应先扩展 c
 
 ## Test
 
+任务级回归与 Web 验收见 [docs/task-regressions.md](docs/task-regressions.md)。脚本模型测试不代表真实模型完成率。
+
 ```bash
 PYTHONPATH=. .venv/bin/python -m unittest discover -s tests
 ```
