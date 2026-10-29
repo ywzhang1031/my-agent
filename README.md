@@ -592,8 +592,26 @@ PYTHONPATH=. python3 scripts/export_trajectory.py \
   --output "$WORKSPACE/.my-agent/sessions/$SESSION_ID/trajectory.json"
 ```
 
-`trace.jsonl` 是原始事件流；导出的 `trajectory.json` 使用 `my-agent.trajectory.v7`，先按 turn
+`trace.jsonl` 是原始事件流；导出的 `trajectory.json` 使用 `my-agent.trajectory.v8`，先按 turn
 分组，再按 step 分组，避免不同 turn 中相同 step 编号发生碰撞。每轮结束后会自动刷新
-`trajectory.json`，手动导出主要用于重新生成或校验现有 session trajectory。v7 增加 turn 级和
-session 级 `goal_events`，以及 `goal_updates` / `goal_clears` metrics；approval、interruption、
-plan、continuation 和 context 字段继续保留。
+`trajectory.json`，手动导出主要用于重新生成或校验现有 session trajectory。turn 和 session 级的
+`goal_events`、`goal_updates` / `goal_clears` metrics，以及 approval、interruption、plan、
+continuation 和 context 字段继续保留。
+
+v8 在每个 turn 下增加 `execution_summary`，只从已有 `tool_result` 派生，不新增运行时状态：
+
+- `changed_files`：成功 `apply_patch` 报告的文件路径，按首次出现顺序去重；包括后来被再次修改或
+  删除的路径，不代表最终净 diff，也不追踪命令、用户或外部进程的文件修改。
+- `evidence`：成功 patch 和所有具有结果的 `exec_command` 请求，按 trace 中结果事件的顺序排列。
+  每条保留 `tool_name`、`call_id`、`step`、`ts`，不按时间戳重排或合并重试。
+- patch 条目保留 `operation`、`changed_files`；命令条目区分 `requested_argv` / `requested_cwd`
+  与工具返回的 `normalized_argv` / `cwd`，并保留 `category`、`status`、`ok`、`exit_code`、
+  `timed_out`、`interrupted`、`duration_ms`、`truncated`。缺失结果字段为 `null`，缺失 status 为
+  `unknown`；`requested_cwd` 未指定时按工具默认值 `.` 展示。
+- `denied`、`invalid_request`、`repeated_call`、`spawn_error` 等结果仍作为请求记录保留，不算已执行。
+  `interrupted` 可能发生在进程启动之前，不能仅凭状态判断命令已运行。
+- 摘要不复制 stdout/stderr，可通过对应 turn、step 和 `call_id` 回查原始 observation。
+  它不从模型文字、Goal completed、批准记录或只有 `tool_call` 的提议生成执行证据。
+
+`success` 仅表示命令进程报告成功，不证明测试覆盖了修改、整个任务正确或 Goal 已验证完成。
+本轮不增加验证过期判定、自动测试或完成门禁，也不改变 agent loop 的停止逻辑。

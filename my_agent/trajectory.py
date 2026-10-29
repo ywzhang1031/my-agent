@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = "my-agent.trajectory.v7"
+SCHEMA_VERSION = "my-agent.trajectory.v8"
 
 
 def read_jsonl_trace(path: str | Path) -> list[dict[str, Any]]:
@@ -76,6 +76,7 @@ def _make_session_trajectory(
                 "final_answer": final.get("answer", "") if final else "",
                 "plan_events": _make_plan_events(turn_events),
                 "goal_events": _make_goal_events(turn_events),
+                "execution_summary": _make_execution_summary(turn_events),
                 "continuation_events": [
                     {
                         "steps_completed": event.get("steps_completed"),
@@ -153,6 +154,53 @@ def write_trajectory_json(trajectory: dict[str, Any], path: str | Path) -> None:
         json.dumps(trajectory, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+
+
+def _make_execution_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
+    changed_files: list[str] = []
+    evidence: list[dict[str, Any]] = []
+    # Trace order retains retries and same-step calls; proposals alone are not evidence.
+    for event in events:
+        if event.get("event") != "tool_result":
+            continue
+        call = event.get("call", {})
+        name = call.get("name")
+        if name not in {"apply_patch", "exec_command"}:
+            continue
+        result = event.get("result", {})
+        metadata = result.get("metadata", {})
+        entry = {
+            "tool_name": name,
+            "call_id": call.get("call_id"),
+            "step": event.get("step"),
+            "ts": event.get("ts"),
+        }
+        if name == "apply_patch":
+            if result.get("ok") is not True or metadata.get("applied") is not True:
+                continue
+            paths = list(metadata.get("changed_files", []))
+            entry.update({"operation": metadata.get("operation"), "changed_files": paths})
+            for path in paths:
+                if path not in changed_files:
+                    changed_files.append(path)
+        else:
+            arguments = call.get("arguments", {})
+            entry.update({
+                "requested_argv": arguments.get("argv"),
+                "requested_cwd": arguments.get("cwd", "."),
+                "normalized_argv": metadata.get("normalized_argv"),
+                "cwd": metadata.get("cwd"),
+                "category": metadata.get("category"),
+                "status": metadata.get("status", "unknown"),
+                "ok": result.get("ok"),
+                "exit_code": result.get("exit_code"),
+                "timed_out": metadata.get("timed_out"),
+                "interrupted": metadata.get("interrupted"),
+                "duration_ms": metadata.get("duration_ms"),
+                "truncated": result.get("truncated"),
+            })
+        evidence.append(entry)
+    return {"changed_files": changed_files, "evidence": evidence}
 
 
 def _group_step_events(events: list[dict[str, Any]]) -> list[tuple[int, list[dict[str, Any]]]]:

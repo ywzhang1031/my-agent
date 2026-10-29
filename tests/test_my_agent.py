@@ -550,7 +550,7 @@ class MyAgentTests(unittest.TestCase):
                 {state.session_id + ":1"},
             )
             trajectory = make_trajectory(trace_events, source_path=state.trace_path)
-            self.assertEqual(trajectory["schema_version"], "my-agent.trajectory.v7")
+            self.assertEqual(trajectory["schema_version"], "my-agent.trajectory.v8")
             self.assertEqual(trajectory["turns"][0]["outcome"]["status"], "completed")
             self.assertEqual(len(trajectory["turns"][0]["errors"]), 1)
             self.assertEqual(trajectory["metrics"]["turn_errors"], 1)
@@ -848,7 +848,7 @@ class MyAgentTests(unittest.TestCase):
             self.assertEqual(built.stopped_by, "final_answer")
             self.assertEqual(state.proposed_plan.status, "completed")
             trajectory = make_trajectory(events, state.trace_path)
-            self.assertEqual(trajectory["schema_version"], "my-agent.trajectory.v7")
+            self.assertEqual(trajectory["schema_version"], "my-agent.trajectory.v8")
             self.assertEqual(trajectory["turns"][0]["mode_id"], "plan")
             self.assertEqual(
                 trajectory["turns"][0]["outcome"]["stopped_by"],
@@ -3453,6 +3453,11 @@ class MyAgentTests(unittest.TestCase):
                 observation["output"]["metadata"]["changed_files"],
                 ["app.py"],
             )
+            summary = trajectory["turns"][0]["execution_summary"]
+            self.assertEqual(summary["changed_files"], ["app.py"])
+            self.assertEqual(len(summary["evidence"]), 1)
+            self.assertEqual(summary["evidence"][0]["call_id"], "call_patch")
+            self.assertEqual(summary["evidence"][0]["operation"], "update")
 
     def test_agent_loop_records_exec_command_observation(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3509,6 +3514,15 @@ class MyAgentTests(unittest.TestCase):
             self.assertEqual(observation["output"]["metadata"]["status"], "success")
             self.assertEqual(observation["output"]["metadata"]["category"], "test")
             self.assertEqual(observation["output"]["metadata"]["cwd"], ".")
+            summary = trajectory["turns"][0]["execution_summary"]
+            self.assertEqual(summary["changed_files"], [])
+            self.assertEqual(len(summary["evidence"]), 1)
+            evidence = summary["evidence"][0]
+            self.assertEqual(evidence["call_id"], action["action_id"])
+            self.assertEqual(evidence["normalized_argv"], argv)
+            self.assertEqual(evidence["exit_code"], 0)
+            for field in ("status", "category", "cwd", "duration_ms", "timed_out", "interrupted"):
+                self.assertEqual(evidence[field], observation["output"]["metadata"][field])
 
     def test_deepseek_provider_translates_canonical_messages_and_tools(self):
         provider = DeepSeekAdapter(
@@ -4160,7 +4174,7 @@ class MyAgentTests(unittest.TestCase):
 
         self.assertEqual(
             trajectory["schema_version"],
-            "my-agent.trajectory.v7",
+            "my-agent.trajectory.v8",
         )
         self.assertEqual(trajectory["workspace"], "/tmp/repo")
         turn = trajectory["turns"][0]
@@ -4270,7 +4284,7 @@ class MyAgentTests(unittest.TestCase):
 
         self.assertEqual(
             trajectory["schema_version"],
-            "my-agent.trajectory.v7",
+            "my-agent.trajectory.v8",
         )
         self.assertEqual(trajectory["session_id"], "session-1")
         self.assertEqual(len(trajectory["turns"]), 2)

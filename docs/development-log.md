@@ -516,3 +516,16 @@ Sandbox policy 从启动参数和只读状态提升为可查询、可切换的 s
   Goal，旧 Goal 也不构成自动执行授权。
 - 新增 11 项测试，覆盖参数边界、同 turn 修正、Goal ID、恢复/重试/中止、running/pending 清除限制，
   以及 Plan mode 即使收到模型误发的 `update_goal` 也不能修改状态。
+
+## Milestone 30: Turn Execution Evidence Summary
+
+本轮只增加 trajectory 导出投影，不改变 provider、agent loop、Goal、权限或客户端行为。
+
+- trajectory 直接升级到 v8，每个 turn 增加 `execution_summary`，从现有 `tool_result` 派生。
+- 成功 patch 汇总为有序去重的 `changed_files`；`evidence` 保留成功 patch 和命令请求结果的原始
+  顺序、`call_id`、step 和时间，同 step、重试和重复 call ID 不合并。
+- 命令请求参数与工具报告的参数分开保存；保留原始成功、非零退出、超时、中断、拒绝和启动失败
+  状态。缺少进程信息时保持未知，不把被拒绝或仅提议的命令认定为已执行。
+- 文件清单不是净 diff，进程成功不是任务验证通过；不增加验证新鲜度、自动运行测试或完成门禁。
+- 新增 9 项回归测试，覆盖证据来源、文件去重、命令状态、未知字段、重试顺序、turn 隔离，以及
+  导出脚本生成 v8 且不改写原始 trace。现有 loop 集成测试补充真实 patch 和本地命令的摘要断言。
