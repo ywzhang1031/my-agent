@@ -12,6 +12,7 @@ from .database import Database, RevisionConflict
 from .attempt_store import AttemptStore
 from .goals import GoalState, goal_from_dict
 from .messages import AssistantMessage, Message, ToolCall, ToolResultMessage, UserMessage
+from .rules import ProjectRules, rules_from_dict
 from .modes import BUILD_MODE
 from .permissions import DEFAULT_PERMISSION_PROFILE_ID, get_permission_profile
 from .sandbox import DEFAULT_SANDBOX_MODE, SANDBOX_MODES
@@ -69,6 +70,13 @@ class SessionState:
     goal: GoalState | None = None
     proposed_plan: ProposedPlan | None = None
     pending_turn: PendingTurn | None = None
+
+    def current_project_rules(self) -> ProjectRules | None:
+        # Keep snapshots with the originating user message, outside lossy summaries.
+        for message in reversed(self.messages):
+            if isinstance(message, UserMessage):
+                return message.project_rules
+        return None
 
     @property
     def trace_path(self) -> Path:
@@ -263,7 +271,10 @@ def normalize_session_title(value: str) -> str:
 
 def message_to_dict(message: Message) -> dict[str, Any]:
     if isinstance(message, UserMessage):
-        return {"role": "user", "content": message.content}
+        payload = {"role": "user", "content": message.content}
+        if message.project_rules is not None:
+            payload["project_rules"] = message.project_rules.to_dict()
+        return payload
     if isinstance(message, AssistantMessage):
         return {
             "role": "assistant",
@@ -285,7 +296,10 @@ def message_to_dict(message: Message) -> dict[str, Any]:
 def message_from_dict(data: dict[str, Any]) -> Message:
     role = data.get("role")
     if role == "user":
-        return UserMessage(content=data.get("content", ""))
+        return UserMessage(
+            content=data.get("content", ""),
+            project_rules=rules_from_dict(data.get("project_rules")),
+        )
     if role == "assistant":
         return AssistantMessage(
             content=data.get("content", ""),

@@ -33,6 +33,7 @@ from .session import PendingTurn, ProposedPlan, SessionState
 from .sandbox import DEFAULT_SANDBOX_MODE, SandboxPolicy
 from .tools import ToolContext, ToolRegistry, ToolResult
 from .trace import TraceRecorder
+from .rules import load_project_rules
 from .workspace import Workspace
 
 
@@ -122,7 +123,8 @@ class AgentLoop:
         turn_number = max(state.turn_counter, sum(isinstance(message, UserMessage) for message in state.messages)) + 1
         state.turn_counter = turn_number
         message_start = len(state.messages)
-        state.messages.append(UserMessage(content=user_input))
+        rules = load_project_rules(self.workspace.root)
+        state.messages.append(UserMessage(content=user_input, project_rules=rules))
         state.pending_turn = PendingTurn(
             turn_id=f"{state.session_id}:{turn_number}",
             task=user_input,
@@ -145,11 +147,15 @@ class AgentLoop:
                 "messages_before_request": len(state.messages),
                 "mode_id": self.mode.mode_id,
                 "approved_plan_id": approved_plan_id,
+                "project_rules": rules.manifest(),
             },
         )
         self._emit(
             event_handler,
-            AgentEvent(kind="turn_started", data={**event_context, "task": user_input}),
+            AgentEvent(
+                kind="turn_started",
+                data={**event_context, "task": user_input, "project_rules": rules.manifest()},
+            ),
         )
 
         return self._continue_turn(state, event_handler, cancel_event, approvals)

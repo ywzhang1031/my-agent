@@ -601,3 +601,15 @@ Sandbox policy 从启动参数和只读状态提升为可查询、可切换的 s
   只读问答六个任务级回归。使用工作区结果、退出码与账本断言，不以模型回答作为 grader。
 - 浏览器额外覆盖后端已创建但响应丢失的情况，确认用户重试仍使用同一 request ID，不重复创建会话。
 - 测试工具使用临时目录，不调用真实模型；具体边界和重跑方法见 `docs/task-regressions.md`。
+
+## Milestone 39: Turn-Scoped Project Rules
+
+- 新 turn 安全读取 workspace 根目录 `AGENTS.md`，只允许不超过 32 KiB 的 UTF-8 普通文件；
+  缺失/空文件不阻塞，符号链接、特殊文件、读取失败和超限明确报错，不静默降级或截断。
+- 将不可变规则快照保存在本轮 UserMessage 的本地元数据中，复用事务 checkpoint；重试/恢复不重新
+  读取文件，新 turn 重新加载。旧数据不伪造历史快照；不新增数据库 schema 或 provider 接口。
+- ContextManager 渲染 user-role 项目指导，单独计入 Project rules，剥离历史快照元数据，避免重复注入。
+  历史 compaction 不替代当前规则正文；规则不能授权操作或绕过 sandbox。
+- CLI `/rules`、Web inspector、turn.started 和 trajectory 展示来源/哈希，正文只保存在会话快照中。
+- 增加隔离测试覆盖边界、预算、重试、压缩、持久提交顺序与失败回滚；离线浏览器验证加载、刷新和窄屏。
+- Skills 自动选择与手动入口已经确认，但未在此提交中实现。

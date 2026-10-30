@@ -622,6 +622,23 @@ textarea:disabled {
   color: var(--muted);
 }
 
+.rules-section {
+  border-top: 1px solid var(--border);
+  padding: 14px;
+}
+.rules-section summary { cursor: pointer; font-weight: 600; font-size: 13px; }
+.rules-view {
+  padding-top: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 160px;
+  overflow-y: auto;
+  color: var(--muted);
+}
+.rules-view[data-status="error"] { color: var(--danger); }
+
 .verification-section {
   padding: 14px;
   border-top: 1px solid var(--border);

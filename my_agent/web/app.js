@@ -63,6 +63,7 @@ const elements = {
   usageFill: document.querySelector("#usage-fill"),
   contextBreakdown: document.querySelector("#context-breakdown"),
   contextMeta: document.querySelector("#context-meta"),
+  rulesView: document.querySelector("#rules-view"),
   goalView: document.querySelector("#goal-view"),
   verificationView: document.querySelector("#verification-view"),
   clearGoal: document.querySelector("#clear-goal"),
@@ -1079,6 +1080,7 @@ function renderActivities() {
 }
 
 function renderContext(context) {
+  renderProjectRules(context.project_rules);
   const total = Number(context.context_window_tokens || 0);
   const used = Number(context.estimated_tokens || 0);
   const percent = total > 0 ? Math.min(100, (used / total) * 100) : 0;
@@ -1090,6 +1092,7 @@ function renderContext(context) {
   const categories = [
     ["System prompt", breakdown.system_prompt_tokens, "#70787c"],
     ["Tool definitions", breakdown.tool_definition_tokens, "#286f9e"],
+    ["Project rules", breakdown.project_rules_tokens, "#7556a8"],
     ["Conversation summary", breakdown.summary_tokens, "#9a6500"],
     ["Conversation", breakdown.conversation_tokens, "#168153"],
     ["Protocol overhead", breakdown.protocol_tokens, "#a63c3c"],
@@ -1119,6 +1122,17 @@ function renderContext(context) {
 
 function resetContext() {
   renderContext({ breakdown: {} });
+}
+
+function renderProjectRules(rules) {
+  const labels = { loaded: "已加载", empty: "文件为空", missing: "未找到文件", error: "加载失败" };
+  elements.rulesView.dataset.status = rules?.status || "not_recorded";
+  elements.rulesView.textContent = rules ? [
+    `${rules.source} · ${labels[rules.status] || rules.status}`,
+    `作用域 ${rules.scope} · ${rules.size_bytes} bytes`,
+    rules.sha256 ? `SHA-256 ${rules.sha256}` : "",
+    rules.error || "",
+  ].filter(Boolean).join("\n") : "尚无规则快照";
 }
 
 function renderGoal() {
@@ -1897,6 +1911,10 @@ async function handleEvent(event) {
     case "turn.started": {
       state.liveItems.set(sessionID, new Map());
       state.busySessions.add(sessionID);
+      if (sessionID === selectedSessionID()) {
+        renderProjectRules(payload.project_rules);
+        await refreshContext();
+      }
       addActivity(eventLabel(sessionID, "Turn 已开始"), event.turn_id || "", "neutral");
       break;
     }

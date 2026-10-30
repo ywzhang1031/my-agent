@@ -295,6 +295,7 @@ def render_context_usage(
     rows = [
         ("System prompt", breakdown.system_prompt_tokens, "90"),
         ("Tool definitions", breakdown.tool_definition_tokens, "35"),
+        ("Project rules", breakdown.project_rules_tokens, "32"),
         ("Conversation summary", breakdown.summary_tokens, "36"),
         ("Conversation", breakdown.conversation_tokens, "33"),
         ("Protocol overhead", breakdown.protocol_tokens, "34"),

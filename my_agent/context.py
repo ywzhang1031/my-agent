@@ -21,6 +21,7 @@ class ContextBreakdown:
     summary_tokens: int
     conversation_tokens: int
     protocol_tokens: int
+    project_rules_tokens: int = 0
 
     @property
     def total_tokens(self) -> int:
@@ -30,6 +31,7 @@ class ContextBreakdown:
             + self.summary_tokens
             + self.conversation_tokens
             + self.protocol_tokens
+            + self.project_rules_tokens
         )
 
     def to_dict(self) -> dict[str, int]:
@@ -39,6 +41,7 @@ class ContextBreakdown:
             "summary_tokens": self.summary_tokens,
             "conversation_tokens": self.conversation_tokens,
             "protocol_tokens": self.protocol_tokens,
+            "project_rules_tokens": self.project_rules_tokens,
             "total_tokens": self.total_tokens,
         }
 
@@ -55,6 +58,7 @@ class ContextSnapshot:
     summarized_messages: int
     breakdown: ContextBreakdown
     compacted_messages: int = 0
+    project_rules: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -66,6 +70,7 @@ class ContextSnapshot:
             "summarized_messages": self.summarized_messages,
             "compacted_messages": self.compacted_messages,
             "breakdown": self.breakdown.to_dict(),
+            "project_rules": self.project_rules,
         }
 
 
@@ -114,6 +119,10 @@ class ContextManager:
         system_prompt: str,
     ) -> ContextSnapshot:
         snapshot = self.inspect(state=state, tools=tools, system_prompt=system_prompt)
+        if snapshot.project_rules and snapshot.project_rules["status"] == "error":
+            raise ContextWindowError(
+                f"{snapshot.project_rules['error']}. Fix the file, then abandon this turn and start a new one."
+            )
         threshold = int(self.input_budget * self.compact_threshold)
         if snapshot.estimated_tokens <= threshold:
             return snapshot
@@ -162,16 +171,24 @@ class ContextManager:
         start = state.summarized_message_count
         if start < 0 or start > len(state.messages):
             raise ContextWindowError("session summarized_message_count is invalid")
-        active_messages = list(state.messages[start:])
+        # Persisted rule snapshots are harness metadata, not provider message fields.
+        active_messages = [
+            UserMessage(content=message.content) if isinstance(message, UserMessage) else message
+            for message in state.messages[start:]
+        ]
+        rules = state.current_project_rules()
+        rules_prompt = rules.prompt() if rules is not None else ""
+        rule_messages = [UserMessage(content=rules_prompt)] if rules_prompt else []
         effective_prompt = _with_summary(system_prompt, state.context_summary)
         breakdown = estimate_request_breakdown(
             system_prompt=system_prompt,
             conversation_summary=state.context_summary,
             messages=active_messages,
             tools=tools,
+            project_rules_messages=rule_messages,
         )
         return ContextSnapshot(
-            messages=active_messages,
+            messages=rule_messages + active_messages,
             system_prompt=effective_prompt,
             estimated_tokens=breakdown.total_tokens,
             context_window_tokens=self.context_window_tokens,
@@ -181,6 +198,7 @@ class ContextManager:
             summarized_messages=start,
             breakdown=breakdown,
             compacted_messages=compacted_messages,
+            project_rules=rules.manifest() if rules is not None else None,
         )
 
     def _ensure_fits(self, snapshot: ContextSnapshot) -> None:
@@ -210,6 +228,7 @@ def estimate_request_breakdown(
     conversation_summary: str,
     messages: list[Message],
     tools: list[ToolSpec],
+    project_rules_messages: list[UserMessage] | None = None,
 ) -> ContextBreakdown:
     tool_payload = [
         {
@@ -240,6 +259,10 @@ def estimate_request_breakdown(
             estimate_text_tokens(_message_payload(message)) for message in messages
         ),
         protocol_tokens=16,
+        project_rules_tokens=sum(
+            estimate_text_tokens(_message_payload(message))
+            for message in project_rules_messages or []
+        ),
     )
 
 

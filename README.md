@@ -336,6 +336,7 @@ REPL 支持这些本地命令：
 - `/trace`：显示当前 raw trace 路径
 - `/tools`：列出可用工具
 - `/context`：查看估算的 context 使用量和 compaction 状态
+- `/rules`：查看最近 turn 使用的项目规则快照来源、状态与 SHA-256
 - `/verification`：查看本轮已提交的修改与验证证据，不等于任务验收
 - `/goal`：查看当前结构化 Goal；idle 且没有 pending turn 时可以清除
 - `/model`：打开模型选择器，用上下方向键选择、`Enter` 切换、`Esc` 取消
@@ -364,11 +365,37 @@ permission profile、context 百分比、估算用量和 pending
 `TERM=dumb`，slash menu 也不会退化为纯文本 `input()`。
 
 `/context` 会展开当前 request 的分类账单：`System prompt`、`Tool definitions`、
-`Conversation summary`、`Conversation` 和 `Protocol overhead`。它还会显示完整 context limit、
+`Project rules`、`Conversation summary`、`Conversation` 和 `Protocol overhead`。它还会显示完整 context limit、
 输入预算、输出预留、最近一次 provider input usage，以及 active/summarized message 数量。没有
-注入 request 的 Rules、Skills、MCP 或 subagent 不会为了界面效果显示成虚构分类。
+注入 request 的 Skills、MCP 或 subagent 不会为了界面效果显示成虚构分类；未加载规则时 `Project rules` 为零。
 当前 Goal 会以结构化 JSON 追加到 system instructions，因此计入 `System prompt`，不会另造一个
 无法与实际请求对齐的 token 类别。
+
+### 项目规则
+
+每个新 turn 只读取 `<workspace>/AGENTS.md`，不向父目录搜索，也不递归加载子目录或个人规则。
+本仓库的 `AGENTS.md` 提供了测试命令和现有架构边界。规则文件必须是 UTF-8 普通文件，最多 32 KiB；
+拒绝符号链接（包括指向 workspace 内部的链接）。文件缺失或为空不影响运行；读取失败、编码错误、
+超大文件会明确报错，不调用模型，也不静默截断规则。当前安全文件读取使用 macOS/Linux 的 POSIX 语义。
+
+调用链是 `AgentLoop.run_turn -> load_project_rules -> UserMessage.project_rules -> turn.started checkpoint
+-> ContextManager.prepare -> ModelRequest -> provider`。正文、状态和哈希随用户消息写入现有 SQLite
+会话记录，提交完成才允许调用模型；不新增数据库表或改动 provider API。每个 turn 单独保留快照，
+增加的存储量最多约 32 KiB 正文/turn；将来会话规模需要时再做内容去重，不引入第二套真相源。
+
+重试、续跑和显式崩溃恢复使用原快照；下一次新 turn 才重新读文件。旧会话没有规则快照时显示
+“尚无规则快照”，不会用今天的文件伪造历史。`/abort` 沿用现有语义：删除该 pending turn 的消息及其
+规则正文快照，已记录的来源哈希事件仍保留。若规则加载失败，修正文件后需放弃该 turn，再发起新 turn。
+
+ContextManager 将当前快照渲染为独立的 user-role 项目指导，放在历史消息前，不提升为 system policy；
+规则不替代显式用户要求或执行权限。普通消息发给 provider 前移除快照元数据，避免把旧规则再次发送。
+规则正文不会被历史摘要替代，预算超限仍明确失败。`Project rules` 使用与其他分类相同的估算方法，
+包含指导消息包装，不是厂商 tokenizer 的精确用量，也不会与 Conversation 重复计数。
+
+Web 右侧显示最近 turn 的来源、作用范围、状态及完整 SHA-256；CLI 使用 `/rules` 和 `/context`。
+`turn.started` 事件与 trajectory 携带来源清单，`model_request.context` 携带实际规则版本和预算，
+事件不重复携带正文。回归测试运行 `.venv/bin/python -m unittest discover -s tests -p test_rules.py`。
+本阶段不提供 Skills 加载、远程规则、自动脚本执行或规则热替换。
 
 默认启用流式输出；`--no-stream` 可以只在本轮结束时显示完整答案。thinking 默认仍会发给
 DeepSeek，但 CLI 只显示 `thinking...` 状态；使用 `--show-thinking` 才会流式打印

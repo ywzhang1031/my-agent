@@ -28,6 +28,7 @@ def main():
     signal.signal(signal.SIGTERM, stop)
     with tempfile.TemporaryDirectory(prefix="my-agent-web-test-") as temporary:
         root = Path(temporary)
+        (root / "AGENTS.md").write_text("Use the offline fixture. Do not call external services.\n", encoding="utf-8")
         store = SessionStore(root / ".my-agent" / "sessions")
         service = AgentService(tool_registry_factory=build_tool_registry, save_session=store.save,
                                event_store=EventStore(store.root))

@@ -197,6 +197,7 @@ class SessionRenamedEvent(AgentEvent):
 @dataclass(frozen=True, kw_only=True)
 class TurnStartedEvent(AgentEvent):
     task: str
+    project_rules: dict[str, Any] = field(default_factory=dict)
     event_type: ClassVar[EventType] = EventType.TURN_STARTED
 
 

@@ -93,6 +93,7 @@ SLASH_COMMANDS = (
     SlashCommand("/sessions", "List saved sessions"),
     SlashCommand("/summary", "Show current session state"),
     SlashCommand("/context", "Show detailed context usage"),
+    SlashCommand("/rules", "Show the latest turn's frozen project rules"),
     SlashCommand("/verification", "Show committed changes and validation evidence"),
     SlashCommand("/model", "Choose the model"),
     SlashCommand("/mode", "Choose Build or Plan mode"),
@@ -846,6 +847,9 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                 if user_input == "/verification":
                     _print_verification(read_verification(store.database, state.session_id))
                     continue
+                if user_input == "/rules":
+                    _print_project_rules(service.inspect_context(state.session_id))
+                    continue
                 if user_input == "/context":
                     snapshot = service.inspect_context(state.session_id)
                     print(
@@ -1469,6 +1473,19 @@ def _print_verification(evidence: dict, *, file=None) -> None:
     for attempt in evidence["unknown_attempts"]:
         print(f"  unknown: {attempt['tool_name']} ({attempt['call_id']})", file=file)
     print("  Scope: this turn's tracked patches only; external and command-side edits are not observed.", file=file)
+
+
+def _print_project_rules(snapshot, *, file=None) -> None:
+    rules = snapshot.project_rules
+    if rules is None:
+        print("Project rules: no recorded snapshot (new or pre-rules session).", file=file)
+        return
+    print(f"Project rules: {rules['status']} | {rules['source']} | workspace scope {rules['scope']}", file=file)
+    print(f"Frozen at turn start | {rules['size_bytes']} bytes | ~{snapshot.breakdown.project_rules_tokens} tokens", file=file)
+    if rules.get("sha256"):
+        print(f"SHA-256: {rules['sha256']}", file=file)
+    if rules.get("error"):
+        print(rules["error"], file=file)
 
 
 def _print_goal(goal: GoalState | None) -> None:

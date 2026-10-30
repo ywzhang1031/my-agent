@@ -714,6 +714,7 @@ class AgentService:
                 state,
                 turn_id=turn_id,
                 task=str(data["task"]),
+                project_rules=dict(data.get("project_rules", {})),
             )
             user_item_id = f"{turn_id}:user"
             self._ensure_item(
