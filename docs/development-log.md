@@ -625,3 +625,15 @@ Sandbox policy 从启动参数和只读状态提升为可查询、可切换的 s
   不修改数据库 schema、provider、agent loop 或已有规则快照。
 - 增加 16 项发现层测试与 1 项 RPC 回归，覆盖恶意 YAML、路径替换、资源边界、元数据变更和无副作用；
   离线浏览器验收目录、错误、纯文本渲染、刷新与手机布局。模型选择/正文加载留到第三阶段。
+
+## Milestone 41: Turn-Scoped Skill Activation
+
+- 扩展发现到项目父级、个人及跨产品约定目录，并支持 `skills.paths`；同名按明确优先级选择，来源冲突可见。
+  不做整盘递归，缓存/命名空间集合需指定真实 Skill 根目录，AGENTS.md 的作用域不扩大。
+- `StartTurn.skills` 传递下一轮手动选择；模型通过目录描述和 `load_skill` 按需选择，不修改 provider。
+- 新 turn 固定目录，首次加载固定正文与完整文件哈希；快照附在 UserMessage，进入现有 SQLite 检查点。
+  工具结果只带确认与来源，正文由 ContextManager 独立注入且只计一次，摘要不替换当前 Skill。
+- CLI 上下选择、Web 勾选、上下文分类和来源回显接通；选择单轮有效，重试/恢复复用已记录版本。
+- 尊重调用控制标记；权限、Plan 工具边界和 OS sandbox 不因 Skill 文本或 `allowed-tools` 扩张。
+- 新增隔离测试覆盖自动/手动调用、目录优先级、正文校验、预算、调用控制、压缩、恢复及检查点失败；
+  浏览器用模型替身验收完整调用链，不把通过回归当作真实模型 Skill 选择质量的证据。

@@ -843,7 +843,7 @@ class MyAgentTests(unittest.TestCase):
             self.assertEqual(plan_provider.requests[0].system_prompt, PLAN_MODE.instructions)
             self.assertEqual(
                 sorted(tool.name for tool in plan_provider.requests[0].tools),
-                ["git_diff", "list_files", "read_file", "search"],
+                ["git_diff", "list_files", "load_skill", "read_file", "search"],
             )
             self.assertEqual(built.stopped_by, "final_answer")
             self.assertEqual(state.proposed_plan.status, "completed")
@@ -2251,7 +2251,7 @@ class MyAgentTests(unittest.TestCase):
             }
             self.assertEqual(
                 tool_lines,
-                {"git_diff", "list_files", "read_file", "search"},
+                {"git_diff", "list_files", "load_skill", "read_file", "search"},
             )
 
     def test_chat_offers_plan_action_and_executes_selected_plan(self):
@@ -2579,6 +2579,7 @@ class MyAgentTests(unittest.TestCase):
                 "exec_command",
                 "git_diff",
                 "list_files",
+                "load_skill",
                 "read_file",
                 "search",
                 "update_goal",
@@ -2588,7 +2589,7 @@ class MyAgentTests(unittest.TestCase):
     def test_plan_mode_exposes_only_read_only_tools_and_extracts_wrapped_protocol(self):
         self.assertEqual(
             build_tool_registry(PLAN_MODE).names(),
-            ["git_diff", "list_files", "read_file", "search"],
+            ["git_diff", "list_files", "load_skill", "read_file", "search"],
         )
         self.assertEqual(get_mode("plan"), PLAN_MODE)
         self.assertEqual(

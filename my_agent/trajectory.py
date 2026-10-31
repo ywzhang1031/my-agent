@@ -58,6 +58,7 @@ def _make_session_trajectory(
                 "mode_id": started.get("mode_id", "build"),
                 "approved_plan_id": started.get("approved_plan_id"),
                 "project_rules": started.get("project_rules"),
+                "skills": started.get("skills"),
                 "started_at": _first_ts(turn_events),
                 "ended_at": _last_ts(turn_events),
                 "max_steps": started.get("max_steps"),

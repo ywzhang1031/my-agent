@@ -1,5 +1,10 @@
 {
   "default_model": "deepseek/deepseek-v4-flash",
+  "skills": {
+    "discover_parents": true,
+    "discover_personal": true,
+    "paths": []
+  },
   "providers": {
     "deepseek": {
       "base_url": "https://api.deepseek.com",

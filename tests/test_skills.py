@@ -47,8 +47,8 @@ class SkillDiscoveryTests(unittest.TestCase):
         catalog = discover_skills(self.root)
         self.assertEqual([skill.name for skill in catalog.skills], ["a-first", "z-last"])
         self.assertIn("Review tests. Check edge cases.", catalog.skills[0].description)
-        self.assertEqual(catalog.skills[0].path, ".agents/skills/a-first/SKILL.md")
-        self.assertFalse(catalog.to_dict()["model_visible"])
+        self.assertEqual(catalog.skills[0].path, str(path.resolve()))
+        self.assertNotIn("loaded", catalog.to_dict())
         self.assertNotIn("Private workflow body", json.dumps(catalog.to_dict()))
         digest = catalog.skills[0].frontmatter_sha256
         with path.open("ab") as source:
@@ -184,7 +184,7 @@ class SkillDiscoveryTests(unittest.TestCase):
         self.assertEqual(catalog.status, "error")
         self.assertIn("Permission denied", catalog.diagnostics[0].message)
 
-    def test_does_not_search_parents_nested_projects_or_legacy_directories(self):
+    def test_isolated_discovery_includes_product_roots_but_not_parents_or_nested_projects(self):
         self.skill()
         child = self.root / "child"
         child.mkdir()
@@ -196,7 +196,9 @@ class SkillDiscoveryTests(unittest.TestCase):
             legacy = self.root / name / "skills" / "legacy"
             legacy.mkdir(parents=True)
             (legacy / "SKILL.md").write_text("---\nname: legacy\ndescription: hidden\n---\n")
-        self.assertEqual([s.name for s in discover_skills(self.root).skills], ["test-review"])
+        catalog = discover_skills(self.root)
+        self.assertEqual([s.name for s in catalog.skills], ["legacy", "test-review"])
+        self.assertTrue(any("Shadowed by" in issue.message for issue in catalog.diagnostics))
 
     def test_cli_lists_metadata_and_escapes_diagnostic_paths(self):
         self.skill()
@@ -205,7 +207,7 @@ class SkillDiscoveryTests(unittest.TestCase):
         output = io.StringIO()
         _print_skill_catalog(catalog, file=output)
         rendered = output.getvalue()
-        self.assertIn("metadata only, not activated", rendered)
+        self.assertIn("metadata only", rendered)
         self.assertIn("Review tests", rendered)
         self.assertIn("error:", rendered)
         self.assertNotIn("\x1b", rendered)
@@ -227,7 +229,7 @@ class SkillDiscoveryTests(unittest.TestCase):
         self.assertIn("\\udcff", catalog.diagnostics[0].path)
         json.dumps(catalog.to_dict(), ensure_ascii=False).encode("utf-8")
 
-    def test_discovery_does_not_inject_context_register_tools_or_run_scripts(self):
+    def test_turn_discovery_injects_metadata_but_not_body_or_scripts(self):
         path = self.skill(header="name: test-review\ndescription: UNIQUE_SKILL_DESCRIPTION")
         sentinel = self.root / "never-created"
         script = path.parent / "scripts" / "run.sh"
@@ -246,6 +248,8 @@ class SkillDiscoveryTests(unittest.TestCase):
         loop.run_turn(state, "Hello")
         request = provider.requests[0]
         self.assertEqual(tools.names(), before)
-        self.assertNotIn("load_skill", before)
-        self.assertNotIn("UNIQUE_SKILL_DESCRIPTION", request.system_prompt + "".join(m.content for m in request.messages))
+        self.assertIn("load_skill", before)
+        contents = request.system_prompt + "".join(m.content for m in request.messages)
+        self.assertIn("UNIQUE_SKILL_DESCRIPTION", contents)
+        self.assertNotIn("Private workflow body", contents)
         self.assertFalse(sentinel.exists())

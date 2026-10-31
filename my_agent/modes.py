@@ -58,6 +58,7 @@ BUILD_MODE = CollaborationMode(
         "search",
         "exec_command",
         "update_goal",
+        "load_skill",
     ),
 )
 
@@ -65,7 +66,7 @@ PLAN_MODE = CollaborationMode(
     mode_id="plan",
     description="Explore read-only and produce an approvable implementation plan",
     instructions=PLAN_INSTRUCTIONS,
-    tool_names=("git_diff", "list_files", "read_file", "search"),
+    tool_names=("git_diff", "list_files", "read_file", "search", "load_skill"),
     produces_plan=True,
 )
 

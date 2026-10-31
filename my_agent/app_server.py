@@ -37,7 +37,7 @@ from .session import SessionState, SessionStore, message_to_dict, normalize_sess
 from .verification import read_verification
 from .database import StorageError
 from .request_store import MUTATING_METHODS, RequestStore
-from .skills import discover_skills
+from .skills import SkillSettings, discover_skills, validate_skill_names
 
 
 RuntimeFactory = Callable[
@@ -74,8 +74,10 @@ class AppServer:
         modes: Iterable[CollaborationMode],
         credentials_path: str | Path | None = None,
         credential_setter: CredentialSetter | None = None,
+        skill_settings: SkillSettings | None = None,
     ) -> None:
         self.workspace = Path(workspace).expanduser().resolve()
+        self.skill_settings = skill_settings or SkillSettings()
         self.session_store = session_store
         self.agent_service = agent_service
         self._runtime_factory = runtime_factory
@@ -216,7 +218,7 @@ class AppServer:
 
     def _list_skills(self, params: dict[str, Any]) -> dict[str, Any]:
         self._check_params(params)
-        return {"catalog": discover_skills(self.workspace).to_dict()}
+        return {"catalog": discover_skills(self.workspace, self.skill_settings).to_dict()}
 
     def _create_session(self, params: dict[str, Any]) -> dict[str, Any]:
         self._check_params(
@@ -470,10 +472,11 @@ class AppServer:
         return {"context": self.agent_service.inspect_context(session_id).to_dict()}
 
     def _start_turn(self, params: dict[str, Any]) -> dict[str, Any]:
-        self._check_params(params, required={"session_id", "user_input"})
+        self._check_params(params, required={"session_id", "user_input"}, optional={"skills"})
         command = StartTurnCommand(
             session_id=self._required_string(params, "session_id"),
             user_input=self._required_string(params, "user_input"),
+            skills=validate_skill_names(params.get("skills", [])),
         )
         return self._dispatch_command(command)
 

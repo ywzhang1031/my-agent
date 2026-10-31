@@ -13,6 +13,7 @@ from .event_broker import EventBroker
 from .event_store import EventStore
 from .messages import UserMessage
 from .goals import GoalState
+from .skills import validate_skill_names
 from .model_invoker import ModelInvoker
 from .modes import BUILD_MODE, CollaborationMode, get_mode
 from .protocol import (
@@ -220,6 +221,7 @@ class AgentService:
                 handle,
                 StartTurn(
                     user_input=command.user_input,
+                    skills=command.skills,
                     retry=command.retry,
                     approved_plan_id=command.approved_plan_id,
                     recovery_confirmed=command.recovery_confirmed,
@@ -417,6 +419,9 @@ class AgentService:
         return handle
 
     def _start_turn(self, handle: _SessionHandle, command: StartTurn) -> None:
+        validate_skill_names(command.skills)
+        if command.retry and command.skills:
+            raise ValueError("retry uses frozen skills; start a new turn to change selection")
         with handle.lock:
             if handle.forwarding:
                 raise RuntimeError("session already has an active event stream")
@@ -715,6 +720,7 @@ class AgentService:
                 turn_id=turn_id,
                 task=str(data["task"]),
                 project_rules=dict(data.get("project_rules", {})),
+                skills=data.get("skills"),
             )
             user_item_id = f"{turn_id}:user"
             self._ensure_item(

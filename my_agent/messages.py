@@ -4,12 +4,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .rules import ProjectRules
+from .skills import TurnSkills
 
 
 @dataclass
 class UserMessage:
     content: str
     project_rules: ProjectRules | None = None
+    skills: TurnSkills | None = None
 
 
 @dataclass(frozen=True)

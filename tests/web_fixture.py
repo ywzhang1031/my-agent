@@ -11,9 +11,10 @@ from my_agent.cli import build_tool_registry
 from my_agent.config import ConfiguredModel
 from my_agent.event_store import EventStore
 from my_agent.model_invoker import ModelInvoker
+from my_agent.messages import ToolCall
 from my_agent.modes import COLLABORATION_MODES, get_mode
 from my_agent.permissions import PermissionPolicy
-from my_agent.provider import ModelMetadata, ModelResponse, ScriptedProviderAdapter
+from my_agent.provider import ModelMetadata, ModelResponse, ScriptedProviderAdapter, StopReason
 from my_agent.runtime import AgentRuntime
 from my_agent.service import AgentService
 from my_agent.session import SessionStore
@@ -47,6 +48,9 @@ def main():
             mode = get_mode(state.mode_id)
             replies = [ModelResponse.from_parts(text="Offline fixture response", metadata=ModelMetadata(
                 provider_id="scripted", model_id="scripted-model")) for _ in range(20)]
+            if state.title == "Auto-select fixture skill":
+                replies.insert(0, ModelResponse.from_parts(tool_calls=[ToolCall("fixture-skill", "load_skill", {"name": "fixture-review"})],
+                    stop_reason=StopReason.TOOL_CALLS, metadata=ModelMetadata(provider_id="scripted", model_id="scripted-model")))
             loop = AgentLoop(workspace=Workspace(root), model=ModelInvoker(ScriptedProviderAdapter(replies)),
                              tools=build_tool_registry(mode), permissions=PermissionPolicy(),
                              trace=TraceRecorder(state.trace_path), mode=mode)

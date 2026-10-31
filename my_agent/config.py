@@ -9,8 +9,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
+from .skills import SkillSettings
+
 
 BUILTIN_CONFIG: dict[str, Any] = {
+    "skills": {"discover_parents": True, "discover_personal": True, "paths": []},
     "default_model": "deepseek/deepseek-v4-flash",
     "providers": {
         "deepseek": {
@@ -89,6 +92,7 @@ class RuntimeConfig:
     default_model: str
     providers: Mapping[str, ProviderSettings]
     credentials: Mapping[str, str]
+    skills: SkillSettings = field(default_factory=SkillSettings)
 
     def models(self) -> tuple[ConfiguredModel, ...]:
         return tuple(
@@ -162,6 +166,7 @@ def load_runtime_config(
         default_model=default_model,
         providers=providers,
         credentials=credentials,
+        skills=_parse_skills(raw_config.get("skills")),
     )
 
 
@@ -217,11 +222,14 @@ def split_model_ref(value: str) -> tuple[str, str]:
 
 
 def _merge_config(target: dict[str, Any], override: dict[str, Any]) -> None:
-    unknown = set(override) - {"default_model", "providers"}
+    unknown = set(override) - {"default_model", "providers", "skills"}
     if unknown:
         raise ValueError(f"unknown config fields: {', '.join(sorted(unknown))}")
     if "default_model" in override:
         target["default_model"] = override["default_model"]
+    if "skills" in override:
+        _parse_skills(override["skills"])
+        target["skills"].update(override["skills"])
     raw_providers = override.get("providers", {})
     if not isinstance(raw_providers, dict):
         raise ValueError("providers must be a JSON object")
@@ -260,6 +268,20 @@ def _merge_config(target: dict[str, Any], override: dict[str, Any]) -> None:
                         f"model {provider_id}/{model_id} must be a JSON object"
                     )
                 model_target.setdefault(model_id, {}).update(raw_model)
+
+
+def _parse_skills(raw: Any) -> SkillSettings:
+    if not isinstance(raw, dict) or set(raw) - {"discover_parents", "discover_personal", "paths"}:
+        raise ValueError("skills must contain only discover_parents, discover_personal and paths")
+    for key in ("discover_parents", "discover_personal"):
+        if key in raw and not isinstance(raw[key], bool):
+            raise ValueError(f"skills.{key} must be a boolean")
+    paths = raw.get("paths", [])
+    if not isinstance(paths, list) or len(paths) > 32 or any(
+        not isinstance(path, str) or not path.strip() or not Path(path).expanduser().is_absolute() for path in paths
+    ):
+        raise ValueError("skills.paths must contain at most 32 absolute or ~ paths")
+    return SkillSettings(raw.get("discover_parents", True), raw.get("discover_personal", True), tuple(paths))
 
 
 def _parse_providers(raw: Any) -> dict[str, ProviderSettings]:

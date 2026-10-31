@@ -22,6 +22,8 @@ class ContextBreakdown:
     conversation_tokens: int
     protocol_tokens: int
     project_rules_tokens: int = 0
+    skill_catalog_tokens: int = 0
+    skill_body_tokens: int = 0
 
     @property
     def total_tokens(self) -> int:
@@ -32,6 +34,8 @@ class ContextBreakdown:
             + self.conversation_tokens
             + self.protocol_tokens
             + self.project_rules_tokens
+            + self.skill_catalog_tokens
+            + self.skill_body_tokens
         )
 
     def to_dict(self) -> dict[str, int]:
@@ -42,6 +46,8 @@ class ContextBreakdown:
             "conversation_tokens": self.conversation_tokens,
             "protocol_tokens": self.protocol_tokens,
             "project_rules_tokens": self.project_rules_tokens,
+            "skill_catalog_tokens": self.skill_catalog_tokens,
+            "skill_body_tokens": self.skill_body_tokens,
             "total_tokens": self.total_tokens,
         }
 
@@ -59,6 +65,7 @@ class ContextSnapshot:
     breakdown: ContextBreakdown
     compacted_messages: int = 0
     project_rules: dict[str, Any] | None = None
+    skills: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -71,6 +78,7 @@ class ContextSnapshot:
             "compacted_messages": self.compacted_messages,
             "breakdown": self.breakdown.to_dict(),
             "project_rules": self.project_rules,
+            "skills": self.skills,
         }
 
 
@@ -123,6 +131,8 @@ class ContextManager:
             raise ContextWindowError(
                 f"{snapshot.project_rules['error']}. Fix the file, then abandon this turn and start a new one."
             )
+        if snapshot.skills and snapshot.skills.get("error"):
+            raise ContextWindowError(f"{snapshot.skills['error']}. Abandon this turn and start a new one after fixing the skill.")
         threshold = int(self.input_budget * self.compact_threshold)
         if snapshot.estimated_tokens <= threshold:
             return snapshot
@@ -179,6 +189,11 @@ class ContextManager:
         rules = state.current_project_rules()
         rules_prompt = rules.prompt() if rules is not None else ""
         rule_messages = [UserMessage(content=rules_prompt)] if rules_prompt else []
+        skills = state.current_skills()
+        catalog_prompt = skills.catalog_prompt() if skills else ""
+        body_prompt = skills.body_prompt() if skills else ""
+        catalog_messages = [UserMessage(content=catalog_prompt)] if catalog_prompt else []
+        body_messages = [UserMessage(content=body_prompt)] if body_prompt else []
         effective_prompt = _with_summary(system_prompt, state.context_summary)
         breakdown = estimate_request_breakdown(
             system_prompt=system_prompt,
@@ -186,9 +201,11 @@ class ContextManager:
             messages=active_messages,
             tools=tools,
             project_rules_messages=rule_messages,
+            skill_catalog_messages=catalog_messages,
+            skill_body_messages=body_messages,
         )
         return ContextSnapshot(
-            messages=rule_messages + active_messages,
+            messages=rule_messages + catalog_messages + body_messages + active_messages,
             system_prompt=effective_prompt,
             estimated_tokens=breakdown.total_tokens,
             context_window_tokens=self.context_window_tokens,
@@ -199,6 +216,7 @@ class ContextManager:
             breakdown=breakdown,
             compacted_messages=compacted_messages,
             project_rules=rules.manifest() if rules is not None else None,
+            skills=skills.manifest() if skills is not None else None,
         )
 
     def _ensure_fits(self, snapshot: ContextSnapshot) -> None:
@@ -229,6 +247,8 @@ def estimate_request_breakdown(
     messages: list[Message],
     tools: list[ToolSpec],
     project_rules_messages: list[UserMessage] | None = None,
+    skill_catalog_messages: list[UserMessage] | None = None,
+    skill_body_messages: list[UserMessage] | None = None,
 ) -> ContextBreakdown:
     tool_payload = [
         {
@@ -263,6 +283,8 @@ def estimate_request_breakdown(
             estimate_text_tokens(_message_payload(message))
             for message in project_rules_messages or []
         ),
+        skill_catalog_tokens=sum(estimate_text_tokens(_message_payload(message)) for message in skill_catalog_messages or []),
+        skill_body_tokens=sum(estimate_text_tokens(_message_payload(message)) for message in skill_body_messages or []),
     )
 
 

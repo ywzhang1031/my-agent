@@ -6,6 +6,7 @@ from typing import Any, ClassVar, Mapping, TypeAlias
 from uuid import uuid4
 
 from .control import ApprovalDecision
+from .skills import validate_skill_names
 
 
 PROTOCOL_VERSION = 2
@@ -85,6 +86,7 @@ class RenameSessionCommand(AgentCommand):
 @dataclass(frozen=True, kw_only=True)
 class StartTurnCommand(AgentCommand):
     user_input: str = ""
+    skills: tuple[str, ...] = ()
     retry: bool = False
     approved_plan_id: str | None = None
     recovery_confirmed: bool = False
@@ -198,6 +200,7 @@ class SessionRenamedEvent(AgentEvent):
 class TurnStartedEvent(AgentEvent):
     task: str
     project_rules: dict[str, Any] = field(default_factory=dict)
+    skills: dict[str, Any] | None = None
     event_type: ClassVar[EventType] = EventType.TURN_STARTED
 
 
@@ -504,6 +507,8 @@ def command_from_dict(data: Mapping[str, Any]) -> AgentCommandType:
     payload = _payload(data)
     if command_type is ResolveApprovalCommand:
         payload["decision"] = ApprovalDecision(payload["decision"])
+    if command_type is StartTurnCommand:
+        payload["skills"] = validate_skill_names(payload.get("skills", []))
     return command_type(
         session_id=str(data["session_id"]),
         command_id=str(data["command_id"]),

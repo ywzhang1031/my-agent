@@ -649,6 +649,11 @@ textarea:disabled {
 .skills-view small, .skills-summary { color: var(--muted); }
 .skills-diagnostic.error { color: var(--danger); }
 .skills-diagnostic.warning { color: var(--warning); }
+.skill-choice { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.skill-choice input { flex: 0 0 16px; width: 16px; height: 16px; margin: 0; }
+.loaded-skills { margin-top: 12px; border-top: 1px solid var(--border); padding-top: 10px; font-size: 12px; overflow-wrap: anywhere; }
+.loaded-skills p { margin: 6px 0; white-space: pre-wrap; color: var(--muted); }
+.loaded-skills details { margin-top: 8px; }
 
 .verification-section {
   padding: 14px;

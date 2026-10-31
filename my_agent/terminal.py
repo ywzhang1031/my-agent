@@ -296,6 +296,8 @@ def render_context_usage(
         ("System prompt", breakdown.system_prompt_tokens, "90"),
         ("Tool definitions", breakdown.tool_definition_tokens, "35"),
         ("Project rules", breakdown.project_rules_tokens, "32"),
+        ("Skill catalog", breakdown.skill_catalog_tokens, "35"),
+        ("Loaded skills", breakdown.skill_body_tokens, "36"),
         ("Conversation summary", breakdown.summary_tokens, "36"),
         ("Conversation", breakdown.conversation_tokens, "33"),
         ("Protocol overhead", breakdown.protocol_tokens, "34"),

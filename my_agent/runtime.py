@@ -38,6 +38,7 @@ class RuntimeState(str, Enum):
 @dataclass(frozen=True)
 class StartTurn:
     user_input: str = ""
+    skills: tuple[str, ...] = ()
     retry: bool = False
     approved_plan_id: str | None = None
     recovery_confirmed: bool = False
@@ -332,6 +333,7 @@ class AgentRuntime:
                     cancel_event=cancel_event,
                     approvals=self._approvals,
                     approved_plan_id=command.approved_plan_id,
+                    skills=command.skills,
                 )
         except TurnInterrupted as exc:
             terminal_kind = "turn_interrupted"

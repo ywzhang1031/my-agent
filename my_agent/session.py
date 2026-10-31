@@ -13,6 +13,7 @@ from .attempt_store import AttemptStore
 from .goals import GoalState, goal_from_dict
 from .messages import AssistantMessage, Message, ToolCall, ToolResultMessage, UserMessage
 from .rules import ProjectRules, rules_from_dict
+from .skills import TurnSkills, skills_from_dict
 from .modes import BUILD_MODE
 from .permissions import DEFAULT_PERMISSION_PROFILE_ID, get_permission_profile
 from .sandbox import DEFAULT_SANDBOX_MODE, SANDBOX_MODES
@@ -76,6 +77,12 @@ class SessionState:
         for message in reversed(self.messages):
             if isinstance(message, UserMessage):
                 return message.project_rules
+        return None
+
+    def current_skills(self) -> TurnSkills | None:
+        for message in reversed(self.messages):
+            if isinstance(message, UserMessage):
+                return message.skills
         return None
 
     @property
@@ -274,6 +281,8 @@ def message_to_dict(message: Message) -> dict[str, Any]:
         payload = {"role": "user", "content": message.content}
         if message.project_rules is not None:
             payload["project_rules"] = message.project_rules.to_dict()
+        if message.skills is not None:
+            payload["skills"] = message.skills.to_dict()
         return payload
     if isinstance(message, AssistantMessage):
         return {
@@ -299,6 +308,7 @@ def message_from_dict(data: dict[str, Any]) -> Message:
         return UserMessage(
             content=data.get("content", ""),
             project_rules=rules_from_dict(data.get("project_rules")),
+            skills=skills_from_dict(data.get("skills")),
         )
     if role == "assistant":
         return AssistantMessage(

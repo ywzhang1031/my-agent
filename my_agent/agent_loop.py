@@ -34,6 +34,7 @@ from .sandbox import DEFAULT_SANDBOX_MODE, SandboxPolicy
 from .tools import ToolContext, ToolRegistry, ToolResult
 from .trace import TraceRecorder
 from .rules import load_project_rules
+from .skills import SkillSettings, TurnSkills, discover_skills, validate_skill_names
 from .workspace import Workspace
 
 
@@ -69,6 +70,7 @@ class AgentLoop:
         mode: CollaborationMode = BUILD_MODE,
         context_manager: ContextManager | None = None,
         sandbox_policy: SandboxPolicy | None = None,
+        skill_settings: SkillSettings | None = None,
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be at least 1")
@@ -79,6 +81,7 @@ class AgentLoop:
         self.trace = trace
         self.max_steps = max_steps
         self.mode = mode
+        self.skill_settings = skill_settings or SkillSettings()
         self.sandbox_policy = sandbox_policy or SandboxPolicy(
             mode=DEFAULT_SANDBOX_MODE,
             workspace=workspace.root,
@@ -106,6 +109,7 @@ class AgentLoop:
         cancel_event: threading.Event | None = None,
         approvals: ApprovalBroker | None = None,
         approved_plan_id: str | None = None,
+        skills: tuple[str, ...] = (),
     ) -> TurnResult:
         if state.workspace != str(self.workspace.root):
             raise ValueError(
@@ -120,11 +124,22 @@ class AgentLoop:
                 raise ValueError("approved plans can only execute in build mode")
             if plan is None or plan.plan_id != approved_plan_id or plan.status != "approved":
                 raise ValueError(f"approved plan is not ready to execute: {approved_plan_id}")
+        selected_skills = validate_skill_names(skills)
         turn_number = max(state.turn_counter, sum(isinstance(message, UserMessage) for message in state.messages)) + 1
         state.turn_counter = turn_number
         message_start = len(state.messages)
         rules = load_project_rules(self.workspace.root)
-        state.messages.append(UserMessage(content=user_input, project_rules=rules))
+        turn_skills = None
+        if "load_skill" in self.tools.names():
+            turn_skills = TurnSkills(discover_skills(self.workspace.root, self.skill_settings))
+            try:
+                for name in selected_skills:
+                    turn_skills.load(name, "manual")
+            except ValueError as exc:
+                turn_skills.error = str(exc)
+        elif selected_skills:
+            raise ValueError("This runtime does not support skill loading")
+        state.messages.append(UserMessage(content=user_input, project_rules=rules, skills=turn_skills))
         state.pending_turn = PendingTurn(
             turn_id=f"{state.session_id}:{turn_number}",
             task=user_input,
@@ -148,13 +163,15 @@ class AgentLoop:
                 "mode_id": self.mode.mode_id,
                 "approved_plan_id": approved_plan_id,
                 "project_rules": rules.manifest(),
+                "skills": turn_skills.manifest() if turn_skills else None,
             },
         )
         self._emit(
             event_handler,
             AgentEvent(
                 kind="turn_started",
-                data={**event_context, "task": user_input, "project_rules": rules.manifest()},
+                data={**event_context, "task": user_input, "project_rules": rules.manifest(),
+                      "skills": turn_skills.manifest() if turn_skills else None},
             ),
         )
 
@@ -307,6 +324,7 @@ class AgentLoop:
             cancel_event=cancel_event,
             sandbox_policy=self.sandbox_policy,
             goal_updater=lambda arguments: self._update_goal(state, arguments),
+            skill_loader=lambda name: self._load_skill(state, name),
         )
         event_context = {
             "session_id": state.session_id,
@@ -682,6 +700,18 @@ class AgentLoop:
             stopped_by="continuation_required",
             mode_id=self.mode.mode_id,
         )
+
+    def _load_skill(self, state: SessionState, name: str) -> dict[str, Any]:
+        skills = state.current_skills()
+        if skills is None:
+            raise ValueError("This turn has no skill catalog; start a new turn")
+        previous = len(skills.loaded)
+        loaded = skills.load(name, "model")
+        snapshot = self.inspect_context(state)
+        if snapshot.estimated_tokens > snapshot.input_budget:
+            del skills.loaded[previous:]
+            raise ValueError("Skill would exceed the current context budget; reduce context or choose a smaller skill")
+        return loaded.manifest()
 
     @staticmethod
     def _recover_observations(state: SessionState) -> None:

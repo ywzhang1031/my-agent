@@ -64,6 +64,7 @@ class ToolContext:
     cancel_event: threading.Event | None = None
     sandbox_policy: SandboxPolicy | None = None
     goal_updater: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+    skill_loader: Callable[[str], dict[str, Any]] | None = None
 
 
 class BaseTool(Protocol):
@@ -132,6 +133,26 @@ class ToolRegistry:
         if tool is None:
             return None
         return tool.permission_request(call.arguments, ctx)
+
+
+class LoadSkillTool(ToolBase):
+    name = "load_skill"
+    description = "Load relevant skill instructions by name from this turn's available skill catalog. This does not execute scripts or grant permissions."
+    parameters = {"type": "object", "properties": {"name": {"type": "string"}},
+                  "required": ["name"], "additionalProperties": False}
+    required = ["name"]
+
+    def run(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        if set(arguments) != {"name"} or not isinstance(arguments.get("name"), str):
+            return ToolResult(ok=False, stderr="load_skill requires only a string name")
+        if ctx.skill_loader is None:
+            return ToolResult(ok=False, stderr="Skill loading is unavailable in this runtime")
+        try:
+            manifest = ctx.skill_loader(arguments["name"])
+        except ValueError as exc:
+            return ToolResult(ok=False, stderr=str(exc), metadata={"status": "skill_load_failed"})
+        return ToolResult(ok=True, stdout="Skill loaded. Its instructions are included in the current turn's skill guidance.",
+                          path=manifest["path"], metadata={"status": "skill_loaded", "skill": manifest})
 
 
 class UpdateGoalTool(ToolBase):

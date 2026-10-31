@@ -66,6 +66,7 @@ const elements = {
   rulesView: document.querySelector("#rules-view"),
   skillsView: document.querySelector("#skills-view"),
   refreshSkills: document.querySelector("#refresh-skills"),
+  loadedSkills: document.querySelector("#loaded-skills"),
   goalView: document.querySelector("#goal-view"),
   verificationView: document.querySelector("#verification-view"),
   clearGoal: document.querySelector("#clear-goal"),
@@ -88,6 +89,8 @@ const state = {
   navigationRevision: 0,
   sending: false,
   draftCreation: null,
+  skillCatalog: null,
+  selectedSkills: new Set(),
   verificationRequest: 0,
   busySessions: new Set(),
   attentionSessions: new Set(),
@@ -594,6 +597,9 @@ function updateControls() {
   elements.sessionTitle.disabled = !enabled || state.sending;
   elements.newSession.disabled = state.sending;
   elements.promptInput.disabled = !enabled || busy || pending;
+  for (const checkbox of elements.skillsView.querySelectorAll('input[type="checkbox"]')) {
+    checkbox.disabled = !enabled || busy || pending || checkbox.dataset.manual === "false";
+  }
   elements.sendPrompt.disabled = !enabled || busy || pending;
   elements.stopTurn.hidden = !sessionID || !state.busySessions.has(sessionID);
   elements.modelMenuTrigger.disabled = !enabled || busy || pending;
@@ -1083,6 +1089,7 @@ function renderActivities() {
 
 function renderContext(context) {
   renderProjectRules(context.project_rules);
+  renderLoadedSkills(context.skills);
   const total = Number(context.context_window_tokens || 0);
   const used = Number(context.estimated_tokens || 0);
   const percent = total > 0 ? Math.min(100, (used / total) * 100) : 0;
@@ -1095,6 +1102,8 @@ function renderContext(context) {
     ["System prompt", breakdown.system_prompt_tokens, "#70787c"],
     ["Tool definitions", breakdown.tool_definition_tokens, "#286f9e"],
     ["Project rules", breakdown.project_rules_tokens, "#7556a8"],
+    ["Skill catalog", breakdown.skill_catalog_tokens, "#336e87"],
+    ["Loaded skills", breakdown.skill_body_tokens, "#986a14"],
     ["Conversation summary", breakdown.summary_tokens, "#9a6500"],
     ["Conversation", breakdown.conversation_tokens, "#168153"],
     ["Protocol overhead", breakdown.protocol_tokens, "#a63c3c"],
@@ -1138,24 +1147,47 @@ function renderProjectRules(rules) {
 }
 
 function renderSkills(catalog) {
+  state.skillCatalog = catalog;
   const fragment = document.createDocumentFragment();
   const summary = document.createElement("p");
   summary.className = "skills-summary";
   const skills = catalog.skills || [];
   summary.textContent = catalog.status === "error" ? "目录读取失败" :
-    catalog.status === "missing" ? "未找到 .agents/skills" : `${skills.length} 项 · 未启用`;
+    catalog.status === "missing" ? "未发现 Skill" : `${skills.length} 项可用 · 下轮已选 ${state.selectedSkills.size} 项`;
   fragment.append(summary);
   const list = document.createElement("ul");
   for (const skill of skills) {
     const item = document.createElement("li");
     const name = document.createElement("strong");
     name.textContent = skill.name;
+    const label = document.createElement("label");
+    label.className = "skill-choice";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.dataset.manual = String(skill.user_invocable);
+    checkbox.value = skill.name;
+    checkbox.checked = state.selectedSkills.has(skill.name);
+    checkbox.setAttribute("aria-label", `下轮使用 ${skill.name}`);
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked && state.selectedSkills.size >= 8) {
+        checkbox.checked = false;
+        showToast("每轮最多选择 8 个 Skill");
+        return;
+      }
+      if (checkbox.checked) state.selectedSkills.add(skill.name);
+      else state.selectedSkills.delete(skill.name);
+      summary.textContent = `${skills.length} 项可用 · 下轮已选 ${state.selectedSkills.size} 项`;
+    });
+    label.append(checkbox, name);
     const description = document.createElement("p");
     description.textContent = skill.description;
     const source = document.createElement("small");
     source.textContent = skill.path;
     source.title = `Frontmatter SHA-256: ${skill.frontmatter_sha256}`;
-    item.append(name, description, source);
+    if (!skill.automatic || !skill.user_invocable) {
+      name.textContent += !skill.automatic && !skill.user_invocable ? " · 不可调用" : !skill.automatic ? " · 仅手动" : " · 仅自动";
+    }
+    item.append(label, description, source);
     list.append(item);
   }
   fragment.append(list);
@@ -1166,6 +1198,36 @@ function renderSkills(catalog) {
     fragment.append(diagnostic);
   }
   elements.skillsView.replaceChildren(fragment);
+  updateControls();
+}
+
+function renderLoadedSkills(snapshot) {
+  const fragment = document.createDocumentFragment();
+  const heading = document.createElement("strong");
+  heading.textContent = "最近 Turn · 已加载";
+  fragment.append(heading);
+  const loaded = snapshot?.loaded || [];
+  if (!loaded.length) {
+    const empty = document.createElement("p");
+    empty.textContent = snapshot ? "未加载正文" : "尚无 Skill 快照";
+    fragment.append(empty);
+  }
+  for (const skill of loaded) {
+    const entry = document.createElement("details");
+    const title = document.createElement("summary");
+    title.textContent = `${skill.name} · ${skill.reason === "manual" ? "手动" : "模型选择"}`;
+    const source = document.createElement("p");
+    source.textContent = `${skill.path}\n${skill.scope} · ${skill.size_bytes} bytes\nSHA-256 ${skill.sha256}`;
+    entry.append(title, source);
+    fragment.append(entry);
+  }
+  if (snapshot?.error) {
+    const error = document.createElement("p");
+    error.className = "skills-diagnostic error";
+    error.textContent = snapshot.error;
+    fragment.append(error);
+  }
+  elements.loadedSkills.replaceChildren(fragment);
 }
 
 async function refreshSkills() {
@@ -1174,6 +1236,13 @@ async function refreshSkills() {
   elements.skillsView.setAttribute("aria-busy", "true");
   try {
     const result = await rpc("skills.list");
+    const available = new Set(result.catalog.skills.map(skill => skill.name));
+    for (const name of state.selectedSkills) {
+      if (!available.has(name)) {
+        state.selectedSkills.delete(name);
+        showToast(`Skill 已不可用，移除下轮选择：${name}`);
+      }
+    }
     renderSkills(result.catalog);
   } catch (error) {
     elements.skillsView.textContent = `Skills 目录暂不可用：${error.message}`;
@@ -1408,6 +1477,8 @@ async function selectSession(sessionID) {
     if (navigation !== state.navigationRevision) return;
     state.selectedSession = result.session;
     state.draftCreation = null;
+    state.selectedSkills.clear();
+    if (state.skillCatalog) renderSkills(state.skillCatalog);
     state.verificationRequest += 1;
     renderVerification(result.verification);
     state.currentGoal = null;
@@ -1451,6 +1522,8 @@ function createSession() {
   };
   state.draftCreation = null;
   state.currentGoal = null;
+  state.selectedSkills.clear();
+  if (state.skillCatalog) renderSkills(state.skillCatalog);
   state.permissionGrants = [];
   state.pendingApproval = null;
   state.credentialRequest = null;
@@ -1612,6 +1685,7 @@ async function startTurn(userInput) {
   let sessionID = selectedSessionID();
   if (!state.selectedSession || state.sending || state.busySessions.has(sessionID) || state.selectedSession.pending_turn_id || !userInput.trim()) return;
   const text = userInput.trim();
+  const skills = [...state.selectedSkills];
   state.sending = true;
   updateControls();
   try {
@@ -1640,7 +1714,9 @@ async function startTurn(userInput) {
     renderVerification();
     updateControls();
     renderSessionList();
-    await rpc("turn.start", { session_id: sessionID, user_input: text });
+    await rpc("turn.start", { session_id: sessionID, user_input: text, skills });
+    state.selectedSkills.clear();
+    if (state.skillCatalog) renderSkills(state.skillCatalog);
   } catch (error) {
     state.busySessions.delete(sessionID);
     if (!sessionID && error.code === "invalid_params") state.draftCreation = null;

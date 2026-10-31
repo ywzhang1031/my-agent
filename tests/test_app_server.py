@@ -255,7 +255,7 @@ class AppServerTests(unittest.TestCase):
         response = self.rpc("skills.list")
         self.assertTrue(response.ok, response.error)
         self.assertEqual(response.result["catalog"]["skills"][0]["description"], "Review tests")
-        self.assertFalse(response.result["catalog"]["model_visible"])
+        self.assertNotIn("loaded", response.result["catalog"])
         path.write_text("---\nname: test-review\ndescription: Updated\n---\n")
         self.assertEqual(self.rpc("skills.list").result["catalog"]["skills"][0]["description"], "Updated")
         self.assertEqual(self.store.list_sessions(), [])

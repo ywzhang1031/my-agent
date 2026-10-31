@@ -78,6 +78,7 @@ from .tools import (
     ExecCommandTool,
     GitDiffTool,
     ListFilesTool,
+    LoadSkillTool,
     ReadFileTool,
     SearchTool,
     ToolRegistry,
@@ -95,7 +96,7 @@ SLASH_COMMANDS = (
     SlashCommand("/summary", "Show current session state"),
     SlashCommand("/context", "Show detailed context usage"),
     SlashCommand("/rules", "Show the latest turn's frozen project rules"),
-    SlashCommand("/skills", "List project skill metadata and validation issues"),
+    SlashCommand("/skills", "Choose skills for the next turn; list sources and validation issues"),
     SlashCommand("/verification", "Show committed changes and validation evidence"),
     SlashCommand("/model", "Choose the model"),
     SlashCommand("/mode", "Choose Build or Plan mode"),
@@ -430,6 +431,7 @@ def _build_app_server(args: argparse.Namespace) -> AppServer:
             ),
             modes=COLLABORATION_MODES,
             credentials_path=args.runtime_config.credentials_path,
+            skill_settings=args.runtime_config.skills,
             credential_setter=lambda provider_id, api_key: _store_provider_credential(
                 args,
                 provider_id,
@@ -489,6 +491,7 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
 
     history_path = store.root.parent / "history"
     toolbar = []
+    selected_skills: tuple[str, ...] = ()
 
     def current_toolbar():
         return toolbar
@@ -527,6 +530,7 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                     _export_session_artifacts(state)
                     return 0
                 if user_input == "/new":
+                    selected_skills = ()
                     service.close()
                     state = store.create(state.workspace)
                     workspace = Workspace(state.workspace)
@@ -852,8 +856,38 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                 if user_input == "/rules":
                     _print_project_rules(service.inspect_context(state.session_id))
                     continue
-                if user_input == "/skills":
-                    _print_skill_catalog(discover_skills(workspace.root))
+                if user_input == "/skills" or user_input.startswith("/skills "):
+                    catalog = discover_skills(workspace.root, args.runtime_config.skills)
+                    _print_skill_catalog(catalog)
+                    current_skills = service.inspect_context(state.session_id).skills or {}
+                    for loaded in current_skills.get("loaded", []):
+                        print(f"Loaded this turn: {loaded['name']} ({loaded['reason']}) | {loaded['path']}")
+                        print(f"  SHA-256: {loaded['sha256']}")
+                    if state.pending_turn is not None:
+                        print("pending turn uses frozen skills; retry or abort before changing selection")
+                        continue
+                    selection = user_input.removeprefix("/skills").strip()
+                    if not selection and editor.supports_interactive_selection:
+                        selection = editor.select("skills> ", [SelectionOption("--clear", "Clear next-turn skill selection")] + [
+                            SelectionOption(skill.name, f"{'[selected] ' if skill.name in selected_skills else ''}{' '.join(skill.description.split())}")
+                            for skill in catalog.skills if skill.user_invocable
+                        ])
+                    if selection == "--clear":
+                        selected_skills = ()
+                    elif selection in selected_skills:
+                        selected_skills = tuple(name for name in selected_skills if name != selection)
+                    elif selection:
+                        if selection not in {skill.name for skill in catalog.skills}:
+                            print(f"unknown skill: {selection}")
+                            continue
+                        if not next(skill for skill in catalog.skills if skill.name == selection).user_invocable:
+                            print("skill does not allow manual invocation")
+                            continue
+                        if len(selected_skills) >= 8:
+                            print("at most 8 skills can be selected")
+                            continue
+                        selected_skills += (selection,)
+                    print(f"Next turn skills: {', '.join(selected_skills) or '(automatic selection only)'}")
                     continue
                 if user_input == "/context":
                     snapshot = service.inspect_context(state.session_id)
@@ -938,8 +972,9 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                     print("pending turn exists; use /retry or /abort before sending a new message")
                     continue
                 terminal_event = _run_chat_turn(
-                    args, store, state, service, editor, user_input=user_input
+                    args, store, state, service, editor, user_input=user_input, skills=selected_skills
                 )
+                selected_skills = ()
                 terminal_event = _offer_continuation_action(
                     args, store, state, service, editor, terminal_event
                 )
@@ -1078,6 +1113,7 @@ def _run_chat_turn(
     user_input: str | None = None,
     retry: bool = False,
     recovery_confirmed: bool = False,
+    skills: tuple[str, ...] = (),
 ) -> TerminalEvent:
     mode = get_mode(service.session_view(state.session_id).mode_id)
     renderer = StreamRenderer(
@@ -1091,6 +1127,7 @@ def _run_chat_turn(
                 user_input=user_input or "",
                 retry=retry,
                 recovery_confirmed=recovery_confirmed,
+                skills=skills,
             )
         )
         terminal_event = _consume_service_events(
@@ -1264,6 +1301,7 @@ def _build_runtime(
         max_steps=args.max_steps,
         mode=mode,
         sandbox_policy=SandboxPolicy(mode=args.sandbox, workspace=workspace.root),
+        skill_settings=args.runtime_config.skills,
     )
     return loop, registry
 
@@ -1481,7 +1519,7 @@ def _print_verification(evidence: dict, *, file=None) -> None:
 
 
 def _print_skill_catalog(catalog: SkillCatalog, *, file=None) -> None:
-    print(f"Skills: {len(catalog.skills)} discovered | {catalog.status} | metadata only, not activated", file=file)
+    print(f"Skills: {len(catalog.skills)} discovered | {catalog.status} | metadata only", file=file)
     for skill in catalog.skills:
         print(f"  {skill.name}: {' '.join(skill.description.split())}", file=file)
         print(f"    {skill.path}", file=file)
@@ -1543,6 +1581,7 @@ def build_tool_registry(mode: CollaborationMode = BUILD_MODE) -> ToolRegistry:
             ApplyPatchTool(),
             GitDiffTool(),
             ListFilesTool(),
+            LoadSkillTool(),
             ReadFileTool(),
             SearchTool(),
             ExecCommandTool(),

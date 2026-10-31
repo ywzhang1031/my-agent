@@ -337,7 +337,7 @@ REPL 支持这些本地命令：
 - `/tools`：列出可用工具
 - `/context`：查看估算的 context 使用量和 compaction 状态
 - `/rules`：查看最近 turn 使用的项目规则快照来源、状态与 SHA-256
-- `/skills`：重新扫描项目 Skill 目录，列出元数据与校验诊断，不启用 Skill
+- `/skills`：查看目录、来源和最近 turn 的加载记录，上下选择后 Enter 切换下一轮的手动选择；`/skills <name>` 同样可选，`/skills --clear` 清空
 - `/verification`：查看本轮已提交的修改与验证证据，不等于任务验收
 - `/goal`：查看当前结构化 Goal；idle 且没有 pending turn 时可以清除
 - `/model`：打开模型选择器，用上下方向键选择、`Enter` 切换、`Esc` 取消
@@ -368,7 +368,8 @@ permission profile、context 百分比、估算用量和 pending
 `/context` 会展开当前 request 的分类账单：`System prompt`、`Tool definitions`、
 `Project rules`、`Conversation summary`、`Conversation` 和 `Protocol overhead`。它还会显示完整 context limit、
 输入预算、输出预留、最近一次 provider input usage，以及 active/summarized message 数量。没有
-注入 request 的 Skills、MCP 或 subagent 不会为了界面效果显示成虚构分类；未加载规则时 `Project rules` 为零。
+注入 request 的 MCP 或 subagent 不会为了界面效果显示成虚构分类；未加载规则时 `Project rules` 为零。
+`Skill catalog` 和 `Loaded skills` 分别统计实际发送的目录描述与正文指导，未加载时为零，不重复计入 Conversation。
 当前 Goal 会以结构化 JSON 追加到 system instructions，因此计入 `System prompt`，不会另造一个
 无法与实际请求对齐的 token 类别。
 
@@ -396,16 +397,37 @@ ContextManager 将当前快照渲染为独立的 user-role 项目指导，放在
 Web 右侧显示最近 turn 的来源、作用范围、状态及完整 SHA-256；CLI 使用 `/rules` 和 `/context`。
 `turn.started` 事件与 trajectory 携带来源清单，`model_request.context` 携带实际规则版本和预算，
 事件不重复携带正文。回归测试运行 `.venv/bin/python -m unittest discover -s tests -p test_rules.py`。
-本阶段不提供 Skills 加载、远程规则、自动脚本执行或规则热替换。
+项目规则不承担 Skill 选择或加载；远程规则、自动脚本执行和规则热替换仍未实现。
 
-### Skill 目录
+### Skills：发现、选择与加载
 
-第二阶段只提供发现与元数据校验，尚未将 Skill 目录或正文加入模型上下文。
-CLI `/skills` 和 Web inspector 的 Skills 目录使用同一个 `discover_skills()`，Web 通过只读
-`skills.list` RPC 获取；不需要先创建会话。页面初始化和手动刷新读取最新文件，不持久化目录、
-不消耗模型 token，不改动 turn、规则快照、工具列表或权限。下一阶段才接入手动选择和模型按需加载。
+Skills 是按需加载的任务指导，不是新的 mode、agent loop 或执行权限。provider 不需要知道
+Skill 是什么，只接收 harness 组装好的普通消息和 `load_skill` 工具定义。
 
-扫描位置固定为 `<workspace>/.agents/skills/<name>/SKILL.md`，不搜索父目录、个人目录或其他产品目录。
+CLI `/skills` 和 Web inspector 共用 `discover_skills()`；Web 的只读 `skills.list` 不需要已有会话。
+目录刷新只读元数据；真正的新 turn 才冻结目录并将允许自动选择的名称、描述加入模型上下文。
+默认发现范围按优先级排列，同名项保留首项，其余项明确显示被哪个绝对路径覆盖：
+
+1. workspace 及其父级，从近到远，读取 `.agents/skills`、`.claude/skills`、`.codex/skills`、
+   `.opencode/skills`、`.cursor/skills`，按此顺序；父级扫描在 home 或文件系统根目录之前停止。
+2. 配置 `skills.paths` 中明确指定的额外 Skill 根目录，按配置顺序。
+3. home 下的上述目录，以及 `$CODEX_HOME/skills`、其 `.system` 子目录和
+   `$XDG_CONFIG_HOME/opencode/skills`；环境变量未设置时使用 `~/.codex` 和 `~/.config`。
+
+每个根目录只扫描直接的 `<name>/SKILL.md`，不递归整盘、不进入其他项目，不默认加入插件缓存或
+历史版本。命名空间/插件集合需要配置到实际的 skills 根目录；缺失 `SKILL.md` 会显示诊断。
+这不是“整台电脑所有 Skill 均兼容”的承诺。相同路径会去重，个人文件不会被复制到项目或修改。
+
+发现配置位于现有 `config.json`，示例见 `docs/config.example.json`：
+
+```json
+{"skills": {"discover_parents": true, "discover_personal": true, "paths": []}}
+```
+
+`paths` 最多 32 项，只接受绝对路径或 `~` 路径。修改配置后重启；开关影响新 turn 的发现，不是
+撤销旧快照的权限机制。嵌入式 `AgentLoop`/`AppServer` 默认隔离共享目录，CLI 启动时显式传入上述配置，
+所以离线测试不依赖或读取开发者的个人 Skills。AGENTS.md 仍然只读 workspace 根文件，不随 Skills 扩大范围。
+
 最小格式沿用 [Agent Skills 的 YAML frontmatter](https://agentskills.io/specification)：
 
 ```markdown
@@ -419,20 +441,53 @@ Read the changed tests and compare their assertions with the intended behavior.
 当前支持的命名子集是 1-64 个 ASCII 小写字母、数字和单个连字符，且必须与目录名一致。
 `description` 必须是 1-1024 字符的非空字符串，支持 YAML 折叠/多行描述，拒绝终端控制字符。
 采用固定版本 `PyYAML==6.0.3` 的 SafeLoader，额外拒绝重复键、anchor/alias 与过深/过复杂结构。
-只解释 `name` 和 `description`；其他字段会产生忽略提示，`allowed-tools` 不会授予执行权限。
+另外尊重布尔字段 `disable-model-invocation` 和 `user-invocable`：前者为 true 时不向模型列出目录项，
+也拒绝模型加载；后者为 false 时禁止手动选择。它们参考 [Claude 的调用控制](https://code.claude.com/docs/en/skills)。
+其他字段提示忽略，`allowed-tools` 不授予权限，`context: fork` 不创建 subagent。动态命令、参数替换、
+hooks、引用资源和脚本执行均未实现；跨产品目录兼容不代表完整运行时兼容。
 
 扫描使用 macOS/Linux 目录句柄逐层打开路径，拒绝任意层级的符号链接和非普通 `SKILL.md` 文件。
-frontmatter 包括分隔符最多 8 KiB，目录最多 128 个直接条目；数量超限时明确拒绝返回任意截取的目录。
+frontmatter 含分隔符最多 8 KiB，每个目录最多 128 个直接条目，合并后最多 128 个有效唯一名称；
+数量超限明确报错，不静默截取。隐藏目录不递归，Codex 的 `.system` 是显式添加的独立来源。
 普通非目录条目不作为 Skill；单个 Skill 失败只排除该项并返回路径和诊断，不阻塞聊天或其他有效项。
 YAML 最多 16 层、1024 个解析事件；解析器异常不回显原始文件内容。
 
-目录只包含名称、描述、相对来源路径和 `frontmatter_sha256`，不返回正文或读取关联脚本。
-该哈希只标识原始 frontmatter（含分隔符）版本，不代表完整 Skill 版本或安全认证。
-正文编码、引用资源和工作流质量尚未验证；发现条目不等于 Skill 已启用或脚本已获授权。
-Web 使用纯文本节点显示文件内容，长路径折行，目录独立滚动；RPC 失败不影响聊天初始化。
+目录保留绝对来源路径、来源作用域及 `frontmatter_sha256`，不是正文哈希或安全认证。
+首次加载才验证完整文件为 UTF-8、正文非空、整体不超过 64 KiB，并记录整个文件的 SHA-256、大小及
+`manual`/`model` 选择原因。每个 turn 最多加载 8 项；工具加载超过当前上下文预算会失败且不保留正文。
+工作流是否适合任务、是否依赖当前产品没有的工具，不由格式校验保证。
 
-定向验证：`.venv/bin/python -m unittest discover -s tests -p test_skills.py`。
-浏览器测试使用隔离的有效/无效 Skill fixture，不读取用户个人 Skills，不调用真实模型。
+调用流程：
+
+```text
+CLI /skills 选择 / Web 勾选 -> StartTurn.skills（仅下一轮）
+  -> AgentLoop.run_turn
+  -> discover_skills -> TurnSkills.catalog（元数据快照）
+  -> 手动选择的正文先加载 -> turn.started checkpoint
+  -> ContextManager.prepare -> ModelRequest -> provider
+  -> 模型按描述调用 load_skill(name)
+  -> tool.started checkpoint -> 安全读取 -> TurnSkills.loaded
+  -> tool.finished checkpoint（保存正文与来源）
+  -> 下一次 ContextManager.prepare 加入正文 -> 模型继续工作
+```
+
+目录和已加载正文分别渲染成 user-role 指导消息，放在历史消息前，不提升成 system policy。
+工具 observation 只返回确认和来源清单，正文只在指导消息中出现一次，避免工具结果和上下文重复计算。
+`ContextManager` 分别计入 `Skill catalog` 与 `Loaded skills`，沿用估算值而非厂商精确 tokenizer。
+模型自动选择依赖描述与提示，不使用关键字硬匹配、embedding 或 RAG，不保证每次都会选择正确 Skill。
+
+目录与正文快照随当前 UserMessage 写入 SQLite；provider 只收到剥离 harness 元数据后的普通消息。
+手动加载在首个模型请求前持久化，模型加载在下一次请求前持久化；写盘失败不能继续调用模型。
+重试、续跑、显式恢复使用原目录和已加载正文，历史压缩不会替换当前正文；尚未加载的正文是在第一次加载时
+取得版本，不假装它已提前冻结。frontmatter 在 turn 中改变会拒绝新加载，要求新建 turn 刷新目录。
+下一条用户任务重新发现目录、不沿用上一 turn 的激活状态；历史快照仍保留，但旧正文不再自动发给模型。
+
+`turn.started`、工具完成事件、trace 和 `model_request.context.skills` 保留来源清单，不重复写正文。
+CLI `/skills` 和 Web“最近 Turn · 已加载”展示选择原因、来源、完整文件哈希；Web 刷新/恢复后可回看。
+手动选择只驻留当前客户端，发送成功后清空；切换会话或刷新页面不保存未发送的选择。目录 RPC 失败不阻塞聊天。
+
+定向验证：`.venv/bin/python -m unittest discover -s tests -p 'test_skill*.py'`。
+离线浏览器验收覆盖手动选择、模型工具加载、来源恢复、纯文本渲染和手机布局，不调用真实模型。
 
 ### 流式输出
 
