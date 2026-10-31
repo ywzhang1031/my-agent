@@ -64,6 +64,8 @@ const elements = {
   contextBreakdown: document.querySelector("#context-breakdown"),
   contextMeta: document.querySelector("#context-meta"),
   rulesView: document.querySelector("#rules-view"),
+  skillsView: document.querySelector("#skills-view"),
+  refreshSkills: document.querySelector("#refresh-skills"),
   goalView: document.querySelector("#goal-view"),
   verificationView: document.querySelector("#verification-view"),
   clearGoal: document.querySelector("#clear-goal"),
@@ -1133,6 +1135,52 @@ function renderProjectRules(rules) {
     rules.sha256 ? `SHA-256 ${rules.sha256}` : "",
     rules.error || "",
   ].filter(Boolean).join("\n") : "尚无规则快照";
+}
+
+function renderSkills(catalog) {
+  const fragment = document.createDocumentFragment();
+  const summary = document.createElement("p");
+  summary.className = "skills-summary";
+  const skills = catalog.skills || [];
+  summary.textContent = catalog.status === "error" ? "目录读取失败" :
+    catalog.status === "missing" ? "未找到 .agents/skills" : `${skills.length} 项 · 未启用`;
+  fragment.append(summary);
+  const list = document.createElement("ul");
+  for (const skill of skills) {
+    const item = document.createElement("li");
+    const name = document.createElement("strong");
+    name.textContent = skill.name;
+    const description = document.createElement("p");
+    description.textContent = skill.description;
+    const source = document.createElement("small");
+    source.textContent = skill.path;
+    source.title = `Frontmatter SHA-256: ${skill.frontmatter_sha256}`;
+    item.append(name, description, source);
+    list.append(item);
+  }
+  fragment.append(list);
+  for (const issue of catalog.diagnostics || []) {
+    const diagnostic = document.createElement("p");
+    diagnostic.className = `skills-diagnostic ${issue.severity === "warning" ? "warning" : "error"}`;
+    diagnostic.textContent = `${issue.path}: ${issue.message}`;
+    fragment.append(diagnostic);
+  }
+  elements.skillsView.replaceChildren(fragment);
+}
+
+async function refreshSkills() {
+  if (elements.refreshSkills.disabled) return;
+  elements.refreshSkills.disabled = true;
+  elements.skillsView.setAttribute("aria-busy", "true");
+  try {
+    const result = await rpc("skills.list");
+    renderSkills(result.catalog);
+  } catch (error) {
+    elements.skillsView.textContent = `Skills 目录暂不可用：${error.message}`;
+  } finally {
+    elements.skillsView.removeAttribute("aria-busy");
+    elements.refreshSkills.disabled = false;
+  }
 }
 
 function renderGoal() {
@@ -2235,6 +2283,7 @@ function bindUI() {
   });
   elements.clearPermissionGrants.addEventListener("click", clearPermissionGrants);
   elements.clearGoal.addEventListener("click", clearGoal);
+  elements.refreshSkills.addEventListener("click", refreshSkills);
   for (const button of elements.approvalPanel.querySelectorAll("[data-approval]")) {
     button.addEventListener("click", () => resolveApproval(button.dataset.approval));
   }
@@ -2282,6 +2331,7 @@ async function initialize() {
     setConnection("已连接", "online");
     if (state.sessions.length) await selectSession(state.sessions[0].session_id);
     else createSession();
+    await refreshSkills();
   } catch (error) {
     setConnection("初始化失败", "offline");
     showToast(`初始化失败：${error.message}`);

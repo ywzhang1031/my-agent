@@ -71,7 +71,7 @@ Git 仓库中。
 
 ## Run
 
-先安装唯一的终端 UI 依赖：
+先安装终端 UI 与 Skill frontmatter 解析依赖：
 
 ```bash
 python3 -m venv .venv
@@ -337,6 +337,7 @@ REPL 支持这些本地命令：
 - `/tools`：列出可用工具
 - `/context`：查看估算的 context 使用量和 compaction 状态
 - `/rules`：查看最近 turn 使用的项目规则快照来源、状态与 SHA-256
+- `/skills`：重新扫描项目 Skill 目录，列出元数据与校验诊断，不启用 Skill
 - `/verification`：查看本轮已提交的修改与验证证据，不等于任务验收
 - `/goal`：查看当前结构化 Goal；idle 且没有 pending turn 时可以清除
 - `/model`：打开模型选择器，用上下方向键选择、`Enter` 切换、`Esc` 取消
@@ -396,6 +397,44 @@ Web 右侧显示最近 turn 的来源、作用范围、状态及完整 SHA-256�
 `turn.started` 事件与 trajectory 携带来源清单，`model_request.context` 携带实际规则版本和预算，
 事件不重复携带正文。回归测试运行 `.venv/bin/python -m unittest discover -s tests -p test_rules.py`。
 本阶段不提供 Skills 加载、远程规则、自动脚本执行或规则热替换。
+
+### Skill 目录
+
+第二阶段只提供发现与元数据校验，尚未将 Skill 目录或正文加入模型上下文。
+CLI `/skills` 和 Web inspector 的 Skills 目录使用同一个 `discover_skills()`，Web 通过只读
+`skills.list` RPC 获取；不需要先创建会话。页面初始化和手动刷新读取最新文件，不持久化目录、
+不消耗模型 token，不改动 turn、规则快照、工具列表或权限。下一阶段才接入手动选择和模型按需加载。
+
+扫描位置固定为 `<workspace>/.agents/skills/<name>/SKILL.md`，不搜索父目录、个人目录或其他产品目录。
+最小格式沿用 [Agent Skills 的 YAML frontmatter](https://agentskills.io/specification)：
+
+```markdown
+---
+name: test-review
+description: Review changed tests for missing edge cases and assertion quality.
+---
+Read the changed tests and compare their assertions with the intended behavior.
+```
+
+当前支持的命名子集是 1-64 个 ASCII 小写字母、数字和单个连字符，且必须与目录名一致。
+`description` 必须是 1-1024 字符的非空字符串，支持 YAML 折叠/多行描述，拒绝终端控制字符。
+采用固定版本 `PyYAML==6.0.3` 的 SafeLoader，额外拒绝重复键、anchor/alias 与过深/过复杂结构。
+只解释 `name` 和 `description`；其他字段会产生忽略提示，`allowed-tools` 不会授予执行权限。
+
+扫描使用 macOS/Linux 目录句柄逐层打开路径，拒绝任意层级的符号链接和非普通 `SKILL.md` 文件。
+frontmatter 包括分隔符最多 8 KiB，目录最多 128 个直接条目；数量超限时明确拒绝返回任意截取的目录。
+普通非目录条目不作为 Skill；单个 Skill 失败只排除该项并返回路径和诊断，不阻塞聊天或其他有效项。
+YAML 最多 16 层、1024 个解析事件；解析器异常不回显原始文件内容。
+
+目录只包含名称、描述、相对来源路径和 `frontmatter_sha256`，不返回正文或读取关联脚本。
+该哈希只标识原始 frontmatter（含分隔符）版本，不代表完整 Skill 版本或安全认证。
+正文编码、引用资源和工作流质量尚未验证；发现条目不等于 Skill 已启用或脚本已获授权。
+Web 使用纯文本节点显示文件内容，长路径折行，目录独立滚动；RPC 失败不影响聊天初始化。
+
+定向验证：`.venv/bin/python -m unittest discover -s tests -p test_skills.py`。
+浏览器测试使用隔离的有效/无效 Skill fixture，不读取用户个人 Skills，不调用真实模型。
+
+### 流式输出
 
 默认启用流式输出；`--no-stream` 可以只在本轮结束时显示完整答案。thinking 默认仍会发给
 DeepSeek，但 CLI 只显示 `thinking...` 状态；使用 `--show-thinking` 才会流式打印

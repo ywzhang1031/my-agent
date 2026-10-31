@@ -246,6 +246,23 @@ class AppServerTests(unittest.TestCase):
         self.assertTrue(response.ok, response.error)
         return response.result["session"]["session_id"]
 
+    def test_skill_catalog_is_readonly_and_available_without_a_session(self):
+        self.assertEqual(self.rpc("skills.list").result["catalog"]["status"], "missing")
+        directory = self.workspace / ".agents" / "skills" / "test-review"
+        directory.mkdir(parents=True)
+        path = directory / "SKILL.md"
+        path.write_text("---\nname: test-review\ndescription: Review tests\n---\nPrivate body")
+        response = self.rpc("skills.list")
+        self.assertTrue(response.ok, response.error)
+        self.assertEqual(response.result["catalog"]["skills"][0]["description"], "Review tests")
+        self.assertFalse(response.result["catalog"]["model_visible"])
+        path.write_text("---\nname: test-review\ndescription: Updated\n---\n")
+        self.assertEqual(self.rpc("skills.list").result["catalog"]["skills"][0]["description"], "Updated")
+        self.assertEqual(self.store.list_sessions(), [])
+        self.assertEqual(self.runtimes, {})
+        self.assertFalse(self.rpc("skills.list", workspace="/tmp").ok)
+        self.assertFalse(self.rpc("skills.list", session_id="unused").ok)
+
     def test_session_create_persists_initial_title(self):
         session_id = self.create_session(title="First task")
         self.assertEqual(self.store.load(session_id).title, "First task")

@@ -37,6 +37,7 @@ from .session import SessionState, SessionStore, message_to_dict, normalize_sess
 from .verification import read_verification
 from .database import StorageError
 from .request_store import MUTATING_METHODS, RequestStore
+from .skills import discover_skills
 
 
 RuntimeFactory = Callable[
@@ -179,6 +180,7 @@ class AppServer:
             "session.close": self._close_session,
             "session.rename": self._rename_session,
             "model.list": self._list_models,
+            "skills.list": self._list_skills,
             "provider.credential.set": self._set_provider_credential,
             "mode.list": self._list_modes,
             "permission.list": self._list_permission_profiles,
@@ -211,6 +213,10 @@ class AppServer:
                 f"unknown RPC method: {request.method}",
             )
         return handler(request.params)
+
+    def _list_skills(self, params: dict[str, Any]) -> dict[str, Any]:
+        self._check_params(params)
+        return {"catalog": discover_skills(self.workspace).to_dict()}
 
     def _create_session(self, params: dict[str, Any]) -> dict[str, Any]:
         self._check_params(

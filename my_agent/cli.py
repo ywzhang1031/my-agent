@@ -62,6 +62,7 @@ from .service import AgentService
 from .goals import GoalState
 from .session import SessionState, SessionStore
 from .verification import read_verification
+from .skills import SkillCatalog, discover_skills
 from .server_instance import ServerInstanceLease
 from .terminal import (
     LineEditor,
@@ -94,6 +95,7 @@ SLASH_COMMANDS = (
     SlashCommand("/summary", "Show current session state"),
     SlashCommand("/context", "Show detailed context usage"),
     SlashCommand("/rules", "Show the latest turn's frozen project rules"),
+    SlashCommand("/skills", "List project skill metadata and validation issues"),
     SlashCommand("/verification", "Show committed changes and validation evidence"),
     SlashCommand("/model", "Choose the model"),
     SlashCommand("/mode", "Choose Build or Plan mode"),
@@ -850,6 +852,9 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                 if user_input == "/rules":
                     _print_project_rules(service.inspect_context(state.session_id))
                     continue
+                if user_input == "/skills":
+                    _print_skill_catalog(discover_skills(workspace.root))
+                    continue
                 if user_input == "/context":
                     snapshot = service.inspect_context(state.session_id)
                     print(
@@ -1473,6 +1478,15 @@ def _print_verification(evidence: dict, *, file=None) -> None:
     for attempt in evidence["unknown_attempts"]:
         print(f"  unknown: {attempt['tool_name']} ({attempt['call_id']})", file=file)
     print("  Scope: this turn's tracked patches only; external and command-side edits are not observed.", file=file)
+
+
+def _print_skill_catalog(catalog: SkillCatalog, *, file=None) -> None:
+    print(f"Skills: {len(catalog.skills)} discovered | {catalog.status} | metadata only, not activated", file=file)
+    for skill in catalog.skills:
+        print(f"  {skill.name}: {' '.join(skill.description.split())}", file=file)
+        print(f"    {skill.path}", file=file)
+    for issue in catalog.diagnostics:
+        print(f"  {issue.severity}: {issue.path!r}: {issue.message}", file=file)
 
 
 def _print_project_rules(snapshot, *, file=None) -> None:

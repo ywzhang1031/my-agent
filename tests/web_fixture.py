@@ -29,6 +29,14 @@ def main():
     with tempfile.TemporaryDirectory(prefix="my-agent-web-test-") as temporary:
         root = Path(temporary)
         (root / "AGENTS.md").write_text("Use the offline fixture. Do not call external services.\n", encoding="utf-8")
+        skills = root / ".agents" / "skills"
+        for name, metadata in (
+            ("fixture-review", "description: 'Review tests <img src=x onerror=alert(1)> and collect evidence.'"),
+            ("invalid-skill", "license: MIT"),
+        ):
+            directory = skills / name
+            directory.mkdir(parents=True)
+            (directory / "SKILL.md").write_text(f"---\nname: {name}\n{metadata}\n---\nWorkflow body not loaded.\n", encoding="utf-8")
         store = SessionStore(root / ".my-agent" / "sessions")
         service = AgentService(tool_registry_factory=build_tool_registry, save_session=store.save,
                                event_store=EventStore(store.root))

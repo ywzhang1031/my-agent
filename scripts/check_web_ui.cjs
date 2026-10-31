@@ -28,9 +28,30 @@ const { chromium } = require('playwright');
     page.on('request', request => {
       if (request.url().endsWith('/api/rpc')) requests.push(request.postDataJSON());
     });
+    let failCatalog = true;
+    await page.route('**/api/rpc', async route => {
+      if (route.request().postDataJSON().method === 'skills.list' && failCatalog) {
+        return route.fulfill({ status: 503, contentType: 'application/json', body: '{}' });
+      }
+      return route.continue();
+    });
     await page.goto(url);
     await page.waitForFunction(() => state.selectedSession && !elements.promptInput.disabled);
     assert.match(await page.locator('#rules-view').innerText(), /尚无规则快照/);
+    await page.waitForFunction(() => document.querySelector('#skills-view').textContent.includes('暂不可用'));
+    assert.equal(await page.locator('#prompt-input').isEnabled(), true);
+    assert.equal(requests.filter(r => r.method === 'session.create').length, 0);
+    failCatalog = false;
+    await page.locator('#refresh-skills').click();
+    await page.waitForFunction(() => document.querySelector('#skills-view').textContent.includes('fixture-review'));
+    assert.match(await page.locator('#skills-view').innerText(), /未启用/);
+    assert.match(await page.locator('#skills-view').innerText(), /invalid-skill/);
+    assert.match(await page.locator('#skills-view').innerText(), /description must/);
+    assert.equal(await page.locator('#skills-view img').count(), 0);
+    assert(!((await page.locator('#skills-view').innerText()).includes('Workflow body')));
+    await page.locator('#refresh-skills').click();
+    await page.waitForFunction(() => !document.querySelector('#refresh-skills').disabled);
+    assert(requests.filter(r => r.method === 'skills.list').length >= 2);
     for (let i = 0; i < 3; i++) await page.locator('#new-session').click();
     assert.equal(requests.filter(r => r.method === 'session.create').length, 0);
     assert.equal(await page.locator('.session-item').count(), 0);
@@ -100,15 +121,18 @@ const { chromium } = require('playwright');
     assert.match(await page.locator('#verification-view').innerText(), /检查后又发生修改/);
     // The lost-response test deliberately raised a toast; let it expire before screenshots.
     await page.locator('#toast').waitFor({ state: 'hidden' });
+    await page.locator('#refresh-skills').scrollIntoViewIfNeeded();
     const out = path.join(root, '.my-agent/ui-checks');
     mkdirSync(out, { recursive: true });
     await page.screenshot({ path: path.join(out, 'desktop.png') });
     await page.setViewportSize({ width: 390, height: 844 });
     await page.locator('#inspector-toggle').click();
+    await page.locator('#refresh-skills').scrollIntoViewIfNeeded();
     assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+    assert(await page.locator('#skills-view').evaluate(el => el.scrollWidth <= el.clientWidth));
     await page.screenshot({ path: path.join(out, 'mobile.png') });
     assert.deepEqual(errors, []);
-    console.log(JSON.stringify({ passed: true, realModelCalls: 0, checks: ['draft', 'double-send', 'title', 'reload', 'same-id-retry', 'verification', 'project-rules', 'mobile'], screenshots: out }));
+    console.log(JSON.stringify({ passed: true, realModelCalls: 0, checks: ['draft', 'double-send', 'title', 'reload', 'same-id-retry', 'verification', 'project-rules', 'skill-catalog', 'mobile'], screenshots: out }));
   } catch (error) {
     if (page) console.error(await page.evaluate(() => ({ session: state.selectedSession, toast: elements.toast.textContent, activities: state.activities })));
     console.error(stderr);

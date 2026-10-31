@@ -613,3 +613,15 @@ Sandbox policy 从启动参数和只读状态提升为可查询、可切换的 s
 - CLI `/rules`、Web inspector、turn.started 和 trajectory 展示来源/哈希，正文只保存在会话快照中。
 - 增加隔离测试覆盖边界、预算、重试、压缩、持久提交顺序与失败回滚；离线浏览器验证加载、刷新和窄屏。
 - Skills 自动选择与手动入口已经确认，但未在此提交中实现。
+
+## Milestone 40: Read-Only Project Skill Catalog
+
+- 新增共享 Skill 发现模块，仅扫描 workspace 的 `.agents/skills/*/SKILL.md`，返回名称、描述、
+  相对路径、frontmatter 哈希和逐项诊断；不加载正文、不注入模型上下文、不执行脚本。
+- 使用固定版本 PyYAML SafeLoader，校验必需字段、目录名和描述长度，拒绝重复键、危险标签、
+  anchor/alias、控制字符与超限结构；额外字段只提示忽略，不解释为权限。
+- 基于目录句柄逐层拒绝符号链接，限定 frontmatter 8 KiB、目录 128 项，单项错误隔离。
+- CLI `/skills` 与只读 `skills.list` RPC 共用扫描器；Web 独立目录面板可刷新，不要求已有会话，
+  不修改数据库 schema、provider、agent loop 或已有规则快照。
+- 增加 16 项发现层测试与 1 项 RPC 回归，覆盖恶意 YAML、路径替换、资源边界、元数据变更和无副作用；
+  离线浏览器验收目录、错误、纯文本渲染、刷新与手机布局。模型选择/正文加载留到第三阶段。

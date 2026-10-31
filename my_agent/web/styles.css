@@ -639,6 +639,17 @@ textarea:disabled {
 }
 .rules-view[data-status="error"] { color: var(--danger); }
 
+.skills-section { padding: 14px; border-top: 1px solid var(--border); }
+.skills-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.skills-header .icon-button { width: 28px; height: 28px; flex: 0 0 28px; }
+.skills-view { max-height: 220px; overflow: auto; overflow-wrap: anywhere; font-size: 12px; }
+.skills-view ul { list-style: none; margin: 0; padding: 0; }
+.skills-view li { padding: 10px 0; border-top: 1px solid var(--border); }
+.skills-view p { margin: 6px 0; }
+.skills-view small, .skills-summary { color: var(--muted); }
+.skills-diagnostic.error { color: var(--danger); }
+.skills-diagnostic.warning { color: var(--warning); }
+
 .verification-section {
   padding: 14px;
   border-top: 1px solid var(--border);
