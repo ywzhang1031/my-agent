@@ -1,0 +1,8 @@
+[
+  {"id":"quantity","skill":"boundary-review","task":"现有测试遗漏了哪些候选数量边界？检查每个有效区间端点的两侧，返回候选编号。","evidence":"Policy: integer quantities from 1 through 12 inclusive are accepted. Tests exercise quantities 0, 6, 13. Candidates: A=1, B=5, C=12, D=14.","gold":["A","C"]},
+  {"id":"tiers","skill":"boundary-review","task":"审查这组分档测试：每次档位改变的两侧，哪些候选输入还没有覆盖？","evidence":"Tier is low for x<10, middle for 10<=x<30, high for x>=30. Inputs are integers. Existing tests exercise 9, 15, 30. Candidates: A=8, B=10, C=29, D=31.","gold":["B","C"]},
+  {"id":"tenant","skill":"access-review","task":"审查租户鉴权逻辑。列出所有与策略不一致的请求编号，包括误放行和误拒绝。","evidence":"Policy: allow exactly when same_tenant AND (owner OR auditor). Implementation: (same_tenant AND owner) OR auditor. Requests as (same_tenant,owner,auditor): A=(0,0,1), B=(1,1,0), C=(0,1,1), D=(1,0,0). 1 means true.","gold":["A","C"]},
+  {"id":"suspend","skill":"access-review","task":"这版权限实现是否符合规格？找出所有决策错误的请求编号，不只看能否越权。","evidence":"Policy: allow exactly when NOT suspended AND (admin OR delegated). Implementation: admin OR (delegated AND active_contract). Candidates as (suspended,admin,delegated,active_contract): A=(1,1,0,0), B=(0,0,1,0), C=(0,1,0,0), D=(0,0,0,1).","gold":["A","B"]},
+  {"id":"release","skill":null,"task":"清单里当前的发布标签是什么？","evidence":"Release manifest: label=R17; previous=R16; next_candidate=R18.","gold":["R17"]},
+  {"id":"owner","skill":null,"task":"清单中负责 parser 组件的是哪个团队？返回团队代码。","evidence":"Component owners: indexer=E7, parser=Q2, renderer=N1.","gold":["Q2"]}
+]
