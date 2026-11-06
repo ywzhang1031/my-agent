@@ -20,6 +20,8 @@ from my_agent.modes import PLAN_MODE
 from my_agent.permissions import PermissionPolicy
 from my_agent.protocol import StartTurnCommand, TurnCompletedEvent, TurnFailedEvent, TurnStartedEvent, command_from_dict, command_to_dict, event_from_dict, event_to_dict
 from my_agent.provider import ModelMetadata, ModelResponse, ScriptedProviderAdapter, StopReason
+from my_agent.providers.deepseek import DeepSeekAdapter
+from my_agent.providers.openai import OpenAIAdapter
 from my_agent.runtime import AgentRuntime
 from my_agent.service import AgentService
 from my_agent.session import SessionStore
@@ -29,8 +31,8 @@ from my_agent.trace import TraceRecorder
 from my_agent.workspace import Workspace, WorkspaceError
 
 
-def response(text="Done", name=None):
-    return ModelResponse.from_parts(text=text if name is None else "", tool_calls=[] if name is None else [ToolCall("skill-1", "load_skill", {"name": name})],
+def response(text="Done", name=None, call_id="skill-1"):
+    return ModelResponse.from_parts(text=text if name is None else "", tool_calls=[] if name is None else [ToolCall(call_id, "load_skill", {"name": name})],
         stop_reason=StopReason.STOP if name is None else StopReason.TOOL_CALLS,
         metadata=ModelMetadata(provider_id="scripted", model_id="scripted-model"))
 
@@ -70,7 +72,10 @@ class SkillRuntimeTests(unittest.TestCase):
         self.assertNotIn("PRIVATE_REVIEW_WORKFLOW", provider.requests[1].system_prompt)
         self.assertTrue(all(message.skills is None for message in provider.requests[1].messages if isinstance(message, UserMessage)))
         result = next(message for message in self.state.messages if isinstance(message, ToolResultMessage))
-        self.assertNotIn("PRIVATE_REVIEW_WORKFLOW", result.content)
+        self.assertIn("PRIVATE_REVIEW_WORKFLOW", result.content)
+        self.assertTrue(json.loads(result.content)["metadata"]["body_included"])
+        self.assertTrue(all("PRIVATE_REVIEW_WORKFLOW" not in message.content
+                            for message in provider.requests[1].messages if isinstance(message, UserMessage)))
         manifest = json.loads(result.content)["metadata"]["skill"]
         self.assertEqual(manifest["reason"], "model")
         self.assertEqual(manifest["path"], str(self.path))
@@ -90,6 +95,160 @@ class SkillRuntimeTests(unittest.TestCase):
         self.assertNotIn("PRIVATE_REVIEW_WORKFLOW", content(provider.requests[1]))
         self.assertEqual(self.state.current_skills().loaded, [])
         self.assertIn("PRIVATE_REVIEW_WORKFLOW", self.state.messages[0].skills.loaded[0].body)
+
+    def test_model_body_expires_without_mutating_history_or_tool_pair(self):
+        loop, provider = self.loop([response(name="test-review"), response(), response()])
+        loop.run_turn(self.state, "Review")
+        original = next(message for message in self.state.messages if isinstance(message, ToolResultMessage))
+        original_content = original.content
+        self.assertIn("PRIVATE_REVIEW_WORKFLOW", original_content)
+        self.store.save(self.state)
+        self.state = self.store.load(self.state.session_id)
+        loop.run_turn(self.state, "A different task")
+        request = provider.requests[2]
+        self.assertNotIn("PRIVATE_REVIEW_WORKFLOW", content(request))
+        tool = next(message for message in request.messages if isinstance(message, ToolResultMessage))
+        assistant = next(message for message in request.messages if isinstance(message, AssistantMessage) and message.tool_calls)
+        self.assertEqual(tool.tool_call_id, assistant.tool_calls[0].call_id)
+        self.assertFalse(json.loads(tool.content)["metadata"]["body_included"])
+        self.assertEqual(next(message.content for message in self.state.messages if isinstance(message, ToolResultMessage)), original_content)
+        self.assertEqual(loop.inspect_context(self.state).breakdown.skill_body_tokens, 0)
+
+    def test_duplicate_model_loads_in_one_response_and_later_steps_are_deduplicated(self):
+        first = ModelResponse.from_parts(tool_calls=[
+            ToolCall("skill-1", "load_skill", {"name": "test-review"}),
+            ToolCall("skill-2", "load_skill", {"name": "test-review"}),
+        ], stop_reason=StopReason.TOOL_CALLS, metadata=ModelMetadata(provider_id="scripted", model_id="scripted-model"))
+        loop, provider = self.loop([first, response(name="test-review", call_id="skill-3"), response()])
+        def delete_after_first_load(event):
+            if event.kind == "tool_finished" and event.data["call_id"] == "skill-1":
+                self.path.unlink()
+        loop.run_turn(self.state, "Review", event_handler=delete_after_first_load)
+        for request in provider.requests[1:]:
+            self.assertEqual(content(request).count("PRIVATE_REVIEW_WORKFLOW"), 1)
+        results = [json.loads(message.content) for message in self.state.messages if isinstance(message, ToolResultMessage)]
+        self.assertTrue(all(result["ok"] for result in results))
+        self.assertEqual([result["metadata"]["body_included"] for result in results], [True, False, False])
+        self.assertEqual(len(self.state.current_skills().loaded), 1)
+
+    def test_model_request_for_manually_selected_skill_returns_ack_only(self):
+        loop, provider = self.loop([response(name="test-review"), response()])
+        loop.run_turn(self.state, "Review", skills=("test-review",))
+        for request in provider.requests:
+            self.assertEqual(content(request).count("PRIVATE_REVIEW_WORKFLOW"), 1)
+            self.assertEqual(sum("PRIVATE_REVIEW_WORKFLOW" in message.content for message in request.messages
+                                 if isinstance(message, UserMessage)), 1)
+        result = next(message for message in self.state.messages if isinstance(message, ToolResultMessage))
+        self.assertNotIn("PRIVATE_REVIEW_WORKFLOW", result.content)
+        self.assertFalse(json.loads(result.content)["metadata"]["body_included"])
+        self.assertEqual(json.loads(result.content)["metadata"]["skill"]["reason"], "manual")
+
+    def test_compaction_excludes_expired_model_body_but_retains_current_tool_body(self):
+        loop, provider = self.loop([response(name="test-review"), response(),
+                                    response(name="test-review", call_id="skill-2"), response()])
+        loop.run_turn(self.state, "Old task " * 3000)
+        self.skill(self.root, "test-review", body="CURRENT_SKILL_BODY")
+        loop.context_manager = ContextManager(context_window_tokens=5000, reserve_output_tokens=200, summary_tokens=200)
+        loop.run_turn(self.state, "New review")
+        self.assertGreater(self.state.summarized_message_count, 0)
+        self.assertNotIn("PRIVATE_REVIEW_WORKFLOW", self.state.context_summary)
+        self.assertNotIn("PRIVATE_REVIEW_WORKFLOW", content(provider.requests[-1]))
+        self.assertEqual(content(provider.requests[-1]).count("CURRENT_SKILL_BODY"), 1)
+        current = next(message for message in provider.requests[-1].messages if isinstance(message, ToolResultMessage))
+        self.assertIn("CURRENT_SKILL_BODY", current.content)
+
+    def test_mixed_selection_keeps_roles_and_counts_in_both_provider_payloads(self):
+        self.skill(self.root, "manual-review", body="MANUAL_REVIEW_WORKFLOW")
+        loop, provider = self.loop([response(name="test-review"), response()])
+        loop.run_turn(self.state, "Review", skills=("manual-review",))
+        request = provider.requests[-1]
+        self.assertEqual(content(request).count("PRIVATE_REVIEW_WORKFLOW"), 1)
+        self.assertEqual(content(request).count("MANUAL_REVIEW_WORKFLOW"), 1)
+        self.assertEqual(sum("MANUAL_REVIEW_WORKFLOW" in message.content for message in request.messages
+                             if isinstance(message, UserMessage)), 1)
+        deepseek = DeepSeekAdapter().build_payload(request)
+        openai = OpenAIAdapter().build_payload(request)
+        deepseek_result = next(message for message in deepseek["messages"] if message["role"] == "tool")
+        openai_result = next(item for item in openai["input"] if item.get("type") == "function_call_output")
+        self.assertIn("PRIVATE_REVIEW_WORKFLOW", deepseek_result["content"])
+        self.assertIn("PRIVATE_REVIEW_WORKFLOW", openai_result["output"])
+        self.assertEqual(deepseek_result["tool_call_id"], openai_result["call_id"])
+        for payload in (deepseek, openai):
+            self.assertEqual(json.dumps(payload).count("PRIVATE_REVIEW_WORKFLOW"), 1)
+            self.assertEqual(json.dumps(payload).count("MANUAL_REVIEW_WORKFLOW"), 1)
+        snapshot = loop.inspect_context(self.state)
+        self.assertEqual(snapshot.estimated_tokens, estimate_request_tokens(snapshot.system_prompt, snapshot.messages, loop.tools.specs()))
+
+    def test_same_name_can_load_a_new_snapshot_in_the_next_turn(self):
+        loop, provider = self.loop([response(name="test-review"), response(),
+                                    response(name="test-review", call_id="new-call"), response()])
+        loop.run_turn(self.state, "First review")
+        first = self.state.current_skills().loaded[0]
+        self.skill(self.root, "test-review", body="UPDATED_REVIEW_WORKFLOW")
+        loop.run_turn(self.state, "Second review")
+        second = self.state.current_skills().loaded[0]
+        self.assertNotEqual(first.sha256, second.sha256)
+        self.assertNotIn("PRIVATE_REVIEW_WORKFLOW", content(provider.requests[2]))
+        self.assertNotIn("UPDATED_REVIEW_WORKFLOW", content(provider.requests[2]))
+        self.assertNotIn("PRIVATE_REVIEW_WORKFLOW", content(provider.requests[3]))
+        self.assertEqual(content(provider.requests[3]).count("UPDATED_REVIEW_WORKFLOW"), 1)
+        self.assertEqual(self.state.messages[0].skills.loaded[0], first)
+
+    def test_tool_body_is_projected_from_durable_snapshot_not_observation_text(self):
+        loop, _ = self.loop([response(name="test-review")], max_steps=1)
+        loop.run_turn(self.state, "Review")
+        result = next(message for message in self.state.messages if isinstance(message, ToolResultMessage))
+        payload = json.loads(result.content)
+        payload["stdout"] = "STALE_OBSERVATION_TEXT"
+        payload["metadata"].pop("body_included")
+        result.content = json.dumps(payload)
+        self.store.save(self.state)
+        self.path.unlink()
+        restored = self.store.load(self.state.session_id)
+        loop, provider = self.loop([response()])
+        loop.retry_turn(restored)
+        request = provider.requests[0]
+        self.assertEqual(content(request).count("PRIVATE_REVIEW_WORKFLOW"), 1)
+        self.assertNotIn("STALE_OBSERVATION_TEXT", content(request))
+        self.assertIn("STALE_OBSERVATION_TEXT", next(message.content for message in restored.messages if isinstance(message, ToolResultMessage)))
+
+    def test_mismatched_tool_provenance_does_not_activate_snapshot_body(self):
+        loop, _ = self.loop([response(name="test-review")], max_steps=1)
+        loop.run_turn(self.state, "Review")
+        result = next(message for message in self.state.messages if isinstance(message, ToolResultMessage))
+        payload = json.loads(result.content)
+        payload["metadata"]["skill"]["sha256"] = "0" * 64
+        result.content = json.dumps(payload)
+        snapshot = loop.inspect_context(self.state)
+        self.assertNotIn("PRIVATE_REVIEW_WORKFLOW", " ".join(message.content for message in snapshot.messages))
+        self.assertEqual(snapshot.breakdown.skill_body_tokens, 0)
+        self.assertIn("PRIVATE_REVIEW_WORKFLOW", result.content)
+
+    def test_skill_budget_checks_complete_observation_and_rolls_back(self):
+        self.skill(self.root, "test-review", body="x" * 4000)
+        loop, provider = self.loop([response(name="test-review"), response()])
+        loop.run_turn(self.state, "Review")
+        request = provider.requests[-1]
+        full_tokens = estimate_request_tokens(request.system_prompt, list(request.messages), list(request.tools))
+        self.state = self.store.create(self.root)
+        manager = ContextManager(context_window_tokens=full_tokens + 199, reserve_output_tokens=200)
+        loop, provider = self.loop([response(name="test-review"), response()], context_manager=manager)
+        loop.run_turn(self.state, "Review")
+        self.assertEqual(self.state.current_skills().loaded, [])
+        result = next(message for message in self.state.messages if isinstance(message, ToolResultMessage))
+        self.assertEqual(json.loads(result.content)["metadata"]["status"], "skill_load_failed")
+        self.assertNotIn("x" * 4000, content(provider.requests[-1]))
+
+    def test_expiration_does_not_strip_other_tools_results(self):
+        loop, provider = self.loop([response(name="test-review"), response(), response()])
+        loop.run_turn(self.state, "Review")
+        self.state.messages.extend([
+            AssistantMessage(tool_calls=[ToolCall("read-1", "read_file", {"path": "tests.py"})]),
+            ToolResultMessage("read-1", "read_file", json.dumps({"ok": True, "stdout": "REGULAR_FILE_CONTENT"})),
+        ])
+        loop.run_turn(self.state, "Another task")
+        self.assertNotIn("PRIVATE_REVIEW_WORKFLOW", content(provider.requests[-1]))
+        self.assertIn("REGULAR_FILE_CONTENT", content(provider.requests[-1]))
 
     def test_pending_turn_restores_loaded_body_even_after_file_deletion(self):
         loop, _ = self.loop([response(name="test-review")], max_steps=1)
@@ -279,9 +438,15 @@ class SkillRuntimeTests(unittest.TestCase):
         stream = provider.stream_once
         calls = []
         def verify(request, cancel_event=None):
-            saved = self.store.load(self.state.session_id, recover=False).current_skills()
+            persisted = self.store.load(self.state.session_id, recover=False)
+            saved = persisted.current_skills()
             self.assertIsNotNone(saved)
             self.assertEqual(len(saved.loaded), len(calls))
+            if calls:
+                stored = next(message for message in persisted.messages if isinstance(message, ToolResultMessage))
+                sent = next(message for message in request.messages if isinstance(message, ToolResultMessage))
+                self.assertEqual(stored.content, sent.content)
+                self.assertIn("PRIVATE_REVIEW_WORKFLOW", stored.content)
             calls.append(request)
             return stream(request, cancel_event)
         with patch.object(provider, "stream_once", side_effect=verify):

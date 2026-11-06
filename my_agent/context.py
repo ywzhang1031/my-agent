@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from .messages import AssistantMessage, Message, ToolResultMessage, UserMessage
 from .session import SessionState
-from .tools import ToolSpec
+from .tools import ToolSpec, skill_load_result
 
 
 class ContextWindowError(RuntimeError):
@@ -181,17 +181,13 @@ class ContextManager:
         start = state.summarized_message_count
         if start < 0 or start > len(state.messages):
             raise ContextWindowError("session summarized_message_count is invalid")
-        # Persisted rule snapshots are harness metadata, not provider message fields.
-        active_messages = [
-            UserMessage(content=message.content) if isinstance(message, UserMessage) else message
-            for message in state.messages[start:]
-        ]
+        active_messages = _project_messages(state, start)
         rules = state.current_project_rules()
         rules_prompt = rules.prompt() if rules is not None else ""
         rule_messages = [UserMessage(content=rules_prompt)] if rules_prompt else []
         skills = state.current_skills()
         catalog_prompt = skills.catalog_prompt() if skills else ""
-        body_prompt = skills.body_prompt() if skills else ""
+        body_prompt = skills.manual_prompt() if skills else ""
         catalog_messages = [UserMessage(content=catalog_prompt)] if catalog_prompt else []
         body_messages = [UserMessage(content=body_prompt)] if body_prompt else []
         effective_prompt = _with_summary(system_prompt, state.context_summary)
@@ -240,6 +236,51 @@ def estimate_request_tokens(
     ).total_tokens
 
 
+def _skill_result_payload(message: Message) -> dict[str, Any] | None:
+    if not isinstance(message, ToolResultMessage) or message.tool_name != "load_skill":
+        return None
+    try:
+        payload = json.loads(message.content)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        return None
+    metadata = payload.get("metadata")
+    if (not isinstance(metadata, dict) or metadata.get("status") != "skill_loaded"
+            or not isinstance(metadata.get("skill"), dict)):
+        return None
+    return payload
+
+
+def _project_messages(state: SessionState, start: int) -> list[Message]:
+    current_start = next((i for i in range(len(state.messages) - 1, -1, -1)
+                          if isinstance(state.messages[i], UserMessage)), -1)
+    skills = state.current_skills()
+    loaded = {item.skill.name: item for item in skills.loaded} if skills else {}
+    seen: set[str] = set()
+    projected: list[Message] = []
+    for index, message in enumerate(state.messages[start:], start):
+        if isinstance(message, UserMessage):
+            projected.append(UserMessage(content=message.content))
+            continue
+        payload = _skill_result_payload(message)
+        if payload is not None:
+            manifest = payload["metadata"]["skill"]
+            skill = loaded.get(manifest.get("name"))
+            if index >= current_start and skill is not None and manifest == skill.manifest():
+                include_body = skill.reason == "model" and skill.skill.name not in seen
+                payload = skill_load_result(skill, include_body=include_body).to_dict()
+                seen.add(skill.skill.name)
+            else:
+                # Keep call/result pairing and provenance; never rewrite stored history.
+                payload = {**payload,
+                           "stdout": "Skill guidance is not active for this turn. Load the skill again if relevant.",
+                           "metadata": {**payload["metadata"], "body_included": False}}
+            message = replace(message, content=json.dumps(payload, ensure_ascii=False))
+        projected.append(message)
+    return projected
+
+
 def estimate_request_breakdown(
     *,
     system_prompt: str,
@@ -267,6 +308,15 @@ def estimate_request_breakdown(
     if conversation_summary:
         effective_prompt_tokens = estimate_text_tokens(effective_prompt)
         summary_tokens = max(0, effective_prompt_tokens - system_prompt_tokens)
+    conversation_tokens = 0
+    skill_tool_tokens = 0
+    for message in messages:
+        tokens = estimate_text_tokens(_message_payload(message))
+        payload = _skill_result_payload(message)
+        if payload is not None and payload["metadata"].get("body_included") is True:
+            skill_tool_tokens += tokens
+        else:
+            conversation_tokens += tokens
     return ContextBreakdown(
         system_prompt_tokens=system_prompt_tokens,
         tool_definition_tokens=(
@@ -275,16 +325,14 @@ def estimate_request_breakdown(
             else 0
         ),
         summary_tokens=summary_tokens,
-        conversation_tokens=sum(
-            estimate_text_tokens(_message_payload(message)) for message in messages
-        ),
+        conversation_tokens=conversation_tokens,
         protocol_tokens=16,
         project_rules_tokens=sum(
             estimate_text_tokens(_message_payload(message))
             for message in project_rules_messages or []
         ),
         skill_catalog_tokens=sum(estimate_text_tokens(_message_payload(message)) for message in skill_catalog_messages or []),
-        skill_body_tokens=sum(estimate_text_tokens(_message_payload(message)) for message in skill_body_messages or []),
+        skill_body_tokens=skill_tool_tokens + sum(estimate_text_tokens(_message_payload(message)) for message in skill_body_messages or []),
     )
 
 
@@ -354,6 +402,10 @@ def _summary_line(message: Message) -> str:
         tools = ", ".join(call.name for call in message.tool_calls)
         suffix = f"; tool_calls={tools}" if tools else ""
         return f"assistant: {_clip(message.content, 800)}{suffix}"
+    skill_result = _skill_result_payload(message)
+    if skill_result is not None:
+        source = skill_result["metadata"]["skill"]
+        return f"tool load_skill: skill_loaded; name={source.get('name')}; source={source.get('path')}; guidance expired"
     try:
         result = json.loads(message.content)
     except json.JSONDecodeError:

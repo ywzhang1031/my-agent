@@ -467,27 +467,46 @@ CLI /skills 选择 / Web 勾选 -> StartTurn.skills（仅下一轮）
   -> ContextManager.prepare -> ModelRequest -> provider
   -> 模型按描述调用 load_skill(name)
   -> tool.started checkpoint -> 安全读取 -> TurnSkills.loaded
-  -> tool.finished checkpoint（保存正文与来源）
-  -> 下一次 ContextManager.prepare 加入正文 -> 模型继续工作
+  -> 正文进入 tool result -> tool.finished checkpoint（保存结果、正文快照与来源）
+  -> 下一次 ContextManager.prepare 生成本轮请求视图 -> 模型继续工作
 ```
 
-目录和已加载正文分别渲染成 user-role 指导消息，放在历史消息前，不提升成 system policy。
-工具 observation 只返回确认和来源清单，正文只在指导消息中出现一次，避免工具结果和上下文重复计算。
-`ContextManager` 分别计入 `Skill catalog` 与 `Loaded skills`，沿用估算值而非厂商精确 tokenizer。
+目录仍是 user-role 指导；手动选择的正文在第一次模型请求前作为独立 user-role 指导加入历史前方。
+模型自动选择的正文则由 `load_skill` 的 tool result 返回，带 `tool_call_id`、来源清单和
+`body_included=true`，不再另放一份 user-role 正文。二者都不提升成 system policy，也不授予权限。
+重复加载返回确认与来源，`body_included=false`；手动选中后模型又请求同一 Skill 也只返回确认，
+保留首次选择的 `reason=manual`。同一请求中每个 Skill 的正文最多出现一份，不影响调用与结果配对。
+`ContextManager` 分别计入 `Skill catalog` 与 `Loaded skills`；后者包含手动指导和携带正文的工具消息，
+不再重复计入 Conversation，沿用估算值而非厂商精确 tokenizer。预算预检包含完整工具结果与协议开销。
 模型自动选择依赖描述与提示，不使用关键字硬匹配、embedding 或 RAG，不保证每次都会选择正确 Skill。
 
 目录与正文快照随当前 UserMessage 写入 SQLite；provider 只收到剥离 harness 元数据后的普通消息。
 手动加载在首个模型请求前持久化，模型加载在下一次请求前持久化；写盘失败不能继续调用模型。
 重试、续跑、显式恢复使用原目录和已加载正文，历史压缩不会替换当前正文；尚未加载的正文是在第一次加载时
 取得版本，不假装它已提前冻结。frontmatter 在 turn 中改变会拒绝新加载，要求新建 turn 刷新目录。
-下一条用户任务重新发现目录、不沿用上一 turn 的激活状态；历史快照仍保留，但旧正文不再自动发给模型。
+下一条用户任务重新发现目录、不沿用上一 turn 的激活状态。ContextManager 按当前 turn 从快照生成请求
+视图：本轮自动正文只放在第一个匹配来源的成功工具结果中；旧 turn 的 Skill 工具结果替换为过期提示，
+保留 call ID 和来源，不修改持久历史。摘要只记录 Skill 名称、来源与过期状态，不复制正文。
+这管理的是加载器注入的正文，不会删除模型已经写进回答的内容，也不会清除其他读取工具的结果。
 
-`turn.started`、工具完成事件、trace 和 `model_request.context.skills` 保留来源清单，不重复写正文。
+`turn.started` 和 `model_request.context.skills` 仍只记录来源清单；自动加载的工具完成事件和 trace
+包含实际返回正文，以便回放。持久历史同时保留加载快照和工具结果；去重针对模型请求，不是存储去重。
 CLI `/skills` 和 Web“最近 Turn · 已加载”展示选择原因、来源、完整文件哈希；Web 刷新/恢复后可回看。
 手动选择只驻留当前客户端，发送成功后清空；切换会话或刷新页面不保存未发送的选择。目录 RPC 失败不阻塞聊天。
 
+例如项目里有 `test-review`，描述为“检查测试覆盖、边界条件和断言质量”，用户任务相同：
+“检查 tests/test_cart.py 有没有遗漏数量为 0 或负数的情况，不修改文件。”
+
+- 自动：直接发送任务，不勾选 Skill。第一请求只有目录；模型认为相关才发出 `load_skill`，第二请求
+  通过工具结果看到正文。模型也可能不选择它。
+- 手动：先在 Web 勾选 `test-review`，或在 CLI 输入 `/skills test-review`，再发送相同任务。
+  `StartTurn.skills` 明确传入名称，Harness 提前读取正文，第一请求就有指导，不需要模型先请求加载。
+- 手动指“用户决定选哪个”，不是用户亲自读文件；两种入口都由 Harness 读取。仅在自然语言中提到
+  Skill 名称不会自动变成结构化手动选择，仍由模型决定调用。
+- 一个 turn 可以有多次模型请求和工具调用；正文在整轮内保留，下一条用户消息才结束其激活作用域。
+
 定向验证：`.venv/bin/python -m unittest discover -s tests -p 'test_skill*.py'`。
-离线浏览器验收覆盖手动选择、模型工具加载、来源恢复、纯文本渲染和手机布局，不调用真实模型。
+离线浏览器验收覆盖手动选择、模型工具正文、来源恢复、下一轮过期、纯文本渲染和手机布局，不调用真实模型。
 
 ### 流式输出
 

@@ -16,6 +16,7 @@ from .control import ApprovalBroker, AutoApproveBroker, PermissionRequest
 from .patches import MAX_PATCH_CHARS, apply_patch, parse_patch
 from .permissions import PermissionPolicy
 from .sandbox import DEFAULT_SANDBOX_MODE, SandboxPolicy, get_sandbox_profile
+from .skills import LoadedSkill
 from .workspace import Workspace, WorkspaceError
 
 
@@ -64,7 +65,7 @@ class ToolContext:
     cancel_event: threading.Event | None = None
     sandbox_policy: SandboxPolicy | None = None
     goal_updater: Callable[[dict[str, Any]], dict[str, Any]] | None = None
-    skill_loader: Callable[[str], dict[str, Any]] | None = None
+    skill_loader: Callable[[str], ToolResult] | None = None
 
 
 class BaseTool(Protocol):
@@ -148,11 +149,18 @@ class LoadSkillTool(ToolBase):
         if ctx.skill_loader is None:
             return ToolResult(ok=False, stderr="Skill loading is unavailable in this runtime")
         try:
-            manifest = ctx.skill_loader(arguments["name"])
+            return ctx.skill_loader(arguments["name"])
         except ValueError as exc:
             return ToolResult(ok=False, stderr=str(exc), metadata={"status": "skill_load_failed"})
-        return ToolResult(ok=True, stdout="Skill loaded. Its instructions are included in the current turn's skill guidance.",
-                          path=manifest["path"], metadata={"status": "skill_loaded", "skill": manifest})
+
+
+def skill_load_result(skill: LoadedSkill, *, include_body: bool) -> ToolResult:
+    text = "Skill already loaded for this turn; reuse its existing guidance."
+    if include_body:
+        text = ("Skill guidance for the current turn only, not system policy or permissions. "
+                "References and scripts are not loaded or executed. Use only available tools.\n" + skill.body)
+    return ToolResult(ok=True, stdout=text, path=skill.skill.path,
+                      metadata={"status": "skill_loaded", "skill": skill.manifest(), "body_included": include_body})
 
 
 class UpdateGoalTool(ToolBase):

@@ -129,6 +129,14 @@ const { chromium } = require('playwright');
     const automaticContext = await page.evaluate(async () => (await rpc('context.inspect', {session_id:selectedSessionID()})).context);
     assert.equal(automaticContext.skills.loaded.length, 1);
     assert.equal(automaticContext.skills.loaded[0].reason, 'model');
+    assert(automaticContext.breakdown.skill_body_tokens > 0);
+    const automaticSession = await page.evaluate(async () => rpc('session.read', {session_id:selectedSessionID()}));
+    const skillResult = JSON.parse(automaticSession.messages.find(message => message.role === 'tool' && message.tool_name === 'load_skill').content);
+    assert.equal(skillResult.metadata.body_included, true);
+    assert.match(skillResult.stdout, /Workflow body not loaded/);
+    assert.equal(skillResult.metadata.skill.sha256, automaticContext.skills.loaded[0].sha256);
+    await page.reload();
+    await page.waitForFunction(() => state.selectedSession?.message_count === 4 && document.querySelector('#loaded-skills').textContent.includes('模型选择'));
     assert.match(await page.locator('#verification-view').innerText(), /暂无修改或验证记录/);
     // Rendering check only: authoritative projection behavior is covered by Python tests.
     await page.evaluate(() => renderVerification({
@@ -153,8 +161,15 @@ const { chromium } = require('playwright');
     assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
     assert(await page.locator('#skills-view').evaluate(el => el.scrollWidth <= el.clientWidth));
     await page.screenshot({ path: path.join(out, 'mobile.png') });
+    await page.locator('#inspector-close').click();
+    await page.locator('#prompt-input').fill('An unrelated follow-up');
+    await page.locator('#send-prompt').click();
+    await page.waitForFunction(() => !state.sending && state.selectedSession?.message_count === 6);
+    const expiredContext = await page.evaluate(async () => (await rpc('context.inspect', {session_id:selectedSessionID()})).context);
+    assert.equal(expiredContext.skills.loaded.length, 0);
+    assert.equal(expiredContext.breakdown.skill_body_tokens, 0);
     assert.deepEqual(errors, []);
-    console.log(JSON.stringify({ passed: true, realModelCalls: 0, checks: ['draft', 'double-send', 'title', 'reload', 'same-id-retry', 'verification', 'project-rules', 'skill-catalog', 'manual-skill', 'model-skill', 'mobile'], screenshots: out }));
+    console.log(JSON.stringify({ passed: true, realModelCalls: 0, checks: ['draft', 'double-send', 'title', 'reload', 'same-id-retry', 'verification', 'project-rules', 'skill-catalog', 'manual-skill', 'model-skill', 'skill-expiry', 'mobile'], screenshots: out }));
   } catch (error) {
     if (page) console.error(await page.evaluate(() => ({ session: state.selectedSession, toast: elements.toast.textContent, activities: state.activities })));
     console.error(stderr);

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -31,7 +31,7 @@ from .provider import (
 )
 from .session import PendingTurn, ProposedPlan, SessionState
 from .sandbox import DEFAULT_SANDBOX_MODE, SandboxPolicy
-from .tools import ToolContext, ToolRegistry, ToolResult
+from .tools import ToolContext, ToolRegistry, ToolResult, skill_load_result
 from .trace import TraceRecorder
 from .rules import load_project_rules
 from .skills import SkillSettings, TurnSkills, discover_skills, validate_skill_names
@@ -324,7 +324,6 @@ class AgentLoop:
             cancel_event=cancel_event,
             sandbox_policy=self.sandbox_policy,
             goal_updater=lambda arguments: self._update_goal(state, arguments),
-            skill_loader=lambda name: self._load_skill(state, name),
         )
         event_context = {
             "session_id": state.session_id,
@@ -601,6 +600,7 @@ class AgentLoop:
                                     },
                                 ),
                             )
+                            ctx.skill_loader = lambda name, call_id=call.call_id: self._load_skill(state, name, call_id)
                             tool_result = self.tools.run(call, ctx)
                             pending.tool_calls_executed += 1
 
@@ -701,17 +701,23 @@ class AgentLoop:
             mode_id=self.mode.mode_id,
         )
 
-    def _load_skill(self, state: SessionState, name: str) -> dict[str, Any]:
+    def _load_skill(self, state: SessionState, name: str, call_id: str) -> ToolResult:
         skills = state.current_skills()
         if skills is None:
             raise ValueError("This turn has no skill catalog; start a new turn")
         previous = len(skills.loaded)
         loaded = skills.load(name, "model")
-        snapshot = self.inspect_context(state)
-        if snapshot.estimated_tokens > snapshot.input_budget:
+        result = skill_load_result(loaded, include_body=loaded.reason == "model" and len(skills.loaded) > previous)
+        # Budget the complete tool observation without mutating durable history.
+        observation = ToolResultMessage(call_id, "load_skill", json.dumps(result.to_dict(), ensure_ascii=False))
+        try:
+            snapshot = self.inspect_context(replace(state, messages=[*state.messages, observation]))
+            if snapshot.estimated_tokens > snapshot.input_budget:
+                raise ValueError("Skill would exceed the current context budget; reduce context or choose a smaller skill")
+        except Exception:
             del skills.loaded[previous:]
-            raise ValueError("Skill would exceed the current context budget; reduce context or choose a smaller skill")
-        return loaded.manifest()
+            raise
+        return result
 
     @staticmethod
     def _recover_observations(state: SessionState) -> None:
