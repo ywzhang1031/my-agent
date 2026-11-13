@@ -1,3 +1,4 @@
+from contextlib import closing
 import json
 import io
 import sqlite3
@@ -8,7 +9,7 @@ from unittest.mock import patch
 
 from my_agent.attempt_store import AttemptStore
 from my_agent.cli import _print_verification, _report_verification
-from my_agent.database import Database
+from my_agent.database import Database, SCHEMA_VERSION
 from my_agent.session import SessionStore
 from my_agent.verification import read_verification
 
@@ -128,11 +129,12 @@ class VerificationTests(unittest.TestCase):
     def test_v4_database_adds_nullable_timestamps_without_fabrication(self):
         root = self.store.root.parent / "v4"
         root.mkdir()
-        with sqlite3.connect(root / "agent.sqlite3") as connection:
+        with closing(sqlite3.connect(root / "agent.sqlite3")) as connection:
             connection.execute("CREATE TABLE tool_attempts (attempt_id TEXT PRIMARY KEY,session_id TEXT,turn_id TEXT,call_id TEXT,tool_name TEXT,arguments TEXT,status TEXT,result TEXT)")
             connection.execute("INSERT INTO tool_attempts VALUES ('old','session','session:1','call','read_file','{}','completed','{}')")
             connection.execute("PRAGMA user_version=4")
+            connection.commit()
         database = Database(root)
         with database.transaction() as connection:
             self.assertEqual(connection.execute("SELECT attempt_id,started_at,finished_at FROM tool_attempts").fetchone(), ("old", None, None))
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION)

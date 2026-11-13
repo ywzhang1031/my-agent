@@ -9,7 +9,7 @@ from typing import Callable, Iterator
 
 
 DATABASE_NAME = "agent.sqlite3"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 _transactions = threading.local()
 
 
@@ -34,7 +34,7 @@ class Database:
         self.root.mkdir(parents=True, exist_ok=True)
         with self.transaction() as connection:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1, 2, 3, 4, SCHEMA_VERSION):
+            if version not in (0, 1, 2, 3, 4, 5, SCHEMA_VERSION):
                 raise StorageError(f"unsupported database schema: {version}")
             connection.execute("""CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, data TEXT NOT NULL
@@ -54,6 +54,11 @@ class Database:
             connection.execute("""CREATE TABLE IF NOT EXISTS rpc_requests (
                 request_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, response TEXT
             )""")
+            connection.execute("""CREATE TABLE IF NOT EXISTS tool_outputs (
+                artifact_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                metadata TEXT NOT NULL, stdout BLOB NOT NULL, stderr BLOB NOT NULL
+            )""")
+            connection.execute("CREATE INDEX IF NOT EXISTS tool_outputs_session ON tool_outputs(session_id)")
             columns = {row[1] for row in connection.execute("PRAGMA table_info(tool_attempts)")}
             for name in ("started_at", "finished_at"):
                 if name not in columns:
