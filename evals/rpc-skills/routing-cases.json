@@ -1,0 +1,86 @@
+[
+  {
+    "id": "target-01",
+    "group": "target",
+    "prompt": "网页新建会话时服务端已经创建成功，但响应丢了。客户端带原 request_id 重试后多出第二个会话；重启 AppServer 后也会发生。帮我设计并修复这个重复执行问题。",
+    "allowed_sets": [["durable-rpc-change"]],
+    "rationale": "已执行业务的控制请求重试，要求跨进程持久化去重。"
+  },
+  {
+    "id": "target-02",
+    "group": "target",
+    "prompt": "turn.start 收到后刚把任务交给 runtime，进程就退出了，还没来得及保存响应。重启后相同 ID 又启动了一次任务。请检查恢复边界，避免把结果未知当成尚未执行。",
+    "allowed_sets": [["durable-rpc-change"]],
+    "rationale": "副作用与响应持久化之间的崩溃窗口。"
+  },
+  {
+    "id": "target-03",
+    "group": "target",
+    "prompt": "provider.credential.set 的控制请求被客户端重发，setter 执行了两次。我想缓存已完成请求的响应，但又不能把原始 API key 写进新增记录。请评审这个服务端持久化方案。",
+    "allowed_sets": [["durable-rpc-change"]],
+    "rationale": "provider 字样不等于模型 HTTP 重试，实际是控制面的凭据写入副作用。"
+  },
+  {
+    "id": "target-04",
+    "group": "target",
+    "prompt": "我们的请求去重只有一个内存字典。重启就失效，而且同 ID 换了参数仍返回旧结果，参数键调个顺序却会再执行。请把这层去重改成可靠的服务端实现。",
+    "allowed_sets": [["durable-rpc-change"]],
+    "rationale": "请求身份冲突、语义相等与持久化生命周期。"
+  },
+  {
+    "id": "near-01",
+    "group": "near",
+    "prompt": "模型接口返回 429 时，我们直接立即重试，忽略了 Retry-After；等待过程中按取消也没反应。请完善模型请求的重试和等待逻辑。",
+    "allowed_sets": [["provider-request-retry"]],
+    "rationale": "真正适用的是模型传输重试，不是业务控制请求去重。"
+  },
+  {
+    "id": "near-02",
+    "group": "near",
+    "prompt": "SSE 重连后聊天区把同一条工具输出显示两遍，服务器确认任务只执行了一次。请用事件游标修复重放合并，并处理游标过期后快照衔接的问题。",
+    "allowed_sets": [["event-stream-recovery"]],
+    "rationale": "重复的是观察事件和投影，不是业务副作用。"
+  },
+  {
+    "id": "near-03",
+    "group": "near",
+    "prompt": "后端已经能拒绝重复提交，但发送按钮在等待时仍能连点，失败后又一直灰着。切换会话还会把另一个会话输入框锁住。请只修复这些前端交互状态。",
+    "allowed_sets": [["web-interaction-state"]],
+    "rationale": "后端正常，任务限定为前端 pending/错误/会话状态。"
+  },
+  {
+    "id": "near-04",
+    "group": "near",
+    "prompt": "恢复对话后摘要和原始历史都被发给模型，上下文很快溢出。截断又把 tool call 删了却留下 tool result。请修复消息组装和窗口预算。",
+    "allowed_sets": [["context-window-management"]],
+    "rationale": "恢复一词对应上下文构建，不是服务端请求恢复。"
+  },
+  {
+    "id": "none-01",
+    "group": "none",
+    "prompt": "请把 README 里的这句话改得更清楚，不改变意思：My Agent is a Python CLI and Web app for working with a local code repository.",
+    "allowed_sets": [[]],
+    "rationale": "普通文案改写，无需目录中的专门工作流。"
+  },
+  {
+    "id": "none-02",
+    "group": "none",
+    "prompt": "帮我写一个 Python 小函数，输入文件路径后返回不含扩展名的文件名，使用 pathlib，并给两个例子。",
+    "allowed_sets": [[]],
+    "rationale": "普通标准库代码，不涉及五个专门领域。"
+  },
+  {
+    "id": "none-03",
+    "group": "none",
+    "prompt": "用一个简短例子解释 agent 里的 ToolCall 和 ToolResult 各代表什么，以及为什么有 tool_call_id。",
+    "allowed_sets": [[]],
+    "rationale": "基础协议说明，不要求上下文压缩或运行时重构。"
+  },
+  {
+    "id": "none-04",
+    "group": "none",
+    "prompt": "这个列表想按 name 字段排序，大小写不敏感：[{'name': 'beta'}, {'name': 'Alpha'}]。给我一行 Python 写法并解释是否会修改原列表。",
+    "allowed_sets": [[]],
+    "rationale": "简单排序问题，检查无关目录是否造成过度选用。"
+  }
+]
