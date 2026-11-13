@@ -16,6 +16,7 @@ Build mode 暴露这些工具：
 - `apply_patch`
 - `git_diff`
 - `exec_command`
+- `read_tool_output`
 - `update_goal`
 
 `update_goal` 把跨 turn 的任务目标和步骤进度写入 `session.json`。它是 Build mode 中的 harness
@@ -36,8 +37,11 @@ Build mode 暴露这些工具：
 `ruff check`、`black --check`、`mypy`、`npm run lint`、`cargo check` 和 `go build`。
 它拒绝 shell operator、可执行文件路径、任意 Python 脚本、`python -c`、shell、安装命令
 和文件操作命令。子进程不接收 stdin/TTY，只继承筛选后的基础环境变量；provider API key
-不会传入。超时会终止整个 process group，stdout/stderr observation 各自最多保留
-12,000 bytes。
+不会传入。超时会终止整个 process group。stdout/stderr observation 各自取最多 4 KiB 原始字节
+的首尾预览（另加截断标记和元数据），原始输出每路最多保存 1 MiB 到会话 SQLite 数据库。
+模型用返回的 `metadata.output_artifact.artifact_id` 调用 `read_tool_output`，按 byte offset
+回读同一会话保存的输出；默认每页 4 KiB，最大 8 KiB，不重跑命令。Plan/Build 均可只读回查。
+归档配额、失败语义、调用例子和与长期记忆的区别见 [工具输出存储](docs/tool-output.md)。
 
 CLI 创建的新 session 默认使用 `--sandbox workspace-write`。在 macOS 上，`exec_command` 会由
 `/usr/bin/sandbox-exec` 以 Seatbelt profile 启动：允许读取宿主文件，写入只开放给当前 workspace

@@ -649,3 +649,15 @@ Sandbox policy 从启动参数和只读状态提升为可查询、可切换的 s
 - 新增 10 项隔离回归，并强化已有来源/检查点断言；覆盖重复与混合选择、新轮次同名新版本、压缩、
   快照恢复、来源不匹配、完整消息预算、普通工具结果保留，以及 DeepSeek/OpenAI 的纯序列化格式。
 - 浏览器验收增加自动正文持久结果、刷新恢复和下一轮过期；不调用真实模型 API。
+
+## Milestone 43: Retained Command Output
+
+- schema 6 增加有配额的 session-scoped `tool_outputs`，每路最多保存 1 MiB 原始字节；
+  事务提交与配额检查复用现有 Database，记录来源、大小、截断状态和保存部分的哈希。
+- `exec_command` 返回每路 4 KiB 首尾预览，在临时捕获文件关闭前归档。新增只读
+  `read_tool_output` 按 byte offset 分页，Plan/Build 共用；不开放任意路径或跨会话读取。
+- 保存失败不篡改真实命令状态、不重跑；工具结果提交失败仍保持未知结果恢复边界。
+  原有 typed event、session snapshot 和 trace 携带引用，旧 turn 摘要尽量保留 artifact ID。
+- 新增存储和真实 loop 回归覆盖按需回读、只执行一次、重开、UTF-8、配额、取消、超时和提交故障。
+  不调用真实模型，不新增记忆/RAG/UI；运行中的临时日志磁盘限制留在既有执行资源边界之外。
+  具体设计与限制见 `docs/tool-output.md`。

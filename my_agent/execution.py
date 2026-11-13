@@ -8,7 +8,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO
+from typing import Any, BinaryIO, Callable
 
 from .sandbox import (
     DEFAULT_SANDBOX_MODE,
@@ -46,6 +46,7 @@ class ProcessResult:
     environment_keys: tuple[str, ...] = ()
     sandbox_mode: str = DEFAULT_SANDBOX_MODE
     sandbox_backend: str = "none"
+    output_artifact: dict[str, Any] | None = None
 
 
 class ProcessRunner:
@@ -59,6 +60,7 @@ class ProcessRunner:
         timeout_seconds: int,
         cancel_event: threading.Event | None = None,
         sandbox_policy: SandboxPolicy | None = None,
+        output_sink: Callable[[BinaryIO, BinaryIO], dict[str, Any]] | None = None,
     ) -> ProcessResult:
         environment = _subprocess_environment()
         started = time.monotonic()
@@ -122,6 +124,7 @@ class ProcessRunner:
 
             stdout, stdout_truncated = _read_capture(stdout_file, self.max_output_bytes)
             stderr, stderr_truncated = _read_capture(stderr_file, self.max_output_bytes)
+            output_artifact = output_sink(stdout_file, stderr_file) if output_sink is not None else None
             if timed_out and not stderr:
                 stderr = f"command timed out after {timeout_seconds}s"
 
@@ -143,6 +146,7 @@ class ProcessRunner:
             environment_keys=tuple(sorted(environment)),
             sandbox_mode=sandbox_command.mode,
             sandbox_backend=sandbox_command.backend,
+            output_artifact=output_artifact,
         )
 
 
@@ -206,13 +210,16 @@ def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
 
 
 def _read_capture(stream: BinaryIO, max_bytes: int) -> tuple[str, bool]:
+    stream.seek(0, 2)
+    size = stream.tell()
     stream.seek(0)
-    data = stream.read(max_bytes + 1)
-    truncated = len(data) > max_bytes
-    text = data[:max_bytes].decode("utf-8", errors="replace")
-    if truncated:
-        text += "\n...[truncated]"
-    return text, truncated
+    if size <= max_bytes:
+        return stream.read(max_bytes).decode("utf-8", errors="replace"), False
+    head_bytes = max_bytes * 3 // 4
+    head = stream.read(head_bytes).decode("utf-8", errors="replace")
+    stream.seek(-(max_bytes - head_bytes), 2)
+    tail = stream.read(max_bytes - head_bytes).decode("utf-8", errors="replace")
+    return head + "\n...[truncated]\n" + tail, True
 
 
 def _duration_ms(started: float) -> int:

@@ -415,7 +415,9 @@ def _summary_line(message: Message) -> str:
             "success" if result.get("ok") else "failed"
         )
         detail = result.get("stderr") or result.get("stdout") or ""
-        return f"tool {message.tool_name}: {status}; {_clip(str(detail), 500)}"
+        artifact = result.get("metadata", {}).get("output_artifact", {})
+        reference = f"; output_artifact={artifact['artifact_id']}" if artifact.get("status") == "stored" else ""
+        return f"tool {message.tool_name}: {status}; {_clip(str(detail), 500)}{reference}"
     return f"tool {message.tool_name}: {_clip(message.content, 500)}"
 
 

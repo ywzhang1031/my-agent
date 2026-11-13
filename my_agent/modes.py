@@ -17,6 +17,8 @@ end with a question or partial result while the goal remains active. Do not mark
 completed just to end a turn, and do not let an older goal override the user's current request.
 After editing, inspect the actual changes with git_diff and run the narrowest relevant validation.
 Use read_file when you need the contents of an untracked file reported by git_diff.
+Command output is a head/tail preview. Use read_tool_output with the returned artifact_id to
+read retained details; check storage_truncated and do not rerun a command just to recover its log.
 Return a concise result only after checking the changes and test evidence.
 """
 
@@ -55,6 +57,7 @@ BUILD_MODE = CollaborationMode(
         "git_diff",
         "list_files",
         "read_file",
+        "read_tool_output",
         "search",
         "exec_command",
         "update_goal",
@@ -66,7 +69,7 @@ PLAN_MODE = CollaborationMode(
     mode_id="plan",
     description="Explore read-only and produce an approvable implementation plan",
     instructions=PLAN_INSTRUCTIONS,
-    tool_names=("git_diff", "list_files", "read_file", "search", "load_skill"),
+    tool_names=("git_diff", "list_files", "read_file", "read_tool_output", "search", "load_skill"),
     produces_plan=True,
 )
 

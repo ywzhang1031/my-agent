@@ -10,6 +10,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Protocol
 
 from .execution import ProcessRunner
+from .database import StorageError
 from .goals import MAX_GOAL_OBJECTIVE_CHARS, MAX_GOAL_STEP_CHARS, MAX_GOAL_STEPS
 from .messages import ToolCall
 from .control import ApprovalBroker, AutoApproveBroker, PermissionRequest
@@ -17,12 +18,14 @@ from .patches import MAX_PATCH_CHARS, apply_patch, parse_patch
 from .permissions import PermissionPolicy
 from .sandbox import DEFAULT_SANDBOX_MODE, SandboxPolicy, get_sandbox_profile
 from .skills import LoadedSkill
+from .tool_output import MAX_PAGE_BYTES, OutputQuotaError, ToolOutputStore
 from .workspace import Workspace, WorkspaceError
 
 
 MAX_OUTPUT_CHARS = 12000
 MAX_UNTRACKED_FILES = 200
 MAX_COMMAND_TIMEOUT_SECONDS = 300
+COMMAND_PREVIEW_BYTES = 4096
 
 
 @dataclass(frozen=True)
@@ -66,6 +69,9 @@ class ToolContext:
     sandbox_policy: SandboxPolicy | None = None
     goal_updater: Callable[[dict[str, Any]], dict[str, Any]] | None = None
     skill_loader: Callable[[str], ToolResult] | None = None
+    output_store: ToolOutputStore | None = None
+    turn_id: str = ""
+    call_id: str = ""
 
 
 class BaseTool(Protocol):
@@ -323,7 +329,8 @@ class ExecCommandTool(ToolBase):
     description = (
         "Run one allowlisted test, check, or build process from a structured argv array. "
         "Shell operators, scripts, arbitrary interpreters, stdin, and interactive commands "
-        "are not supported."
+        "are not supported. Output is a bounded head/tail preview; use read_tool_output with "
+        "metadata.output_artifact.artifact_id for retained details instead of rerunning the command."
     )
     parameters = {
         "type": "object",
@@ -419,11 +426,24 @@ class ExecCommandTool(ToolBase):
                 },
             )
 
-        execution = ProcessRunner(max_output_bytes=MAX_OUTPUT_CHARS).run(
+        def save_output(stdout, stderr):
+            if ctx.output_store is None:
+                return {"status": "unavailable", "reason": "session_output_store_unavailable"}
+            try:
+                return {"status": "stored", **ctx.output_store.save(
+                    stdout, stderr, turn_id=ctx.turn_id, call_id=ctx.call_id)}
+            except OutputQuotaError:
+                return {"status": "unavailable", "reason": "retention_quota_reached"}
+            except (OSError, StorageError):
+                # The command already ran. Report lost output without inventing an execution failure.
+                return {"status": "unavailable", "reason": "output_storage_failed"}
+
+        execution = ProcessRunner(max_output_bytes=COMMAND_PREVIEW_BYTES).run(
             argv=list(decision.argv),
             cwd=cwd,
             timeout_seconds=timeout,
             cancel_event=ctx.cancel_event,
+            output_sink=save_output,
             sandbox_policy=(
                 ctx.sandbox_policy
                 or SandboxPolicy(
@@ -450,8 +470,47 @@ class ExecCommandTool(ToolBase):
                 "environment_keys": list(execution.environment_keys),
                 "sandbox_mode": execution.sandbox_mode,
                 "sandbox_backend": execution.sandbox_backend,
+                **({"output_artifact": execution.output_artifact} if execution.output_artifact else {}),
             },
         )
+
+
+class ReadToolOutputTool(ToolBase):
+    name = "read_tool_output"
+    description = (
+        "Read a bounded UTF-8 view of retained command stdout or stderr from this session. "
+        "Use the artifact_id returned by exec_command, not a file path. Offsets and limits are bytes; "
+        "continue with next_offset. eof means the saved portion ended, not necessarily the entire output: "
+        "check storage_truncated. This does not rerun the command."
+    )
+    parameters = {
+        "type": "object", "properties": {
+            "artifact_id": {"type": "string"},
+            "stream": {"type": "string", "enum": ["stdout", "stderr"]},
+            "offset": {"type": "integer", "minimum": 0},
+            "limit": {"type": "integer", "minimum": 4, "maximum": MAX_PAGE_BYTES},
+        }, "required": ["artifact_id", "stream"], "additionalProperties": False,
+    }
+    required = ["artifact_id", "stream"]
+
+    def run(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        if not {"artifact_id", "stream"} <= set(arguments) or set(arguments) - {"artifact_id", "stream", "offset", "limit"}:
+            return ToolResult(ok=False, stderr="read_tool_output requires artifact_id and stream; optional offset and limit",
+                              metadata={"status": "invalid_request"})
+        if ctx.output_store is None:
+            return ToolResult(ok=False, stderr="Session output storage is unavailable", metadata={"status": "unavailable"})
+        try:
+            page = ctx.output_store.read(arguments["artifact_id"], arguments["stream"],
+                                         arguments.get("offset", 0), arguments.get("limit", 4096))
+        except ValueError as exc:
+            return ToolResult(ok=False, stderr=str(exc), metadata={"status": "invalid_request"})
+        except FileNotFoundError as exc:
+            return ToolResult(ok=False, stderr=str(exc), metadata={"status": "not_found"})
+        except (OSError, StorageError):
+            return ToolResult(ok=False, stderr="Cannot read retained tool output", metadata={"status": "storage_error"})
+        text = page.pop("text")
+        return ToolResult(ok=True, stdout=text, truncated=not page["eof"] or page["storage_truncated"],
+                          metadata={"status": "output_read", **page})
 
 
 class ApplyPatchTool(ToolBase):

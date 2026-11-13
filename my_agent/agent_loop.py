@@ -32,6 +32,7 @@ from .provider import (
 from .session import PendingTurn, ProposedPlan, SessionState
 from .sandbox import DEFAULT_SANDBOX_MODE, SandboxPolicy
 from .tools import ToolContext, ToolRegistry, ToolResult, skill_load_result
+from .tool_output import ToolOutputStore
 from .trace import TraceRecorder
 from .rules import load_project_rules
 from .skills import SkillSettings, TurnSkills, discover_skills, validate_skill_names
@@ -324,6 +325,8 @@ class AgentLoop:
             cancel_event=cancel_event,
             sandbox_policy=self.sandbox_policy,
             goal_updater=lambda arguments: self._update_goal(state, arguments),
+            output_store=ToolOutputStore(state.session_dir.parent, state.session_id),
+            turn_id=pending.turn_id,
         )
         event_context = {
             "session_id": state.session_id,
@@ -601,6 +604,7 @@ class AgentLoop:
                                 ),
                             )
                             ctx.skill_loader = lambda name, call_id=call.call_id: self._load_skill(state, name, call_id)
+                            ctx.call_id = call.call_id
                             tool_result = self.tools.run(call, ctx)
                             pending.tool_calls_executed += 1
 
