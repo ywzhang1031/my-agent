@@ -30,6 +30,7 @@ from .provider import (
     TextDelta,
 )
 from .session import PendingTurn, ProposedPlan, SessionState
+from .summarization import summarize_history
 from .sandbox import DEFAULT_SANDBOX_MODE, SandboxPolicy
 from .tools import ToolContext, ToolRegistry, ToolResult, skill_load_result
 from .tool_output import ToolOutputStore
@@ -221,6 +222,16 @@ class AgentLoop:
             system_prompt=self._instructions_for(state),
         )
 
+    def prepare_context(self, state: SessionState, *, manual_focus: str | None = None,
+                        cancel_event: threading.Event | None = None, output_store: ToolOutputStore | None = None,
+                        revalidate_outputs: bool = False) -> ContextSnapshot:
+        return self.context_manager.prepare(
+            state=state, tools=self.tools.specs(), system_prompt=self._instructions_for(state),
+            output_store=output_store, revalidate_outputs=revalidate_outputs, manual_focus=manual_focus,
+            summarize=lambda previous, messages, focus: summarize_history(
+                self.model, self.context_manager, self.trace, previous, messages, focus, cancel_event),
+        )
+
     def switch_model(self, model: ModelInvoker) -> None:
         current = self.context_manager
         self.model = model
@@ -341,25 +352,20 @@ class AgentLoop:
             pending.step = step
             try:
                 raise_if_cancelled(cancel_event)
-                snapshot = self.context_manager.prepare(
-                    state=state,
-                    tools=self.tools.specs(),
-                    system_prompt=self._instructions_for(state),
+                previous_context = (state.context_summary, state.summarized_message_count, pending.compacted_outputs)
+                snapshot = self.prepare_context(
+                    state, cancel_event=cancel_event,
                     output_store=ctx.output_store,
                     revalidate_outputs=(step == batch_start),
                 )
                 if snapshot.compacted_messages:
-                    self.trace.write(
-                        "context_compacted",
-                        {**event_context, "step": step, **snapshot.to_dict()},
-                    )
-                    self._emit(
-                        event_handler,
-                        AgentEvent(
-                            kind="context_compacted",
-                            data={"step": step, **snapshot.to_dict()},
-                        ),
-                    )
+                    data = {"step": step, "trigger": "automatic", **snapshot.to_dict()}
+                    try:
+                        self._emit(event_handler, AgentEvent(kind="context_compacted", data=data))
+                    except BaseException:
+                        state.context_summary, state.summarized_message_count, pending.compacted_outputs = previous_context
+                        raise
+                    self.trace.write("context_compacted", {**event_context, **data})
                 self.trace.write(
                     "model_request",
                     {

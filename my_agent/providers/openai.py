@@ -113,7 +113,7 @@ class OpenAIAdapter:
             "input": self._convert_messages(request.messages),
             "stream": True,
             "store": False,
-            "max_output_tokens": self.profile.max_output_tokens,
+            "max_output_tokens": min(request.max_output_tokens or self.profile.max_output_tokens, self.profile.max_output_tokens),
             "parallel_tool_calls": True,
         }
         if request.system_prompt:

@@ -177,7 +177,7 @@ class DeepSeekAdapter:
             "stream": True,
             "stream_options": {"include_usage": True},
             "thinking": {"type": self.thinking},
-            "max_tokens": self.profile.max_output_tokens,
+            "max_tokens": min(request.max_output_tokens or self.profile.max_output_tokens, self.profile.max_output_tokens),
         }
         if request.tools:
             payload["tools"] = [self._convert_tool(tool) for tool in request.tools]

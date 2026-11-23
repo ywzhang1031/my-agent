@@ -1592,6 +1592,7 @@ class MyAgentTests(unittest.TestCase):
                 state=state,
                 tools=[ListFilesTool().spec()],
                 system_prompt="You are a coding agent.",
+                summarize=lambda previous, messages, focus: "Five completed questions.",
             )
 
             self.assertGreater(state.summarized_message_count, 0)
@@ -1601,10 +1602,11 @@ class MyAgentTests(unittest.TestCase):
             )
             self.assertTrue(state.context_summary)
             self.assertEqual(
-                snapshot.messages,
+                snapshot.messages[1:],
                 state.messages[state.summarized_message_count :],
             )
-            self.assertIn("<conversation_summary>", snapshot.system_prompt)
+            self.assertEqual(snapshot.system_prompt, "You are a coding agent.")
+            self.assertIn(state.context_summary, snapshot.messages[0].content)
             self.assertLessEqual(snapshot.estimated_tokens, snapshot.input_budget)
             self.assertGreater(snapshot.compacted_messages, 0)
             self.assertEqual(snapshot.breakdown.total_tokens, snapshot.estimated_tokens)
@@ -1613,8 +1615,7 @@ class MyAgentTests(unittest.TestCase):
             self.assertGreater(snapshot.breakdown.summary_tokens, 0)
             self.assertGreater(snapshot.breakdown.conversation_tokens, 0)
             self.assertEqual(
-                snapshot.breakdown.system_prompt_tokens
-                + snapshot.breakdown.summary_tokens,
+                snapshot.breakdown.system_prompt_tokens,
                 estimate_text_tokens(snapshot.system_prompt),
             )
             self.assertEqual(snapshot.context_window_tokens, 900)

@@ -196,7 +196,7 @@ class ProjectRulesTests(unittest.TestCase):
         current = load_project_rules(self.root)
         self.state.messages = [UserMessage("old question " * 500, old), AssistantMessage("answer " * 500), UserMessage("new question", current)]
         manager = ContextManager(context_window_tokens=1500, reserve_output_tokens=200, summary_tokens=100)
-        snapshot = manager.prepare(state=self.state, tools=[], system_prompt="System")
+        snapshot = manager.prepare(state=self.state, tools=[], system_prompt="System", summarize=lambda *_: "Previous task.")
         self.assertGreater(snapshot.summarized_messages, 0)
         self.assertIn("current policy", snapshot.messages[0].content)
         self.assertNotIn("old policy", snapshot.system_prompt)

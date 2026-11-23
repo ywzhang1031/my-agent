@@ -107,6 +107,7 @@ class ModelRequest:
     messages: tuple[Message, ...]
     tools: tuple[ToolSpec, ...]
     system_prompt: str = ""
+    max_output_tokens: int | None = None
 
 
 @dataclass(frozen=True)

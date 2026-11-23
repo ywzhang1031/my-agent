@@ -9,7 +9,8 @@ from unittest.mock import patch
 
 from my_agent.agent_loop import AgentLoop
 from my_agent.cli import build_tool_registry
-from my_agent.context import _summary_line, estimate_text_tokens
+from my_agent.context import estimate_text_tokens
+from my_agent.summarization import history_record
 from my_agent.database import StorageError
 from my_agent.event_store import EventStore
 from my_agent.execution import ProcessRunner, _read_capture
@@ -114,7 +115,7 @@ class OutputRuntimeTests(unittest.TestCase):
         self.assertTrue(command["truncated"])
         self.assertLess(estimate_text_tokens(results[0].content), estimate_text_tokens(OUTPUT) // 10)
         self.assertEqual((self.workspace / "runs.txt").read_text(), "run\n")
-        self.assertIn(artifact["artifact_id"], _summary_line(results[0]))
+        self.assertIn(artifact["artifact_id"], history_record(results[0])["text"])
         trace = read_jsonl_trace(self.state.trace_path)
         self.assertEqual(sum(e["event"] == "tool_result" and e["call"]["name"] == "exec_command" for e in trace), 1)
 

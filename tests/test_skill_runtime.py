@@ -145,12 +145,16 @@ class SkillRuntimeTests(unittest.TestCase):
 
     def test_compaction_excludes_expired_model_body_but_retains_current_tool_body(self):
         loop, provider = self.loop([response(name="test-review"), response(),
+                                    response("Earlier review"), response("Earlier review completed"),
                                     response(name="test-review", call_id="skill-2"), response()])
         loop.run_turn(self.state, "Old task " * 3000)
         self.skill(self.root, "test-review", body="CURRENT_SKILL_BODY")
         loop.context_manager = ContextManager(context_window_tokens=5000, reserve_output_tokens=200, summary_tokens=200)
         loop.run_turn(self.state, "New review")
         self.assertGreater(self.state.summarized_message_count, 0)
+        compact_requests = [r for r in provider.requests if not r.tools]
+        self.assertEqual(len(compact_requests), 2)
+        self.assertTrue(all("PRIVATE_REVIEW_WORKFLOW" not in content(r) for r in compact_requests))
         self.assertNotIn("PRIVATE_REVIEW_WORKFLOW", self.state.context_summary)
         self.assertNotIn("PRIVATE_REVIEW_WORKFLOW", content(provider.requests[-1]))
         self.assertEqual(content(provider.requests[-1]).count("CURRENT_SKILL_BODY"), 1)
@@ -337,7 +341,7 @@ class SkillRuntimeTests(unittest.TestCase):
         current.load("test-review", "manual")
         self.state.messages = [UserMessage("old question " * 500, skills=old), AssistantMessage("answer " * 500), UserMessage("new", skills=current)]
         manager = ContextManager(context_window_tokens=1800, reserve_output_tokens=200, summary_tokens=100)
-        snapshot = manager.prepare(state=self.state, tools=[], system_prompt="System")
+        snapshot = manager.prepare(state=self.state, tools=[], system_prompt="System", summarize=lambda *_: "Previous task.")
         self.assertGreater(snapshot.summarized_messages, 0)
         self.assertIn("CURRENT_BODY", " ".join(message.content for message in snapshot.messages))
         self.assertNotIn("PRIVATE_REVIEW_WORKFLOW", snapshot.system_prompt)
