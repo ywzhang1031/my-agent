@@ -6,7 +6,9 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from .messages import AssistantMessage, Message, ToolResultMessage, UserMessage
+from .output_checkpoint import OutputCheckpoint, compact_v1, fingerprint, older_observations
 from .session import SessionState
+from .tool_output import ToolOutputStore
 from .tools import ToolSpec, skill_load_result
 
 
@@ -64,6 +66,8 @@ class ContextSnapshot:
     summarized_messages: int
     breakdown: ContextBreakdown
     compacted_messages: int = 0
+    compacted_outputs: int = 0
+    estimated_tokens_before_compaction: int | None = None
     project_rules: dict[str, Any] | None = None
     skills: dict[str, Any] | None = None
 
@@ -76,6 +80,9 @@ class ContextSnapshot:
             "active_messages": self.active_messages,
             "summarized_messages": self.summarized_messages,
             "compacted_messages": self.compacted_messages,
+            "compacted_outputs": self.compacted_outputs,
+            **({"estimated_tokens_before_compaction": self.estimated_tokens_before_compaction}
+               if self.estimated_tokens_before_compaction is not None else {}),
             "breakdown": self.breakdown.to_dict(),
             "project_rules": self.project_rules,
             "skills": self.skills,
@@ -125,8 +132,16 @@ class ContextManager:
         state: SessionState,
         tools: list[ToolSpec],
         system_prompt: str,
+        output_store: ToolOutputStore | None = None,
+        revalidate_outputs: bool = False,
     ) -> ContextSnapshot:
         snapshot = self.inspect(state=state, tools=tools, system_prompt=system_prompt)
+        pending = state.pending_turn
+        if revalidate_outputs and pending:
+            for entry in pending.compacted_outputs:
+                message = state.messages[entry.index]  # inspect already checked position and fingerprint.
+                if output_store is None or not output_store.confirms_observation(pending.turn_id, message, entry.artifact_id):
+                    raise ContextWindowError("cannot recover compacted output: missing artifact or completed tool receipt")
         if snapshot.project_rules and snapshot.project_rules["status"] == "error":
             raise ContextWindowError(
                 f"{snapshot.project_rules['error']}. Fix the file, then abandon this turn and start a new one."
@@ -137,15 +152,16 @@ class ContextManager:
         if snapshot.estimated_tokens <= threshold:
             return snapshot
 
+        # Stage both kinds of compaction: a rejected request must not advance either cursor.
+        before = snapshot.estimated_tokens
+        trial = replace(state, pending_turn=replace(pending) if pending else None)
         start = state.summarized_message_count
+        end = pending.message_start + 1 if pending else len(state.messages)
         candidates = [
             index
-            for index in range(start + 1, len(state.messages))
+            for index in range(start + 1, end)
             if isinstance(state.messages[index], UserMessage)
         ]
-        if not candidates:
-            self._ensure_fits(snapshot)
-            return snapshot
 
         original_start = start
         summary = state.context_summary
@@ -157,10 +173,10 @@ class ContextManager:
                 max_tokens=self.summary_tokens,
             )
             start = cutoff
-            state.context_summary = summary
-            state.summarized_message_count = cutoff
+            trial.context_summary = summary
+            trial.summarized_message_count = cutoff
             snapshot = self._snapshot(
-                state,
+                trial,
                 tools,
                 system_prompt,
                 compacted_messages=cutoff - original_start,
@@ -168,8 +184,20 @@ class ContextManager:
             if snapshot.estimated_tokens <= target:
                 break
 
+        if (snapshot.estimated_tokens > target and trial.pending_turn and output_store
+                and any(tool.name == "read_tool_output" for tool in tools)):
+            entries = _select_output_checkpoints(trial, output_store, snapshot.estimated_tokens - target)
+            if entries:
+                trial.pending_turn.compacted_outputs += entries
+                snapshot = self._snapshot(trial, tools, system_prompt, start - original_start + len(entries))
+                snapshot = replace(snapshot, compacted_outputs=len(entries))
+
         self._ensure_fits(snapshot)
-        return snapshot
+        state.context_summary = trial.context_summary
+        state.summarized_message_count = trial.summarized_message_count
+        if pending and trial.pending_turn:
+            pending.compacted_outputs = trial.pending_turn.compacted_outputs
+        return replace(snapshot, estimated_tokens_before_compaction=before) if snapshot.compacted_messages else snapshot
 
     def _snapshot(
         self,
@@ -252,6 +280,50 @@ def _skill_result_payload(message: Message) -> dict[str, Any] | None:
     return payload
 
 
+def _select_output_checkpoints(
+    state: SessionState, store: ToolOutputStore, tokens_to_save: int,
+) -> tuple[OutputCheckpoint, ...]:
+    pending = state.pending_turn
+    assert pending is not None
+    used = {entry.index for entry in pending.compacted_outputs}
+    entries = []
+    for index in older_observations(state.messages, pending.message_start):
+        source = state.messages[index]
+        if index in used or not isinstance(source, ToolResultMessage):
+            continue
+        candidate = compact_v1(source, pending.turn_id)
+        if candidate is None:
+            continue
+        artifact_id, short = candidate
+        saved = estimate_text_tokens(_message_payload(source)) - estimate_text_tokens(_message_payload(short))
+        if saved < 128 or not store.confirms_observation(pending.turn_id, source, artifact_id):
+            continue
+        entries.append(OutputCheckpoint(index, fingerprint(source), artifact_id))
+        tokens_to_save -= saved
+        if tokens_to_save <= 0:
+            break
+    return tuple(entries)
+
+
+def _checkpoint_projections(state: SessionState, start: int) -> dict[int, ToolResultMessage]:
+    replacements = {}
+    pending = state.pending_turn
+    if pending is None:
+        return replacements
+    for entry in pending.compacted_outputs:
+        if (entry.version != 1 or type(entry.index) is not int or entry.index in replacements
+                or not max(start, pending.message_start + 1) <= entry.index < len(state.messages)):
+            raise ContextWindowError("invalid active-turn output checkpoint")
+        source = state.messages[entry.index]
+        if not isinstance(source, ToolResultMessage) or fingerprint(source) != entry.fingerprint:
+            raise ContextWindowError("active-turn output checkpoint does not match the original observation")
+        candidate = compact_v1(source, pending.turn_id)
+        if candidate is None or candidate[0] != entry.artifact_id:
+            raise ContextWindowError("active-turn output checkpoint does not match the artifact")
+        replacements[entry.index] = candidate[1]
+    return replacements
+
+
 def _project_messages(state: SessionState, start: int) -> list[Message]:
     current_start = next((i for i in range(len(state.messages) - 1, -1, -1)
                           if isinstance(state.messages[i], UserMessage)), -1)
@@ -259,7 +331,11 @@ def _project_messages(state: SessionState, start: int) -> list[Message]:
     loaded = {item.skill.name: item for item in skills.loaded} if skills else {}
     seen: set[str] = set()
     projected: list[Message] = []
+    replacements = _checkpoint_projections(state, start)
     for index, message in enumerate(state.messages[start:], start):
+        if index in replacements:
+            projected.append(replacements[index])
+            continue
         if isinstance(message, UserMessage):
             projected.append(UserMessage(content=message.content))
             continue

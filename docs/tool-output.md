@@ -84,6 +84,28 @@ schema 6 新增 `tool_outputs` 表及 session 索引；原 session/event/attempt
 - 现有运行中临时捕获文件仍可能增长，宿主崩溃前的输出也不保证归档；本改动不实现流式日志持久化、
   进程磁盘硬配额或更强的 OS sandbox。存储范围隔离不等于抵御宿主进程直接读取数据库。
 
+## 同一 turn 内的压缩检查点
+
+例：第 1 步跑测试，第 2 步回读日志，第 3 步请求模型时，测试预览和刚读的片段原本都要重发。
+当估算超过**输入预算**的 85%（窗口先扣除预留输出）时，harness 先按原逻辑摘要已结束的 turn；
+若仍高于 70% 的目标，从本轮最早的完整工具批次开始缩短结果。最近一次模型回复里的**整批**
+调用及结果保持原样，所以此例只改第 1 步的请求视图。达不到 70% 但未超过硬预算时仍可继续。
+
+- 只选有已提交的相同工具结果、同会话 artifact、输出完整保留且每条至少省 128 个估算 tokens 的
+  `exec_command`（成功或非零退出）和 `read_tool_output`。过长的每路预览保留前 64 和后 128 个字符；
+  页面的 stream、字节区间、命令退出码、来源不变。短诊断不裁剪。未决、未知、超时、没归档的结果不选。
+- 新请求保留原来的消息顺序、角色、call ID、模型原生字段、本轮指令与 Skill。数据库里的原始消息和日志不改写。
+  若缩完仍超硬预算，返回 `ContextWindowError`，不推进历史摘要或本轮检查点，也不发送模型请求。
+- 检查点在 `PendingTurn.compacted_outputs`：每条记录版本、原消息位置、指纹和 artifact ID。
+  Service 将它与 `context_compacted` 事件同事务提交，成功后才放行下一次模型请求；
+  事件含压缩前后本地估算和本次新压缩条数。正常完成或放弃本轮后，检查点随 pending turn 清除。
+- 重启仍须人工确认恢复。提交前中断：从上一个已提交的工具结果重新计算视图；提交后中断：
+  核对原消息、artifact 和完成记录，按相同版本重建视图。两者都不为压缩而重跑工具或推进 step。
+  引用缺失时恢复报错，原始消息还在。未知执行仍按既有恢复流程处理，不拿日志存在当作成功凭证。
+
+压缩的目的是给下一次推理腾出空间，不是承诺任意长的任务一定能继续。用户交代的约束、模型自己的
+回复、最新工具批次，或没有 artifact 的大文件，如果单独就撑满预算，仍需要处理这个限制。
+
 ## 与记忆的关系
 
 可以把它看作后续记忆/检索的基础，但当前保存的是一次执行的原始证据。
@@ -95,6 +117,7 @@ schema 6 新增 `tool_outputs` 表及 session 索引；原 session/event/attempt
 ```bash
 .venv/bin/python -m unittest discover -s tests -p test_tool_output.py -v
 .venv/bin/python -m unittest discover -s tests -p test_output_runtime.py -v
+.venv/bin/python -m unittest discover -s tests -p test_output_checkpoint.py -v
 .venv/bin/python -m unittest discover -s tests
 ```
 

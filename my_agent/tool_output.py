@@ -10,6 +10,7 @@ from typing import BinaryIO
 from uuid import uuid4
 
 from .database import Database, StorageError
+from .messages import ToolResultMessage
 
 
 MAX_STREAM_BYTES = 1024 * 1024
@@ -67,6 +68,28 @@ class ToolOutputStore:
             connection.execute("INSERT INTO tool_outputs VALUES (?, ?, ?, ?, ?)",
                 (metadata["artifact_id"], self.session_id, json.dumps(metadata), data["stdout"], data["stderr"]))
         return metadata
+
+    def confirms_observation(self, turn_id: str, message: ToolResultMessage, artifact_id: str) -> bool:
+        # A stored artifact alone does not prove the tool-result checkpoint committed.
+        with self.database.transaction() as connection:
+            row = connection.execute(
+                "SELECT metadata FROM tool_outputs WHERE session_id=? AND artifact_id=? AND EXISTS "
+                "(SELECT 1 FROM tool_attempts WHERE session_id=? AND turn_id=? AND call_id=? "
+                "AND tool_name=? AND status='completed' AND result=?)",
+                (self.session_id, artifact_id, self.session_id, turn_id, message.tool_call_id,
+                 message.tool_name, message.content),
+            ).fetchone()
+        if not row:
+            return False
+        artifact = json.loads(row[0])
+        metadata = json.loads(message.content)["metadata"]
+        if message.tool_name == "exec_command":
+            return metadata["output_artifact"] == {"status": "stored", **artifact}
+        stream = artifact["streams"].get(metadata.get("stream"))
+        return bool(stream and all(metadata.get(k) == v for k, v in stream.items())
+                    and all(metadata.get(k) == artifact[k] for k in ("call_id", "turn_id"))
+                    and type(metadata.get("offset")) is int and type(metadata.get("next_offset")) is int
+                    and 0 <= metadata["offset"] <= metadata["next_offset"] <= stream["stored_bytes"])
 
     def read(self, artifact_id: str, stream: str, offset: int = 0, limit: int = 4096) -> dict:
         if not isinstance(artifact_id, str) or not re.fullmatch(r"[0-9a-f]{32}", artifact_id):

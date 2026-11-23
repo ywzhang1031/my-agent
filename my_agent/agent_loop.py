@@ -345,6 +345,8 @@ class AgentLoop:
                     state=state,
                     tools=self.tools.specs(),
                     system_prompt=self._instructions_for(state),
+                    output_store=ctx.output_store,
+                    revalidate_outputs=(step == batch_start),
                 )
                 if snapshot.compacted_messages:
                     self.trace.write(

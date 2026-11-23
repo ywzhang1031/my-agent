@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 import secrets
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -12,6 +12,7 @@ from .database import Database, RevisionConflict
 from .attempt_store import AttemptStore
 from .goals import GoalState, goal_from_dict
 from .messages import AssistantMessage, Message, ToolCall, ToolResultMessage, UserMessage
+from .output_checkpoint import OutputCheckpoint
 from .rules import ProjectRules, rules_from_dict
 from .skills import TurnSkills, skills_from_dict
 from .modes import BUILD_MODE
@@ -37,6 +38,7 @@ class PendingTurn:
     last_error_details: dict[str, Any] = field(default_factory=dict)
     pause_reason: str | None = None
     pause_details: dict[str, Any] = field(default_factory=dict)
+    compacted_outputs: tuple[OutputCheckpoint, ...] = ()
 
 
 @dataclass
@@ -361,6 +363,7 @@ def _pending_turn_to_dict(pending: PendingTurn | None) -> dict[str, Any] | None:
         "last_error_details": pending.last_error_details,
         "pause_reason": pending.pause_reason,
         "pause_details": pending.pause_details,
+        "compacted_outputs": [asdict(entry) for entry in pending.compacted_outputs],
     }
 
 
@@ -383,6 +386,7 @@ def _pending_turn_from_dict(data: Any) -> PendingTurn | None:
         last_error_details=dict(data.get("last_error_details", {})),
         pause_reason=data.get("pause_reason"),
         pause_details=dict(data.get("pause_details", {})),
+        compacted_outputs=tuple(OutputCheckpoint(**entry) for entry in data.get("compacted_outputs", ())),
     )
 
 
