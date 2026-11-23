@@ -27,6 +27,7 @@ from .protocol import (
     ApprovalRequestedEvent,
     ClearGoalCommand,
     ClearPermissionGrantsCommand,
+    ContextCompactedEvent,
     ExecutePlanCommand,
     GoalClearedEvent,
     InterruptTurnCommand,
@@ -96,6 +97,7 @@ SLASH_COMMANDS = (
     SlashCommand("/sessions", "List saved sessions"),
     SlashCommand("/summary", "Show current session state"),
     SlashCommand("/context", "Show detailed context usage"),
+    SlashCommand("/compact", "Summarize finished history with the model: /compact [focus]"),
     SlashCommand("/rules", "Show the latest turn's frozen project rules"),
     SlashCommand("/skills", "Choose skills for the next turn; list sources and validation issues"),
     SlashCommand("/verification", "Show committed changes and validation evidence"),
@@ -899,6 +901,23 @@ def _chat(args: argparse.Namespace, store: SessionStore, state: SessionState) ->
                             color=sys.stdout.isatty(),
                         )
                     )
+                    continue
+                if user_input.split(maxsplit=1)[0] == "/compact":
+                    focus = user_input[len("/compact"):].strip()
+                    print("Compacting finished history with the current model...", flush=True)
+                    try:
+                        snapshot = service.compact_context(state.session_id, focus)
+                        if snapshot.compacted_messages:
+                            event = service.next_event(timeout=1)
+                            if not isinstance(event, ContextCompactedEvent):
+                                raise RuntimeError(f"expected context.compacted, got {event.event_type.value}")
+                            print(f"Context: ~{snapshot.estimated_tokens_before_compaction} -> ~{snapshot.estimated_tokens} tokens")
+                        else:
+                            print("No eligible finished history to compact.")
+                    except (RuntimeError, ValueError, OSError) as exc:
+                        print(f"Compaction failed: {exc}")
+                    except KeyboardInterrupt:
+                        print("Compaction interrupted.")
                     continue
                 if user_input in {"/retry", "/recover"}:
                     if state.pending_turn is None:

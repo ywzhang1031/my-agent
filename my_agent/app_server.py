@@ -190,6 +190,7 @@ class AppServer:
             "sandbox.list": self._list_sandbox_profiles,
             "goal.read": self._read_goal,
             "context.inspect": self._inspect_context,
+            "context.compact": self._compact_context,
             "turn.start": self._start_turn,
             "turn.retry": self._retry_turn,
             "turn.recover": self._recover_turn,
@@ -470,6 +471,15 @@ class AppServer:
         session_id = self._session_id(params)
         self._require_active_session(session_id)
         return {"context": self.agent_service.inspect_context(session_id).to_dict()}
+
+    def _compact_context(self, params: dict[str, Any]) -> dict[str, Any]:
+        self._check_params(params, required={"session_id"}, optional={"focus"})
+        session_id = self._required_string(params, "session_id")
+        self._require_active_session(session_id)
+        focus = params.get("focus", "")
+        if not isinstance(focus, str):
+            raise ValueError("focus must be a string")
+        return {"context": self.agent_service.compact_context(session_id, focus.strip()).to_dict()}
 
     def _start_turn(self, params: dict[str, Any]) -> dict[str, Any]:
         self._check_params(params, required={"session_id", "user_input"}, optional={"skills"})

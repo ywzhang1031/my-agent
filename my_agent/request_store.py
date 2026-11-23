@@ -11,7 +11,7 @@ MUTATING_METHODS = frozenset({
     "session.create", "session.rename", "turn.start", "turn.retry", "turn.recover",
     "turn.abort", "turn.interrupt", "plan.execute", "plan.revise", "goal.clear",
     "model.switch", "mode.switch", "permission.switch", "sandbox.switch",
-    "approval.resolve", "provider.credential.set",
+    "approval.resolve", "provider.credential.set", "context.compact",
 })
 
 

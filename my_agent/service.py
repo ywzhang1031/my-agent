@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 import copy
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterable, Mapping
 
 from .control import ApprovalDecision, ApprovalGrant
@@ -114,6 +114,7 @@ class _SessionHandle:
     forwarder: threading.Thread | None = None
     lock: threading.RLock = field(default_factory=threading.RLock)
     operation_lock: threading.Lock = field(default_factory=threading.Lock)
+    compact_cancel: threading.Event | None = None
     closed: bool = False
     staged_events: list[AgentEventType] | None = None
     persistence_error: str | None = None
@@ -179,6 +180,8 @@ class AgentService:
                 raise ValueError(f"session is not registered: {session_id}")
             with handle.operation_lock:
                 handle.closed = True
+                if handle.compact_cancel:
+                    handle.compact_cancel.set()
                 del self._sessions[session_id]
         self._close_handle(handle, timeout)
 
@@ -188,6 +191,11 @@ class AgentService:
         with handle.operation_lock:
             if handle.closed:
                 raise ValueError(f"session is not registered: {command.session_id}")
+            if handle.compact_cancel:
+                if isinstance(command, InterruptTurnCommand):
+                    handle.compact_cancel.set()
+                    return
+                raise RuntimeError("session is compacting history")
             if handle.persistence_error and not isinstance(command, InterruptTurnCommand):
                 raise StorageError("session storage failed; restart and recover before continuing")
             try:
@@ -351,6 +359,38 @@ class AgentService:
         handle = self._handle(session_id)
         return handle.runtime.loop.inspect_context(handle.runtime.session)
 
+    def compact_context(self, session_id: str, focus: str = ""):
+        handle = self._handle(session_id)
+        state = handle.runtime.session
+        with handle.operation_lock:
+            if handle.closed or handle.persistence_error:
+                raise RuntimeError("session unavailable; reopen it before compacting")
+            if handle.forwarding or state.pending_turn or handle.compact_cancel:
+                raise RuntimeError("finish or recover the pending operation before manual compaction")
+            cancel = handle.compact_cancel = threading.Event()
+            trial = replace(state)
+        try:
+            # Never hold a SQLite write transaction during model I/O.
+            snapshot = handle.runtime.loop.prepare_context(trial, manual_focus=focus, cancel_event=cancel)
+            with handle.operation_lock:
+                if handle.closed or cancel.is_set():
+                    raise RuntimeError("compaction cancelled; original context unchanged")
+                if snapshot.compacted_messages:
+                    try:
+                        with self._checkpoint(handle):
+                            self._save_session(trial)
+                            self._publish(handle, ContextCompactedEvent, AgentState.IDLE, turn_id=None,
+                                          step=0, snapshot={**snapshot.to_dict(), "trigger": "manual"})
+                    except (OSError, StorageError) as exc:
+                        handle.persistence_error = str(exc)
+                        raise
+                    state.context_summary, state.summarized_message_count = trial.context_summary, trial.summarized_message_count
+                    state.revision, state.updated_at = trial.revision, trial.updated_at
+                return snapshot
+        finally:
+            with handle.operation_lock:
+                handle.compact_cancel = None
+
     def permission_grants(self, session_id: str) -> tuple[ApprovalGrant, ...]:
         return self._handle(session_id).runtime.permission_grants()
 
@@ -397,6 +437,8 @@ class AgentService:
             for handle in handles:
                 with handle.operation_lock:
                     handle.closed = True
+                    if handle.compact_cancel:
+                        handle.compact_cancel.set()
             self._sessions.clear()
         for handle in handles:
             self._close_handle(handle, timeout)

@@ -340,6 +340,7 @@ REPL 支持这些本地命令：
 - `/trace`：显示当前 raw trace 路径
 - `/tools`：列出可用工具
 - `/context`：查看估算的 context 使用量和 compaction 状态
+- `/compact [重点]`：会话空闲时让当前模型压缩已完成的历史，例如 `/compact 保留 RPC 兼容性决定和未验证项`。Web 输入框也支持；它不是普通对话，不会启动新 turn。
 - `/rules`：查看最近 turn 使用的项目规则快照来源、状态与 SHA-256
 - `/skills`：查看目录、来源和最近 turn 的加载记录，上下选择后 Enter 切换下一轮的手动选择；`/skills <name>` 同样可选，`/skills --clear` 清空
 - `/verification`：查看本轮已提交的修改与验证证据，不等于任务验收
@@ -671,11 +672,18 @@ session ID、可选 turn ID、单 session 递增序号、durable 标记和显式
 mode switching。`AgentLoop` 不读取 stdin，也不知道 prompt_toolkit、AppServer、event store 或
 transport。
 
-Context token 数量是保守估算，不是 provider tokenizer 的精确计数。达到输入预算的 85% 时，
-`ContextManager` 会按完整 user turn 边界压缩较老历史，目标降到 70%；当前 active turn、最近
-原始消息和完整本地 `messages.jsonl` 会保留。摘要是确定性的 extractive summary，不会递归
-调用模型，因此它便宜且可预测，但不等同于语义无损记忆。分类 breakdown 与发送前的同一份
-`ContextSnapshot` 一起生成，类别之和必须等于 `estimated_tokens`，终端不会另算一套数字。
+Context token 数量是估算，不是 provider tokenizer 的精确计数。超过输入预算的 85% 时，
+harness 划定已完成的历史，向**当前模型**发送不带工具的独立摘要请求，不进入 agent loop。
+输入是上一份摘要和新增历史；不重发旧 reasoning、原生 provider 数据或过期 Skill 正文。
+手动 `/compact` 走相同路径，但不必等到阈值，可附加最多 1000 字符的重点。它不重新读取已经
+被前一份摘要概括的历史。无新历史时不调用 API；待处理的计划不因压缩而失去原文。
+
+摘要有真实的模型延迟和 token 开销：通常一份请求，超过输入预算则分片滚动合并，每次压缩最多
+4 个分片（传输重试另计）。只接受完整结束、非空、不含工具调用、长度受控且能缩小上下文的结果。
+模型请求使用现有 DeepSeek / OpenAI adapter，不依赖 OpenAI 专属的 `/responses/compact`。
+摘要是普通历史数据，不放进 system prompt，也不充当审批或执行回执。SQLite 保留原始消息；
+检查点写入后才使用新摘要。中断前已经发送的摘要请求可能计费，恢复后未提交的摘要可能重新生成。
+单个未完成 turn 不参与语义摘要，仍使用[工具输出回读检查点](docs/tool-output.md)；70% 是压缩目标而非硬门槛。
 
 `ModelInvoker` 只会在尚未向终端输出任何 text、reasoning 或 tool-call delta 时自动重试
 adapter 标记为 retryable 的错误。provider adapter 本身从不循环重试，只分类并返回错误。

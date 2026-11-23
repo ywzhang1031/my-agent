@@ -168,8 +168,15 @@ const { chromium } = require('playwright');
     const expiredContext = await page.evaluate(async () => (await rpc('context.inspect', {session_id:selectedSessionID()})).context);
     assert.equal(expiredContext.skills.loaded.length, 0);
     assert.equal(expiredContext.breakdown.skill_body_tokens, 0);
+    const turnsBeforeCompact = requests.filter(r => r.method === 'turn.start').length;
+    await page.locator('#prompt-input').fill('/compact 保留验证证据');
+    await page.locator('#send-prompt').click();
+    await page.waitForFunction(() => !state.sending && elements.toast.textContent.includes('已压缩'));
+    assert.equal(requests.filter(r => r.method === 'turn.start').length, turnsBeforeCompact);
+    assert.equal(requests.find(r => r.method === 'context.compact').params.focus, '保留验证证据');
+    assert.equal(await page.evaluate(() => state.selectedSession.message_count), 6);
     assert.deepEqual(errors, []);
-    console.log(JSON.stringify({ passed: true, realModelCalls: 0, checks: ['draft', 'double-send', 'title', 'reload', 'same-id-retry', 'verification', 'project-rules', 'skill-catalog', 'manual-skill', 'model-skill', 'skill-expiry', 'mobile'], screenshots: out }));
+    console.log(JSON.stringify({ passed: true, realModelCalls: 0, checks: ['draft', 'double-send', 'title', 'reload', 'same-id-retry', 'verification', 'project-rules', 'skill-catalog', 'manual-skill', 'model-skill', 'skill-expiry', 'mobile', 'focused-compact'], screenshots: out }));
   } catch (error) {
     if (page) console.error(await page.evaluate(() => ({ session: state.selectedSession, toast: elements.toast.textContent, activities: state.activities })));
     console.error(stderr);

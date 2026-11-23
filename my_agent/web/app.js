@@ -1685,10 +1685,29 @@ async function startTurn(userInput) {
   let sessionID = selectedSessionID();
   if (!state.selectedSession || state.sending || state.busySessions.has(sessionID) || state.selectedSession.pending_turn_id || !userInput.trim()) return;
   const text = userInput.trim();
+  const compact = /^\/compact(?:\s|$)/u.test(text);
   const skills = [...state.selectedSkills];
   state.sending = true;
   updateControls();
   try {
+    if (compact) {
+      if (!sessionID) {
+        showToast("还没有可压缩的对话历史");
+        return;
+      }
+      const focus = text.slice("/compact".length).trim();
+      showToast("正在用当前模型压缩历史…");
+      const { context } = await rpc("context.compact", { session_id: sessionID, focus });
+      if (selectedSessionID() === sessionID) {
+        if (elements.promptInput.value.trim() === text) elements.promptInput.value = "";
+        resizePrompt();
+        await refreshContext();
+      }
+      showToast(context.compacted_messages
+        ? `已压缩：约 ${context.estimated_tokens_before_compaction} → ${context.estimated_tokens} tokens`
+        : "没有新的已完成历史可压缩");
+      return;
+    }
     if (!sessionID) {
       const draft = state.selectedSession;
       state.draftCreation ||= { id: requestID(), params: {
@@ -1718,6 +1737,11 @@ async function startTurn(userInput) {
     state.selectedSkills.clear();
     if (state.skillCatalog) renderSkills(state.skillCatalog);
   } catch (error) {
+    if (compact) {
+      addActivity(eventLabel(sessionID, "上下文压缩失败"), error.message, "danger");
+      showToast(`压缩失败：${error.message}`);
+      return;
+    }
     state.busySessions.delete(sessionID);
     if (!sessionID && error.code === "invalid_params") state.draftCreation = null;
     if (!elements.promptInput.value) elements.promptInput.value = text;
@@ -2047,7 +2071,7 @@ async function handleEvent(event) {
       addActivity(eventLabel(sessionID, "Turn 已恢复"), `step ${payload.step}`, "neutral");
       break;
     case "context.compacted":
-      addActivity(eventLabel(sessionID, "上下文已压缩"), `step ${payload.step}`, "warning");
+      addActivity(eventLabel(sessionID, "上下文已压缩"), payload.snapshot?.trigger === "manual" ? "手动压缩" : `step ${payload.step}`, "warning");
       break;
     case "model.started":
       addActivity(eventLabel(sessionID, "模型请求"), `step ${payload.step}`, "neutral");
