@@ -16,6 +16,8 @@ from my_agent.web_server import LocalWebServer
 
 
 class _AppServer:
+    supported_methods = ("context.inspect", "session.list")
+
     def __init__(self, workspace: Path) -> None:
         self.workspace = workspace
         self.instance_id = "instance-1"
@@ -89,6 +91,13 @@ class LocalWebServerTests(unittest.TestCase):
         connection.close()
 
         self.assertEqual(response.status, 403)
+
+    def test_bootstrap_advertises_dispatch_methods_separately_from_retry_policy(self):
+        with self.request("/bootstrap.js") as response:
+            script = response.read().decode("utf-8")
+        config = json.loads(script.removeprefix("window.__MY_AGENT__=").strip().removesuffix(";"))
+        self.assertEqual(config["supportedMethods"], list(self.app.supported_methods))
+        self.assertNotIn("session.list", config["deduplicatedMethods"])
 
     def test_bundled_ui_contains_secure_credential_recovery_panel(self) -> None:
         bundled_root = Path(__file__).parents[1] / "my_agent" / "web"

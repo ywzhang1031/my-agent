@@ -200,6 +200,9 @@ const { chromium } = require('playwright');
     assert.equal(expiredContext.skills.loaded.length, 0);
     assert.equal(expiredContext.breakdown.skill_body_tokens, 0);
     const turnsBeforeCompact = requests.filter(r => r.method === 'turn.start').length;
+    assert(await page.evaluate(() => bootstrap.supportedMethods.includes('context.compact')));
+    // Support does not require safe transport replay.
+    await page.evaluate(() => { bootstrap.deduplicatedMethods = bootstrap.deduplicatedMethods.filter(m => m !== 'context.compact'); });
     await prompt.fill('/co');
     await menu.waitFor();
     const menuBox = await menu.boundingBox();
@@ -214,8 +217,37 @@ const { chromium } = require('playwright');
     assert.equal(requests.filter(r => r.method === 'turn.start').length, turnsBeforeCompact);
     assert.deepEqual(requests.filter(r => r.method === 'context.compact').map(r => r.params.focus), ['保留验证证据']);
     assert.equal(await page.evaluate(() => state.selectedSession.message_count), 6);
+    for (const override of [
+      'delete window.__MY_AGENT__.supportedMethods;',
+      "window.__MY_AGENT__.supportedMethods = ['context.inspect'];",
+    ]) {
+      // Keep the real dedup list (including context.compact) to catch accidental fallback.
+      await page.route('**/bootstrap.js', async route => {
+        const response = await route.fetch();
+        await route.fulfill({ response, body: (await response.text()) + '\n' + override });
+      });
+      await page.reload();
+      await page.waitForFunction(() => selectedSessionID() && !elements.promptInput.disabled);
+      const before = requests.length;
+      await prompt.fill('/co');
+      const unavailable = menu.getByRole('option', { name: /\/compact/ });
+      assert.equal(await unavailable.getAttribute('aria-disabled'), 'true');
+      assert.match(await unavailable.innerText(), /请重启服务以启用压缩/);
+      await prompt.press('Enter');
+      assert.equal(await prompt.inputValue(), '/co');
+      assert.match(await page.locator('#toast').innerText(), /请重启服务以启用压缩/);
+      await prompt.fill('/compact 保留验证证据');
+      await page.locator('#send-prompt').click();
+      assert.equal(await prompt.inputValue(), '/compact 保留验证证据');
+      assert.match(await page.locator('#toast').innerText(), /请重启服务以启用压缩/);
+      await prompt.fill('/mod');
+      await prompt.press('Enter');
+      await page.locator('#model-menu').waitFor();
+      assert(!requests.slice(before).some(r => ['context.compact', 'turn.start', 'session.create'].includes(r.method)));
+      await page.unroute('**/bootstrap.js');
+    }
     assert.deepEqual(errors, []);
-    console.log(JSON.stringify({ passed: true, realModelCalls: 0, checks: ['draft', 'double-send', 'title', 'reload', 'same-id-retry', 'verification', 'project-rules', 'skill-catalog', 'manual-skill', 'model-skill', 'skill-expiry', 'mobile', 'focused-compact'], screenshots: out }));
+    console.log(JSON.stringify({ passed: true, realModelCalls: 0, checks: ['draft', 'double-send', 'title', 'reload', 'same-id-retry', 'verification', 'project-rules', 'skill-catalog', 'manual-skill', 'model-skill', 'skill-expiry', 'mobile', 'focused-compact', 'legacy-compact-guard'], screenshots: out }));
   } catch (error) {
     if (page) console.error(await page.evaluate(() => ({ session: state.selectedSession, toast: elements.toast.textContent, activities: state.activities })));
     console.error(stderr);

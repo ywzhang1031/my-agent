@@ -116,6 +116,7 @@ class LocalWebServer:
                             "instanceID": owner.app_server.instance_id,
                             "rpcVersion": RPC_VERSION,
                             "protocolVersion": PROTOCOL_VERSION,
+                            "supportedMethods": owner.app_server.supported_methods,
                             "deduplicatedMethods": sorted(MUTATING_METHODS),
                         },
                         ensure_ascii=False,

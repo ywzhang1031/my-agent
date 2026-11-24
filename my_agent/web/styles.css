@@ -1070,6 +1070,11 @@ textarea:disabled {
   background: var(--accent-soft);
 }
 
+.command-option[aria-disabled="true"] {
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
 .composer textarea {
   max-height: 180px;
   min-height: 32px;

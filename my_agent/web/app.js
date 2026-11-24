@@ -114,13 +114,20 @@ let toastTimer = null;
 
 // List only commands this client can actually dispatch.
 const composerCommands = [
-  { name: "/compact", description: "压缩历史 · 可填写重点", editArguments: true },
+  { name: "/compact", description: "压缩历史 · 可填写重点", editArguments: true,
+    method: "context.compact", unavailable: "请重启服务以启用压缩" },
   { name: "/context", description: "查看上下文用量", run: () => revealInspector(elements.contextPercent) },
   { name: "/model", description: "选择模型", run: () => openChoiceMenu(elements.modelMenuTrigger, elements.modelMenu) },
   { name: "/permissions", description: "选择权限策略", run: () => openChoiceMenu(elements.permissionMenuTrigger, elements.permissionMenu) },
   { name: "/skills", description: "选择下轮 Skill", run: () => revealInspector(elements.skillsView) },
   { name: "/new", description: "新建对话", run: createSession },
 ];
+
+const supportedMethods = new Set(Array.isArray(bootstrap?.supportedMethods) ? bootstrap.supportedMethods : []);
+
+function unavailableReason(command) {
+  return command?.method && !supportedMethods.has(command.method) ? command.unavailable : "";
+}
 
 function revealInspector(target) {
   if (elements.inspectorToggle.getClientRects().length) openOverlay("inspector-open");
@@ -142,6 +149,11 @@ function selectCommandOption(option) {
 
 function acceptCommand(name, fillOnly) {
   const command = composerCommands.find(item => item.name === name);
+  const reason = unavailableReason(command);
+  if (reason) {
+    showToast(reason);
+    return;
+  }
   closeCommandMenu();
   elements.promptInput.value = name + (command.editArguments ? " " : "");
   elements.promptInput.focus();
@@ -173,7 +185,9 @@ function renderCommandMenu() {
     const name = document.createElement("code");
     name.textContent = command.name;
     const description = document.createElement("span");
-    description.textContent = command.description;
+    const reason = unavailableReason(command);
+    if (reason) option.setAttribute("aria-disabled", "true");
+    description.textContent = reason || command.description;
     option.append(name, description);
     return option;
   });
@@ -1762,6 +1776,11 @@ async function startTurn(userInput) {
   const token = text.split(/\s/u, 1)[0].toLowerCase();
   const command = composerCommands.find(item => item.name === token);
   closeCommandMenu();
+  const reason = unavailableReason(command);
+  if (reason) {
+    showToast(reason);
+    return;
+  }
   if (!command && /^\/[a-z0-9_-]*$/iu.test(token)) {
     showToast("未知快捷命令：" + token);
     return;
@@ -1788,7 +1807,7 @@ async function startTurn(userInput) {
       }
       const focus = text.slice("/compact".length).trim();
       showToast("正在用当前模型压缩历史…");
-      const { context } = await rpc("context.compact", { session_id: sessionID, focus });
+      const { context } = await rpc(command.method, { session_id: sessionID, focus });
       if (selectedSessionID() === sessionID) {
         if (elements.promptInput.value.trim() === text) elements.promptInput.value = "";
         resizePrompt();

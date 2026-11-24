@@ -263,6 +263,18 @@ class AppServerTests(unittest.TestCase):
         self.assertFalse(self.rpc("skills.list", workspace="/tmp").ok)
         self.assertFalse(self.rpc("skills.list", session_id="unused").ok)
 
+    def test_advertised_methods_are_routed(self):
+        methods = self.app.supported_methods
+        self.assertIn("context.compact", methods)
+        self.assertIn("context.inspect", methods)
+        self.assertEqual(methods, tuple(sorted(set(methods))))
+        # Unknown parameters are rejected by the handler, not by method lookup.
+        for method in methods:
+            with self.subTest(method=method):
+                response = self.rpc(method, unexpected_param=True)
+                self.assertFalse(response.ok)
+                self.assertEqual(response.error.code, "invalid_params")
+
     def test_session_create_persists_initial_title(self):
         session_id = self.create_session(title="First task")
         self.assertEqual(self.store.load(session_id).title, "First task")

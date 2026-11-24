@@ -91,6 +91,7 @@ class AppServer:
         self._credential_setter = credential_setter
         self._lifecycle_lock = threading.Lock()
         self._closed = False
+        self._handlers = self._build_handlers()
         self.instance_id = uuid4().hex
         self._instance_lease = ServerInstanceLease.acquire(
             self.session_store.root,
@@ -172,8 +173,8 @@ class AppServer:
         finally:
             self._instance_lease.release()
 
-    def _dispatch(self, request: RequestEnvelope) -> dict[str, Any]:
-        handlers = {
+    def _build_handlers(self) -> dict[str, Callable[[dict[str, Any]], dict[str, Any]]]:
+        return {
             "session.create": self._create_session,
             "session.list": self._list_sessions,
             "session.read": self._read_session,
@@ -209,7 +210,13 @@ class AppServer:
             "events.subscribe": self._subscribe_events,
             "events.unsubscribe": self._unsubscribe_events,
         }
-        handler = handlers.get(request.method)
+
+    @property
+    def supported_methods(self) -> tuple[str, ...]:
+        return tuple(sorted(self._handlers))
+
+    def _dispatch(self, request: RequestEnvelope) -> dict[str, Any]:
+        handler = self._handlers.get(request.method)
         if handler is None:
             raise _RpcCallError(
                 "method_not_found",
