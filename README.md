@@ -159,6 +159,8 @@ DEEPSEEK_API_KEY=... .venv/bin/python cli.py ui --workspace . --open-browser
 - `supervised` / `accept_edits` / `trusted` 权限策略切换
 - 分类 context 使用量、pending turn 的 retry/abort 和运行中 turn 的 interrupt
 - 在输入框键入 `/` 打开本地命令列表，输入 `/co` 可筛选。用上下键选中、Tab 补全、Enter 确认，也可直接点选。选中 `/compact` 只填入命令，可继续写重点；再次按 Enter 或点发送才请求压缩。
+- `/model`、`/mode`、`/permissions`、`/sandbox` 在输入框上方展开选项；当前值带勾。上下键浏览，Enter 或 Tab 确认，Esc 返回命令列表。草稿里的选择不会创建会话；已有会话沿用顶部控件的切换逻辑。
+- `/status` 查看本会话的模型、模式、权限和沙箱；`/context`、`/goal`、`/rules`、`/verify`、`/skills` 定位到对应面板。`/rename` 编辑名称，`/new` 打开草稿。这些命令不作为消息发送。
 - 网页从 `bootstrap.js` 的 `supportedMethods` 读取当前服务注册的 RPC；`deduplicatedMethods` 只用于判断传输失败后能否用同一请求 ID 重试。未声明 `context.compact` 时，菜单提示重启，手输 `/compact` 也不会发送请求。升级后端后刷新页面即可重新读取能力；方法存在不代表当前会话可执行它。
 - 每批模型步骤达到预算后暂停并询问“继续或停止”，继续时从下一步恢复，不伪造 final answer
 - provider 报告 API key 缺失或认证失败时，显示凭据面板并将 key 原子写入

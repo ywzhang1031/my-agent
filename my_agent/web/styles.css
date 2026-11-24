@@ -1063,6 +1063,7 @@ textarea:disabled {
 .command-option span {
   color: var(--muted);
   font-size: 12px;
+  overflow-wrap: anywhere;
 }
 
 .command-option:hover,
@@ -1074,6 +1075,18 @@ textarea:disabled {
   color: var(--muted);
   cursor: not-allowed;
 }
+
+#command-choices .choice-menu-option-copy span { white-space: normal; }
+#command-choices .choice-menu-option:focus-visible { background: var(--accent-soft); }
+#status-values {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 5px 12px;
+  margin: 8px 0 0;
+  font-size: 12px;
+}
+#status-values dt { color: var(--muted); }
+#status-values dd { margin: 0; overflow-wrap: anywhere; }
 
 .composer textarea {
   max-height: 180px;

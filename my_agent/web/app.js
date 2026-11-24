@@ -35,6 +35,9 @@ const elements = {
   composer: document.querySelector("#composer"),
   promptInput: document.querySelector("#prompt-input"),
   commandMenu: document.querySelector("#command-menu"),
+  commandChoices: document.querySelector("#command-choices"),
+  sessionStatus: document.querySelector("#session-status"),
+  statusValues: document.querySelector("#status-values"),
   sendPrompt: document.querySelector("#send-prompt"),
   stopTurn: document.querySelector("#stop-turn"),
   approvalPanel: document.querySelector("#approval-panel"),
@@ -117,9 +120,16 @@ const composerCommands = [
   { name: "/compact", description: "压缩历史 · 可填写重点", editArguments: true,
     method: "context.compact", unavailable: "请重启服务以启用压缩" },
   { name: "/context", description: "查看上下文用量", run: () => revealInspector(elements.contextPercent) },
-  { name: "/model", description: "选择模型", run: () => openChoiceMenu(elements.modelMenuTrigger, elements.modelMenu) },
-  { name: "/permissions", description: "选择权限策略", run: () => openChoiceMenu(elements.permissionMenuTrigger, elements.permissionMenu) },
+  { name: "/status", description: "查看会话状态", run: () => revealInspector(elements.sessionStatus) },
+  { name: "/model", description: "选择模型", choices: modelChoices, current: () => elements.modelMenuTrigger.dataset.value, select: switchModel },
+  { name: "/mode", description: "选择协作模式", choices: modeChoices, current: () => state.selectedSession?.mode_id, select: switchMode },
+  { name: "/permissions", description: "选择权限策略", choices: permissionChoices, current: () => elements.permissionMenuTrigger.dataset.value, select: switchPermissionProfile },
+  { name: "/sandbox", description: "选择命令沙箱", choices: sandboxChoices, current: () => elements.sandboxMenuTrigger.dataset.value, select: switchSandbox },
   { name: "/skills", description: "选择下轮 Skill", run: () => revealInspector(elements.skillsView) },
+  { name: "/goal", description: "查看当前目标", run: () => revealInspector(elements.goalView) },
+  { name: "/rules", description: "查看本轮项目规则", run: () => revealInspector(elements.rulesView) },
+  { name: "/verify", description: "查看本轮验证记录", run: () => revealInspector(elements.verificationView) },
+  { name: "/rename", description: "重命名会话", run: beginSessionRename },
   { name: "/new", description: "新建对话", run: createSession },
 ];
 
@@ -131,11 +141,14 @@ function unavailableReason(command) {
 
 function revealInspector(target) {
   if (elements.inspectorToggle.getClientRects().length) openOverlay("inspector-open");
+  const details = target.closest("details");
+  if (details) details.open = true;
   target.scrollIntoView({ block: "nearest" });
 }
 
 function closeCommandMenu() {
   elements.commandMenu.hidden = true;
+  elements.commandChoices.hidden = true;
   elements.promptInput.removeAttribute("aria-activedescendant");
 }
 
@@ -158,7 +171,7 @@ function acceptCommand(name, fillOnly) {
   elements.promptInput.value = name + (command.editArguments ? " " : "");
   elements.promptInput.focus();
   resizePrompt();
-  if (!fillOnly && !command.editArguments) elements.composer.requestSubmit();
+  if ((!fillOnly || command.choices) && !command.editArguments) elements.composer.requestSubmit();
 }
 
 function atCommandEnd() {
@@ -187,7 +200,7 @@ function renderCommandMenu() {
     const description = document.createElement("span");
     const reason = unavailableReason(command);
     if (reason) option.setAttribute("aria-disabled", "true");
-    description.textContent = reason || command.description;
+    description.textContent = reason || [command.description, command.current?.()].filter(Boolean).join(" · ");
     option.append(name, description);
     return option;
   });
@@ -477,19 +490,34 @@ function closeSessionMenu() {
   }
 }
 
+function modelChoices() {
+  return state.models.map(m => ({ value: m.ref, label: m.ref, description: m.description }));
+}
+
+function modeChoices() {
+  return state.modes.map(m => ({ value: m.mode_id, label: m.mode_id, description: m.description }));
+}
+
+function permissionChoices() {
+  return state.permissionProfiles.map(p => ({
+    value: p.profile_id, label: permissionLabels[p.profile_id] || p.profile_id, description: p.description,
+  }));
+}
+
+function sandboxChoices() {
+  return state.sandboxProfiles.map(p => ({
+    value: p.mode, label: sandboxLabels[p.mode] || p.mode, disabled: !p.available,
+    description: (p.dangerous ? "高风险：" : "") + (p.description || "")
+      + (p.available ? "" : " 不可用：" + (p.unavailable_reason || "缺少 backend")),
+  }));
+}
+
+function fillChoices(menu, options, onSelect) {
+  menu.replaceChildren(...options.map(option => createChoiceOption({ ...option, onSelect })));
+}
+
 function renderModelCatalog() {
-  const fragment = document.createDocumentFragment();
-  for (const model of state.models) {
-    fragment.append(
-      createChoiceOption({
-        value: model.ref,
-        label: model.ref,
-        description: model.description,
-        onSelect: switchModel,
-      }),
-    );
-  }
-  elements.modelMenu.replaceChildren(fragment);
+  fillChoices(elements.modelMenu, modelChoices(), switchModel);
   if (!elements.modelMenuTrigger.dataset.value && state.models[0]) {
     setChoiceMenuValue(
       elements.modelMenuTrigger,
@@ -503,33 +531,22 @@ function renderModelCatalog() {
 
 function renderModeCatalog() {
   const fragment = document.createDocumentFragment();
-  for (const mode of state.modes) {
+  for (const mode of modeChoices()) {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "mode-button";
-    button.textContent = mode.mode_id;
-    button.title = mode.description || mode.mode_id;
-    button.dataset.modeId = mode.mode_id;
+    button.textContent = mode.label;
+    button.title = mode.description || mode.label;
+    button.dataset.modeId = mode.value;
     button.setAttribute("aria-pressed", "false");
-    button.addEventListener("click", () => switchMode(mode.mode_id));
+    button.addEventListener("click", () => switchMode(mode.value));
     fragment.append(button);
   }
   elements.modeSelector.replaceChildren(fragment);
 }
 
 function renderPermissionCatalog() {
-  const fragment = document.createDocumentFragment();
-  for (const profile of state.permissionProfiles) {
-    fragment.append(
-      createChoiceOption({
-        value: profile.profile_id,
-        label: permissionLabels[profile.profile_id] || profile.profile_id,
-        description: profile.description,
-        onSelect: switchPermissionProfile,
-      }),
-    );
-  }
-  elements.permissionMenu.replaceChildren(fragment);
+  fillChoices(elements.permissionMenu, permissionChoices(), switchPermissionProfile);
   if (!elements.permissionMenuTrigger.dataset.value && state.permissionProfiles[0]) {
     const profile = state.permissionProfiles[0];
     setChoiceMenuValue(
@@ -543,22 +560,7 @@ function renderPermissionCatalog() {
 }
 
 function renderSandboxCatalog() {
-  const fragment = document.createDocumentFragment();
-  for (const profile of state.sandboxProfiles) {
-    const availability = profile.available
-      ? profile.description
-      : `${profile.description} 不可用：${profile.unavailable_reason || "缺少 backend"}`;
-    fragment.append(
-      createChoiceOption({
-        value: profile.mode,
-        label: sandboxLabels[profile.mode] || profile.mode,
-        description: profile.dangerous ? `高风险：${availability}` : availability,
-        disabled: !profile.available,
-        onSelect: switchSandbox,
-      }),
-    );
-  }
-  elements.sandboxMenu.replaceChildren(fragment);
+  fillChoices(elements.sandboxMenu, sandboxChoices(), switchSandbox);
   if (!elements.sandboxMenuTrigger.dataset.value) {
     const profile = state.sandboxProfiles[0];
     if (profile) {
@@ -637,6 +639,28 @@ function openChoiceMenu(trigger, menu, direction = 1) {
   target?.focus();
 }
 
+function openCommandChoices(command) {
+  const menu = elements.commandChoices;
+  const options = command.choices();
+  if (!options.length) {
+    showToast("暂无可选项：" + command.name);
+    return;
+  }
+  closeChoiceMenus();
+  fillChoices(menu, options, value => {
+    closeCommandMenu();
+    elements.promptInput.focus();
+    command.select(value);
+  });
+  menu.setAttribute("aria-label", command.description);
+  menu.dataset.command = command.name;
+  const current = [...menu.children].find(option => option.dataset.value === command.current());
+  current?.setAttribute("aria-selected", "true");
+  menu.hidden = false;
+  const target = current && !current.disabled ? current : menu.querySelector("button:not(:disabled)");
+  (target || menu).focus();
+}
+
 function bindChoiceMenu(trigger, menu) {
   trigger.addEventListener("click", () => {
     if (menu.hidden) openChoiceMenu(trigger, menu);
@@ -648,13 +672,19 @@ function bindChoiceMenu(trigger, menu) {
       openChoiceMenu(trigger, menu, event.key === "ArrowUp" ? -1 : 1);
     }
   });
+  bindChoiceKeys(menu, () => {
+    closeChoiceMenus();
+    trigger.focus();
+  });
+}
+
+function bindChoiceKeys(menu, cancel) {
   menu.addEventListener("keydown", (event) => {
     const options = [...menu.querySelectorAll(".choice-menu-option:not(:disabled)")];
     const index = options.indexOf(document.activeElement);
     if (event.key === "Escape") {
       event.preventDefault();
-      closeChoiceMenus();
-      trigger.focus();
+      cancel();
     } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
       event.preventDefault();
       const offset = event.key === "ArrowDown" ? 1 : -1;
@@ -789,6 +819,22 @@ function updateControls() {
   elements.credentialSave.disabled = state.credentialSaving;
   elements.credentialAbort.disabled = state.credentialSaving;
   renderGoal();
+  const status = storageFailure ? "存储故障" : busy ? "运行中" : pending ? "等待处理" : sessionID ? "空闲" : "草稿";
+  const rows = [
+    ["会话", session ? sessionDisplayName(session) : "未选择"],
+    ["状态", session ? status : "未选择"],
+    ["模型", session?.model_id && `${session.provider_id}/${session.model_id}`],
+    ["模式", session?.mode_id],
+    ["权限", permissionLabels[session?.permission_profile_id] || session?.permission_profile_id],
+    ["沙箱", sandboxLabels[session?.sandbox_mode] || session?.sandbox_mode],
+  ];
+  elements.statusValues.replaceChildren(...rows.flatMap(([label, value]) => {
+    const key = document.createElement("dt");
+    const detail = document.createElement("dd");
+    key.textContent = label;
+    detail.textContent = value || "未选择";
+    return [key, detail];
+  }));
 }
 
 function syncCredentialRequest(session) {
@@ -1785,14 +1831,15 @@ async function startTurn(userInput) {
     showToast("未知快捷命令：" + token);
     return;
   }
-  if (command?.run) {
+  if (command?.run || command?.choices) {
     if (text.length !== token.length) {
       showToast(command.name + " 不接受参数");
       return;
     }
     elements.promptInput.value = "";
     resizePrompt();
-    command.run();
+    if (command.choices) openCommandChoices(command);
+    else command.run();
     return;
   }
   const compact = command?.name === "/compact";
@@ -1924,6 +1971,7 @@ async function switchSandbox(mode) {
       mode,
       sandboxLabels[mode] || mode,
     );
+    updateControls();
     return;
   }
   if (mode === state.selectedSession.sandbox_mode) return;
@@ -2440,7 +2488,28 @@ function bindUI() {
     else renderCommandMenu();
   });
   elements.promptInput.addEventListener("blur", event => {
-    if (!elements.commandMenu.contains(event.relatedTarget)) closeCommandMenu();
+    if (!elements.commandMenu.contains(event.relatedTarget) && !elements.commandChoices.contains(event.relatedTarget)) closeCommandMenu();
+  });
+  bindChoiceKeys(elements.commandChoices, () => {
+    const name = elements.commandChoices.dataset.command;
+    closeCommandMenu();
+    elements.promptInput.value = "/";
+    elements.promptInput.focus();
+    renderCommandMenu();
+    const option = [...elements.commandMenu.children].find(item => item.dataset.command === name);
+    if (option) selectCommandOption(option);
+  });
+  elements.commandChoices.addEventListener("focusout", event => {
+    if (!elements.commandChoices.contains(event.relatedTarget)) elements.commandChoices.hidden = true;
+  });
+  elements.commandChoices.addEventListener("keydown", event => {
+    if (event.key === "Tab" && !event.shiftKey) {
+      const option = event.target.closest("button:not(:disabled)");
+      if (option) {
+        event.preventDefault();
+        option.click();
+      }
+    }
   });
   elements.commandMenu.addEventListener("mousedown", event => event.preventDefault());
   elements.commandMenu.addEventListener("click", event => {
@@ -2450,7 +2519,7 @@ function bindUI() {
   elements.promptInput.addEventListener("keydown", (event) => {
     if (event.isComposing || event.keyCode === 229) return;
     if (event.key === "Tab" && !event.shiftKey && atCommandEnd()
-        && composerCommands.some(c => c.editArguments && c.name === elements.promptInput.value.toLowerCase())) {
+        && composerCommands.some(c => (c.editArguments || c.choices) && c.name === elements.promptInput.value.toLowerCase())) {
       event.preventDefault();
       acceptCommand(elements.promptInput.value.toLowerCase(), true);
       return;
