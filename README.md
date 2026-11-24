@@ -158,6 +158,7 @@ DEEPSEEK_API_KEY=... .venv/bin/python cli.py ui --workspace . --open-browser
 - provider/model 与 Build/Plan mode 切换；模型、权限和 sandbox 使用紧凑、可键盘导航的弹出菜单
 - `supervised` / `accept_edits` / `trusted` 权限策略切换
 - 分类 context 使用量、pending turn 的 retry/abort 和运行中 turn 的 interrupt
+- 在输入框键入 `/` 打开本地命令列表，输入 `/co` 可筛选。用上下键选中、Tab 补全、Enter 确认，也可直接点选。选中 `/compact` 只填入命令，可继续写重点；再次按 Enter 或点发送才请求压缩。
 - 每批模型步骤达到预算后暂停并询问“继续或停止”，继续时从下一步恢复，不伪造 final answer
 - provider 报告 API key 缺失或认证失败时，显示凭据面板并将 key 原子写入
   `credentials.json`（`0600`）；保存后热重载当前 session 并自动重试 pending turn

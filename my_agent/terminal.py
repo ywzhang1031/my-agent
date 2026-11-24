@@ -38,6 +38,7 @@ from .protocol import (
 class SlashCommand:
     name: str
     description: str
+    edit_arguments: bool = False
 
 
 @dataclass(frozen=True)
@@ -56,14 +57,12 @@ class SlashCommandCompleter(Completer):
         complete_event: CompleteEvent,
     ) -> Iterable[Completion]:
         prefix = document.text_before_cursor
-        if not prefix.startswith("/"):
-            return
-        if " " in prefix:
+        if document.text_after_cursor or not prefix.startswith("/") or any(c.isspace() for c in prefix):
             return
         lowered = prefix.lower()
         for command in self.commands:
             command_name = command.name.lower()
-            if command_name.startswith(lowered) and command_name != lowered:
+            if command_name.startswith(lowered) and command.name != prefix:
                 yield Completion(
                     command.name,
                     start_position=-len(prefix),
@@ -516,7 +515,16 @@ def _partial_tag_suffix_length(text: str, tag: str) -> int:
 
 def _completion_key_bindings(commands: Iterable[SlashCommand]) -> KeyBindings:
     bindings = KeyBindings()
-    command_names = {command.name for command in commands}
+    catalog = {command.name: command for command in commands}
+
+    def accept(buffer: Any) -> bool:
+        state = buffer.complete_state
+        completion = state.current_completion or state.completions[0]
+        buffer.apply_completion(completion)
+        if catalog[completion.text].edit_arguments:
+            buffer.insert_text(" ")
+            return False
+        return True
 
     def slash_menu_active() -> bool:
         buffer = get_app().current_buffer
@@ -550,25 +558,29 @@ def _completion_key_bindings(commands: Iterable[SlashCommand]) -> KeyBindings:
     @bindings.add("enter", filter=slash_menu)
     def run_selected_command(event: Any) -> None:
         buffer = event.app.current_buffer
-        state = buffer.complete_state
-        completion = state.current_completion or state.completions[0]
-        buffer.apply_completion(completion)
-        buffer.validate_and_handle()
+        if accept(buffer):
+            buffer.validate_and_handle()
+
+    @bindings.add("escape", filter=slash_menu)
+    def dismiss_menu(event: Any) -> None:
+        event.app.current_buffer.cancel_completion()
 
     @bindings.add("tab")
     def accept_completion_or_command(event: Any) -> None:
         buffer = event.app.current_buffer
         completion_state = buffer.complete_state
         if completion_state and completion_state.completions:
-            completion = completion_state.current_completion
-            buffer.apply_completion(completion or completion_state.completions[0])
+            accept(buffer)
             return
         document = buffer.document
         if (
             document.cursor_position == len(document.text)
-            and document.text in command_names
+            and document.text in catalog
         ):
-            buffer.validate_and_handle()
+            if catalog[document.text].edit_arguments:
+                buffer.insert_text(" ")
+            else:
+                buffer.validate_and_handle()
             return
         if document.text_before_cursor.startswith("/"):
             buffer.start_completion(select_first=False)

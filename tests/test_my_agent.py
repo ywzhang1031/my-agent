@@ -20,6 +20,7 @@ from prompt_toolkit.output import DummyOutput
 
 from my_agent.agent_loop import AgentEvent, AgentLoop
 from my_agent.cli import (
+    SLASH_COMMANDS,
     _build_model,
     _restore_session_mode,
     _restore_session_model,
@@ -1781,6 +1782,24 @@ class MyAgentTests(unittest.TestCase):
 
         self.assertEqual(accepted, ["/context"])
         self.assertEqual(buffer.text, "")
+
+    def test_compact_menu_selection_leaves_focus_editable_without_submitting(self):
+        bindings = _completion_key_bindings(SLASH_COMMANDS)
+        for key in (Keys.ControlM, Keys.ControlI):
+            with self.subTest(key=key):
+                accepted = []
+                buffer = Buffer(document=Document("/comp"), multiline=False,
+                                accept_handler=lambda b: accepted.append(b.text))
+                options = list(SlashCommandCompleter(SLASH_COMMANDS).get_completions(
+                    buffer.document, CompleteEvent(completion_requested=True)))
+                self.assertEqual([c.text for c in options], ["/compact"])
+                buffer.complete_state = CompletionState(buffer.document, options)
+                event = SimpleNamespace(app=SimpleNamespace(current_buffer=buffer))
+                next(b.handler for b in bindings.bindings if b.keys == (key,))(event)
+                self.assertEqual((buffer.text, buffer.cursor_position, accepted), ("/compact ", 9, []))
+                buffer.insert_text("RPC")
+                buffer.validate_and_handle()
+                self.assertEqual(accepted, ["/compact RPC"])
 
     def test_slash_menu_uses_arrows_and_enter_to_run_command(self):
         commands = [

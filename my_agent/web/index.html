@@ -162,7 +162,9 @@
         </form>
 
         <form class="composer" id="composer">
-          <textarea id="prompt-input" rows="1" placeholder="输入任务" disabled></textarea>
+          <div class="command-menu" id="command-menu" role="listbox" aria-label="快捷命令" hidden></div>
+          <textarea id="prompt-input" rows="1" placeholder="输入任务，或 / 选择命令" aria-label="输入任务"
+            aria-autocomplete="list" aria-controls="command-menu" disabled></textarea>
           <button class="icon-button stop-button" id="stop-turn" type="button" title="停止" aria-label="停止" hidden>■</button>
           <button class="send-button" id="send-prompt" type="submit" title="发送" aria-label="发送" disabled>↑</button>
         </form>

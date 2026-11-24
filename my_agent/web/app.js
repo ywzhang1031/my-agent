@@ -34,6 +34,7 @@ const elements = {
   permissionMenu: document.querySelector("#permission-menu"),
   composer: document.querySelector("#composer"),
   promptInput: document.querySelector("#prompt-input"),
+  commandMenu: document.querySelector("#command-menu"),
   sendPrompt: document.querySelector("#send-prompt"),
   stopTurn: document.querySelector("#stop-turn"),
   approvalPanel: document.querySelector("#approval-panel"),
@@ -110,6 +111,76 @@ const state = {
 };
 
 let toastTimer = null;
+
+// List only commands this client can actually dispatch.
+const composerCommands = [
+  { name: "/compact", description: "压缩历史 · 可填写重点", editArguments: true },
+  { name: "/context", description: "查看上下文用量", run: () => revealInspector(elements.contextPercent) },
+  { name: "/model", description: "选择模型", run: () => openChoiceMenu(elements.modelMenuTrigger, elements.modelMenu) },
+  { name: "/permissions", description: "选择权限策略", run: () => openChoiceMenu(elements.permissionMenuTrigger, elements.permissionMenu) },
+  { name: "/skills", description: "选择下轮 Skill", run: () => revealInspector(elements.skillsView) },
+  { name: "/new", description: "新建对话", run: createSession },
+];
+
+function revealInspector(target) {
+  if (elements.inspectorToggle.getClientRects().length) openOverlay("inspector-open");
+  target.scrollIntoView({ block: "nearest" });
+}
+
+function closeCommandMenu() {
+  elements.commandMenu.hidden = true;
+  elements.promptInput.removeAttribute("aria-activedescendant");
+}
+
+function selectCommandOption(option) {
+  for (const item of elements.commandMenu.children) {
+    item.setAttribute("aria-selected", String(item === option));
+  }
+  elements.promptInput.setAttribute("aria-activedescendant", option.id);
+  option.scrollIntoView({ block: "nearest" });
+}
+
+function acceptCommand(name, fillOnly) {
+  const command = composerCommands.find(item => item.name === name);
+  closeCommandMenu();
+  elements.promptInput.value = name + (command.editArguments ? " " : "");
+  elements.promptInput.focus();
+  resizePrompt();
+  if (!fillOnly && !command.editArguments) elements.composer.requestSubmit();
+}
+
+function atCommandEnd() {
+  const input = elements.promptInput;
+  return !input.disabled && input.selectionStart === input.value.length && input.selectionEnd === input.value.length;
+}
+
+function renderCommandMenu() {
+  const prefix = elements.promptInput.value.toLowerCase();
+  const matches = atCommandEnd() && /^\/[a-z]*$/u.test(prefix) && !composerCommands.some(c => c.name === prefix)
+    ? composerCommands.filter(c => c.name.startsWith(prefix)) : [];
+  if (!matches.length) {
+    closeCommandMenu();
+    return;
+  }
+  const options = matches.map(command => {
+    const option = document.createElement("button");
+    option.type = "button";
+    option.tabIndex = -1;
+    option.id = "command-option-" + command.name.slice(1);
+    option.className = "command-option";
+    option.dataset.command = command.name;
+    option.setAttribute("role", "option");
+    const name = document.createElement("code");
+    name.textContent = command.name;
+    const description = document.createElement("span");
+    description.textContent = command.description;
+    option.append(name, description);
+    return option;
+  });
+  elements.commandMenu.replaceChildren(...options);
+  elements.commandMenu.hidden = false;
+  selectCommandOption(options[0]);
+}
 
 const permissionLabels = {
   supervised: "监督",
@@ -597,6 +668,7 @@ function updateControls() {
   elements.sessionTitle.disabled = !enabled || state.sending;
   elements.newSession.disabled = state.sending;
   elements.promptInput.disabled = !enabled || busy || pending;
+  if (elements.promptInput.disabled) closeCommandMenu();
   for (const checkbox of elements.skillsView.querySelectorAll('input[type="checkbox"]')) {
     checkbox.disabled = !enabled || busy || pending || checkbox.dataset.manual === "false";
   }
@@ -1462,6 +1534,7 @@ async function refreshSessions() {
 
 async function selectSession(sessionID) {
   if (state.sending) return;
+  closeCommandMenu();
   const summary = sessionSummary(sessionID);
   if (!summary) return;
   const navigation = ++state.navigationRevision;
@@ -1504,6 +1577,7 @@ async function selectSession(sessionID) {
 
 function createSession() {
   if (state.sending) return;
+  closeCommandMenu();
   // Repeated clicks on New must not discard an unsent draft.
   if (state.selectedSession && !selectedSessionID()) {
     closeOverlays();
@@ -1685,7 +1759,24 @@ async function startTurn(userInput) {
   let sessionID = selectedSessionID();
   if (!state.selectedSession || state.sending || state.busySessions.has(sessionID) || state.selectedSession.pending_turn_id || !userInput.trim()) return;
   const text = userInput.trim();
-  const compact = /^\/compact(?:\s|$)/u.test(text);
+  const token = text.split(/\s/u, 1)[0].toLowerCase();
+  const command = composerCommands.find(item => item.name === token);
+  closeCommandMenu();
+  if (!command && /^\/[a-z0-9_-]*$/iu.test(token)) {
+    showToast("未知快捷命令：" + token);
+    return;
+  }
+  if (command?.run) {
+    if (text.length !== token.length) {
+      showToast(command.name + " 不接受参数");
+      return;
+    }
+    elements.promptInput.value = "";
+    resizePrompt();
+    command.run();
+    return;
+  }
+  const compact = command?.name === "/compact";
   const skills = [...state.selectedSkills];
   state.sending = true;
   updateControls();
@@ -2324,9 +2415,47 @@ function bindUI() {
     event.preventDefault();
     startTurn(elements.promptInput.value);
   });
-  elements.promptInput.addEventListener("input", resizePrompt);
+  elements.promptInput.addEventListener("input", event => {
+    resizePrompt();
+    if (event.isComposing) closeCommandMenu();
+    else renderCommandMenu();
+  });
+  elements.promptInput.addEventListener("blur", event => {
+    if (!elements.commandMenu.contains(event.relatedTarget)) closeCommandMenu();
+  });
+  elements.commandMenu.addEventListener("mousedown", event => event.preventDefault());
+  elements.commandMenu.addEventListener("click", event => {
+    const option = event.target.closest("[data-command]");
+    if (option && !elements.commandMenu.hidden) acceptCommand(option.dataset.command, false);
+  });
   elements.promptInput.addEventListener("keydown", (event) => {
-    if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+    if (event.isComposing || event.keyCode === 229) return;
+    if (event.key === "Tab" && !event.shiftKey && atCommandEnd()
+        && composerCommands.some(c => c.editArguments && c.name === elements.promptInput.value.toLowerCase())) {
+      event.preventDefault();
+      acceptCommand(elements.promptInput.value.toLowerCase(), true);
+      return;
+    }
+    if (!elements.commandMenu.hidden && !event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey) {
+      const options = [...elements.commandMenu.children];
+      const index = options.findIndex(option => option.getAttribute("aria-selected") === "true");
+      if (!atCommandEnd() || ["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+        closeCommandMenu();
+      } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        selectCommandOption(options[(index + (event.key === "ArrowDown" ? 1 : -1) + options.length) % options.length]);
+        return;
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        closeCommandMenu();
+        return;
+      } else if (event.key === "Tab" || event.key === "Enter") {
+        event.preventDefault();
+        acceptCommand(options[index].dataset.command, event.key === "Tab");
+        return;
+      }
+    }
+    if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       elements.composer.requestSubmit();
     }

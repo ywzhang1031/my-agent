@@ -1012,6 +1012,7 @@ textarea:disabled {
 }
 
 .composer {
+  position: relative;
   display: grid;
   grid-template-columns: minmax(0, 1fr) 32px;
   gap: 8px;
@@ -1025,6 +1026,48 @@ textarea:disabled {
 .composer:focus-within {
   border-color: var(--focus);
   box-shadow: 0 0 0 2px rgb(46 117 182 / 12%);
+}
+
+.command-menu {
+  position: absolute;
+  z-index: 15;
+  bottom: calc(100% + 6px);
+  left: 0;
+  width: min(352px, 100%);
+  max-height: min(260px, 38dvh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 4px;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  background: var(--surface);
+  box-shadow: 0 6px 20px rgb(20 28 31 / 12%);
+}
+
+.command-option {
+  display: grid;
+  grid-template-columns: 8em minmax(0, 1fr);
+  align-items: center;
+  width: 100%;
+  min-height: 34px;
+  gap: 8px;
+  padding: 5px 8px;
+  border: 0;
+  border-radius: 4px;
+  color: var(--text);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.command-option span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.command-option:hover,
+.command-option[aria-selected="true"] {
+  background: var(--accent-soft);
 }
 
 .composer textarea {
